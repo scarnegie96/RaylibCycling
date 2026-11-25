@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -145,7 +146,7 @@ void detailVoxel(int N, int x, int y, int z, unsigned char* o) {
     o[3] = 255;
 }
 
-Texture2D buildWeatherMap(int n) {
+Texture2D buildWeatherMap(int n, std::vector<unsigned char>& keep) {
     std::vector<float> f[3];
     for (auto& c : f) c.resize(size_t(n) * n);
     parallelFor(n, [&](int y) {
@@ -170,6 +171,7 @@ Texture2D buildWeatherMap(int n) {
         std::sort(order.begin(), order.end(), [&](int a, int b) { return f[ch][a] < f[ch][b]; });
         for (size_t r = 0; r < order.size(); ++r) px[size_t(order[r]) * 4 + ch] = u8((r + 0.5f) / order.size());
     }
+    keep = px;
     Image im{px.data(), n, n, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
     Texture2D t = LoadTextureFromImage(im);
     GenTextureMipmaps(&t);
@@ -230,14 +232,21 @@ void Renderer::initVolumetrics() {
         if (s.id == rlGetShaderIdDefault()) std::fprintf(stderr, "[vol] shader failed to compile\n");
     volShape_ = buildAtlas(128, 16, volShapeDim_, shapeVoxel);
     volDetail_ = buildAtlas(32, 8, volDetailDim_, detailVoxel);
-    cloudMap_ = buildWeatherMap(512);
+    cloudMap_ = buildWeatherMap(512, cloudPx_);
+    cloudPxN_ = 512;
+    {   // the same source with the shadow-map main
+        std::string src = volshaders::FS_VOL_MARCH;
+        src = "#version 330\n#define SHADOW_PASS\n" + src.substr(src.find('\n') + 1);
+        volShadowSh_ = LoadShaderFromMemory(nullptr, src.c_str());
+        if (volShadowSh_.id == rlGetShaderIdDefault()) std::fprintf(stderr, "[vol] shadow shader failed to compile\n");
+    }
 }
 
 void Renderer::unloadVolumetrics() {
     destroyVolTargets();
     for (Texture2D* t : {&volShape_, &volDetail_, &cloudMap_})
         if (t->id) { UnloadTexture(*t); *t = Texture2D{}; }
-    for (Shader* s : {&volMarchSh_, &volResolveSh_, &volApplySh_})
+    for (Shader* s : {&volMarchSh_, &volResolveSh_, &volApplySh_, &volShadowSh_})
         if (s->id) { UnloadShader(*s); *s = Shader{}; }
 }
 
@@ -255,6 +264,9 @@ void Renderer::createVolTargets() {
     rlFramebufferAttach(sceneFx_.id, scene_.depth.id, RL_ATTACHMENT_DEPTH, RL_ATTACHMENT_TEXTURE2D, 0);
     if (!rlFramebufferComplete(sceneFx_.id)) std::fprintf(stderr, "[vol] fx framebuffer incomplete\n");
     rlDisableFramebuffer();
+    const int cs = quality_ >= 2 ? 512 : 256;
+    csm_ = colorRT(cs, cs, HDR);
+    csmTmp_ = colorRT(cs, cs, HDR);
     volHistValid_ = false;
 }
 
@@ -262,26 +274,112 @@ void Renderer::destroyVolTargets() {
     freeRT(volCur_);
     for (auto& h : volHist_) freeRT(h);
     freeRT(sceneFx_);
+    freeRT(csm_);
+    freeRT(csmTmp_);
     volW_ = volH_ = 0;
     volHistValid_ = false;
 }
 
 // ------------------------------------------------------------------ per-frame parameters
 void Renderer::updateCloudParams(const SceneState& s, float dt) {
+    // The weather decides the sky: how much of it is cloud, what kind, how low, how dark,
+    // and how much of it is raining. Coverage is the fraction of the sky covered (the
+    // weather map is equalised): clear ~2 %, fair ~30 %, cloudy ~60 %, overcast / rain ~100 %.
     const WeatherFx& w = s.wx;
     CloudParams& c = cloud_;
     float overcast = smooth(0.6f, 1.f, w.cloud);
-    c.coverage = std::clamp(w.cloud * 0.92f + w.rain * 0.2f + w.storm * 0.25f + w.snow * 0.2f, 0.f, 1.f);
-    c.type = std::clamp(0.5f - 0.42f * overcast * (1.f - w.storm) - 0.15f * w.fog + 0.5f * w.storm + 0.15f * w.hail, 0.f, 1.f);
+    c.coverage = std::pow(std::clamp((w.cloud - 0.03f) / 0.92f, 0.f, 1.f), 1.1f);
+    // stratus decks when it's grey and settled, cumulus on fair days, towering cumulonimbus in storms
+    c.type = std::clamp(0.5f - 0.42f * overcast * (1.f - w.storm) - 0.15f * w.fog + 0.5f * w.storm + 0.2f * w.hail, 0.f, 1.f);
     float ref = refMax_;   // eased (endless roads grow)
     c.base = ref + 1050.f - 420.f * overcast - 200.f * w.fog - 150.f * w.rain;
     c.top = c.base + 650.f + 1500.f * std::min(c.type, 0.6f) + 5200.f * w.storm;
     c.sigma = 0.05f * (1.f + 0.9f * w.dark + 0.5f * w.rain + 0.6f * w.storm);
     c.precip = std::clamp(w.rain + 0.7f * w.snow + 0.5f * w.hail, 0.f, 1.f);
+    // rain falls from cells: drizzle from about a third of a grey sky, rain from nearly all of
+    // it, a sunshower from a few cumulus with the sun out between them
+    c.precipArea = std::clamp(w.rain * 1.25f * (0.35f + 0.65f * w.cloud) + w.snow + w.hail * 0.5f, 0.f, 1.f);
     float speed = 5.f + w.wind * 16.f + w.gust * 6.f;
     c.wind = Vector2Add(c.wind, {std::sin(w.windDir) * speed * dt, std::cos(w.windDir) * speed * dt});
     if (std::fabs(c.wind.x) > 1e6f || std::fabs(c.wind.y) > 1e6f) c.wind = {0, 0};
     c.scale = 26000.f;
+    // is a rain cell over the rider? (eased, so showers arrive and pass rather than switch)
+    float target = 1.f;
+    if (volEnabled() && course_ && c.precipArea > 0.001f) {
+        auto p = course_->at(s.dist);
+        float b = precipCellAt(p.pos.x, p.pos.z);
+        target = smooth(1.f - c.precipArea - 0.06f, 1.f - c.precipArea + 0.12f, b);
+    }
+    c.here += (target - c.here) * (1.f - std::exp(-dt / 6.f));
+}
+
+float Renderer::precipCellAt(float x, float z) const {
+    if (cloudPx_.empty()) return 1.f;
+    const int n = cloudPxN_;
+    float u = (x + cloud_.wind.x) / cloud_.scale * n - 0.5f, v = (z + cloud_.wind.y) / cloud_.scale * n - 0.5f;
+    int i = int(std::floor(u)), k = int(std::floor(v));
+    float fu = u - i, fv = v - k;
+    auto at = [&](int a, int b) { a = ((a % n) + n) % n; b = ((b % n) + n) % n; return cloudPx_[(size_t(b) * n + a) * 4 + 2] / 255.f; };
+    return (at(i, k) * (1 - fu) + at(i + 1, k) * fu) * (1 - fv) + (at(i, k + 1) * (1 - fu) + at(i + 1, k + 1) * fu) * fv;
+}
+
+// the cloud shadow map: sunlight through the cloud layer along the light, around the camera
+void Renderer::renderCloudShadow() {
+    if (!volEnabled() || !csm_.id) return;
+    const int res = csm_.texture.width;
+    const float size = quality_ >= 2 ? 16000.f : 12000.f, texel = size / res;
+    Vector3 L = L_.lightDir;
+    L.y = std::max(L.y, 0.05f);
+    // centred on where the camera's own light ray meets the cloud base, snapped to texels
+    float cx = cam_.position.x + L.x / L.y * (cloud_.base - cam_.position.y);
+    float cz = cam_.position.z + L.z / L.y * (cloud_.base - cam_.position.y);
+    float x0 = std::floor((cx - size * 0.5f) / texel) * texel, z0 = std::floor((cz - size * 0.5f) / texel) * texel;
+    csmRect_ = {x0, z0, 1.f / size, cloud_.base};
+    if (std::getenv("CORERAY_VOLDEBUG") && volFrame_ % 10 == 0) std::fprintf(stderr, "[csm] rect %.0f %.0f %.6f %.0f cam %.0f %.0f %.0f L %.2f %.2f %.2f\n", x0, z0, 1.f / size, cloud_.base, cam_.position.x, cam_.position.y, cam_.position.z, L.x, L.y, L.z);
+    fullPass(csm_, volShadowSh_, [&] {
+        Shader sh = volShadowSh_;
+        bindTex(2, volShape_.id); setI(sh, "shapeTex", 2);
+        bindTex(3, volDetail_.id); setI(sh, "detailTex", 3);
+        bindTex(4, cloudMap_.id); setI(sh, "weatherTex", 4);
+        setV2(sh, "res", {float(res), float(res)});
+        setV3(sh, "camPos", cam_.position);
+        setF(sh, "time", time_);
+        setV4(sh, "shapeDim", volShapeDim_);
+        setV4(sh, "detailDim", volDetailDim_);
+        setV3(sh, "lightDirF", L_.lightDir);
+        setF(sh, "coverage", cloud_.coverage);
+        setF(sh, "cloudType", cloud_.type);
+        setF(sh, "cloudBase", cloud_.base);
+        setF(sh, "cloudTop", cloud_.top);
+        setF(sh, "cloudSigma", cloud_.sigma);
+        setF(sh, "weatherScale", cloud_.scale);
+        setV2(sh, "windOffset", cloud_.wind);
+        setF(sh, "planetR", 2.5e6f);
+        setF(sh, "precipArea", cloud_.precipArea);
+        setV4(sh, "csmRect", csmRect_);
+    }, {2, 3, 4});
+    // soften: cloud edges are wispy and the sun is a disc, so shadows have broad penumbrae
+    auto blurPass = [&](RenderTexture2D& src, RenderTexture2D& dst, Vector2 dir) {
+        BeginTextureMode(dst);
+        BeginShaderMode(blurSh_);
+        setV2(blurSh_, "dir", dir);
+        DrawTexturePro(src.texture, {0, 0, float(res), -float(res)}, {0, 0, float(res), float(res)}, {0, 0}, 0, WHITE);
+        EndShaderMode();
+        EndTextureMode();
+    };
+    // (wider when the sun is low: the light crosses more of each cloud's ragged edge)
+    const float t = (1.2f + 1.6f * (1.f - smooth(0.15f, 0.7f, L_.lightDir.y))) / res;
+    blurPass(csm_, csmTmp_, {t, 0});
+    blurPass(csmTmp_, csm_, {0, t});
+    if (std::getenv("CORERAY_VOLDEBUG") && volFrame_ % 10 == 0) {
+        Image im = LoadImageFromTexture(csm_.texture);
+        ImageFormat(&im, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+        const unsigned char* px = (const unsigned char*)im.data;
+        int lo = 255, hi = 0; double sum = 0;
+        for (int i = 0; i < res * res; ++i) { lo = std::min(lo, int(px[i * 4])); hi = std::max(hi, int(px[i * 4])); sum += px[i * 4]; }
+        std::fprintf(stderr, "[csm] T min %d max %d mean %.0f\n", lo, hi, sum / (res * res));
+        UnloadImage(im);
+    }
 }
 
 // ------------------------------------------------------------------ the passes
@@ -367,7 +465,10 @@ void Renderer::renderVolumetrics(const SceneState& s) {
         setV3(sh, "cascadeCenter1", Vector3Add(cam_.position, Vector3Scale(f, cascadeRange_[1] * 0.55f)));
         setV2(sh, "cascadeRange", {cascadeRange_[0], cascadeRange_[1]});
         setLightUniforms(sh);
-    }, {1, 2, 3, 4, 5, 6});
+        bindTex(7, csm_.texture.id); setI(sh, "cloudShadowTex", 7);
+        setV4(sh, "csmRect", csmRect_);
+        setF(sh, "precipArea", cloud_.precipArea);
+    }, {1, 2, 3, 4, 5, 6, 7});
 
     // ---- temporal resolve
     RenderTexture2D& hist = volHist_[volHistIdx_];

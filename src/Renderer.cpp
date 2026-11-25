@@ -438,8 +438,8 @@ void Renderer::computeLighting(const SceneState& s) {
     const bool vol = volEnabled();
     L_.sunRaw = Vector3Scale(sunCol, smooth(-6.f, 1.f, k.sunElevation));
     float overcast = std::clamp(w.cloud * 0.6f + w.dark * 0.7f, 0.f, 1.f);
-    sunCol = Vector3Scale(sunCol, vol ? 1.f - 0.45f * smooth(0.6f, 1.f, w.cloud) - 0.1f * w.dark
-                                      : 1.f - 0.82f * smooth(0.45f, 1.f, w.cloud) - 0.1f * w.dark);
+    // (with volumetric clouds the cloud shadow map does the dimming, cloud by cloud)
+    sunCol = Vector3Scale(sunCol, vol ? 1.f - 0.1f * w.dark : 1.f - 0.82f * smooth(0.45f, 1.f, w.cloud) - 0.1f * w.dark);
     auto grey = [&](Vector3 c, float amt, float dim) {
         float l = (c.x + c.y + c.z) / 3.f;
         return Vector3Scale(lerp3(c, {l * 0.95f, l * 0.98f, l * 1.04f}, amt), dim);
@@ -607,12 +607,9 @@ void Renderer::setCommonUniforms(Shader sh) {
     setF(sh, "night", L_.night);
     setF(sh, "fogGrey", L_.fogGrey);
     setI(sh, "cloudMap", 13);
-    setF(sh, "cloudShadowAmt", volEnabled() ? 1.f : 0.f);
+    setF(sh, "cloudShadowAmt", volEnabled() && csm_.id ? 1.f : 0.f);
     setF(sh, "cloudCov", cloud_.coverage);
-    setF(sh, "cloudBaseH", cloud_.base);
-    setF(sh, "cloudTopH", cloud_.top);
-    setF(sh, "cloudMapScale", cloud_.scale);
-    setV2(sh, "cloudWind", cloud_.wind);
+    setV4(sh, "csmRect", csmRect_);
     setF(sh, "volClouds", volEnabled() ? 1.f : 0.f);
     setLightUniforms(sh);
 }
@@ -908,8 +905,22 @@ void Renderer::drawWater(const SceneState& s) {
 }
 
 // ------------------------------------------------------------------ frame
-void Renderer::render(const SceneState& s, float dt) {
+void Renderer::render(const SceneState& sIn, float dt) {
     if (!course_) return;
+    // the weather sets the clouds; the rain the rider gets is what falls from the cloud overhead
+    SceneState s = sIn;
+    {
+        float tmin = course_->minElevation(), tmax = course_->maxElevation();
+        if (!refInit_) { refMin_ = tmin; refMax_ = tmax; refInit_ = true; }
+        float a = 1.f - std::exp(-dt / 20.f);
+        refMin_ += (tmin - refMin_) * a;
+        refMax_ += (tmax - refMax_) * a;
+    }
+    updateCloudParams(s, dt);
+    if (volEnabled()) {
+        float f = 0.12f + 0.88f * cloud_.here;
+        s.wx.rain *= f; s.wx.snow *= f; s.wx.hail *= f;
+    }
     if (rtW_ != GetRenderWidth() || rtH_ != GetRenderHeight()) {
         destroyTargets();
         createTargets();
@@ -925,14 +936,6 @@ void Renderer::render(const SceneState& s, float dt) {
     riderPos_ = Vector3Add(toV(course_->at(s.dist).pos), Vector3Scale(rightOf(course_->at(s.dist).heading), 1.4f));
     updateGrass();
     updateParticles(s, dt);
-    {
-        float tmin = course_->minElevation(), tmax = course_->maxElevation();
-        if (!refInit_) { refMin_ = tmin; refMax_ = tmax; refInit_ = true; }
-        float a = 1.f - std::exp(-dt / 20.f);
-        refMin_ += (tmin - refMin_) * a;
-        refMax_ += (tmax - refMax_) * a;
-    }
-    updateCloudParams(s, dt);
     if (bolt_.t >= 0) { bolt_.t += dt; if (bolt_.t > 0.35f) bolt_.t = -1; }
     cascadeRange_[0] = 40.f;
     cascadeRange_[1] = quality_ >= 1 ? 380.f : 250.f;
@@ -941,6 +944,7 @@ void Renderer::render(const SceneState& s, float dt) {
     if (s.pacerDist >= 0) ghostRig_.pose({s.time * 9.0, 0.f, 0.f, 0.5f, 0.f});
 
     renderShadowMaps(s);
+    renderCloudShadow();
 
     BeginTextureMode(scene_);
     ClearBackground(BLACK);
@@ -951,7 +955,7 @@ void Renderer::render(const SceneState& s, float dt) {
     rlActiveTextureSlot(11);
     rlEnableTexture(shadow_[1].depth.id);
     rlActiveTextureSlot(13);
-    rlEnableTexture(cloudMap_.id);
+    rlEnableTexture(csm_.id ? csm_.texture.id : cloudMap_.id);
     rlActiveTextureSlot(14);
     rlEnableTexture(tex_.moor.id);   // terrain: moorland (material slots 0-11 are taken)
     rlActiveTextureSlot(0);

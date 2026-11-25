@@ -137,7 +137,14 @@ private:
     void drawBolt();
 
     // ---- volumetric clouds / fog / light cones / rain shafts (Volumetrics.cpp)
-    struct CloudParams { float coverage = 0.3f, type = 0.5f, base = 1500, top = 2500, sigma = 0.05f, precip = 0, scale = 26000; Vector2 wind{}; };
+    struct CloudParams {
+        float coverage = 0.3f, type = 0.5f, base = 1500, top = 2500, sigma = 0.05f, precip = 0, scale = 26000;
+        float precipArea = 0;   // fraction of the sky raining / snowing (the weather's rain cells)
+        float here = 1;         // 0..1: how much of that falls on the rider right now (cell overhead?)
+        Vector2 wind{};
+    };
+    void renderCloudShadow();
+    float precipCellAt(float x, float z) const;   // CPU copy of the weather map's rain cells
     void initVolumetrics();
     void unloadVolumetrics();
     void createVolTargets();
@@ -146,7 +153,11 @@ private:
     void renderVolumetrics(const SceneState& s);
     bool volEnabled() const { return quality_ >= 1 && volShape_.id != 0 && !volDisabled_; }
     void setLightUniforms(Shader sh);
-    Shader volMarchSh_{}, volResolveSh_{}, volApplySh_{};
+    Shader volMarchSh_{}, volResolveSh_{}, volApplySh_{}, volShadowSh_{};
+    RenderTexture2D csm_{}, csmTmp_{};   // cloud shadow map (+ blur scratch)
+    Vector4 csmRect_{0, 0, 1.f / 16000.f, 1500};
+    std::vector<unsigned char> cloudPx_;   // weather map texels (r coverage, g type, b rain cells)
+    int cloudPxN_ = 0;
     Texture2D volShape_{}, volDetail_{}, cloudMap_{};
     Vector4 volShapeDim_{}, volDetailDim_{};
     RenderTexture2D volCur_{}, volHist_[2]{}, sceneFx_{};

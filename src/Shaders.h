@@ -144,13 +144,10 @@ uniform vec3 lightCol[16];
 uniform vec3 lightDir[16];
 uniform vec2 lightCone[16];   // cos inner, cos outer (outer < -0.5 = point light)
 uniform vec4 lightShape[16];  // xyz = beam's long axis (along the road), w = elongation (1 = round)
-uniform sampler2D cloudMap;   // volumetric clouds' weather map (r = coverage)
+uniform sampler2D cloudMap;   // the clouds' shadow map (sunlight through the cloud layer)
 uniform float cloudShadowAmt; // 0 = no cloud shadows (volumetrics off)
 uniform float cloudCov;
-uniform float cloudBaseH;
-uniform float cloudTopH;
-uniform float cloudMapScale;
-uniform vec2 cloudWind;
+uniform vec4 csmRect;         // x0, z0, 1/size (m), cloud base height the map is parametrised at
 uniform float wetness;
 uniform float snowCover;
 uniform float flash;
@@ -219,12 +216,17 @@ float shadowFactor(vec3 wp, vec3 n) {
 }
 
 // shadows of the volumetric clouds: where the light's ray meets the cloud layer, how covered is it
+// soft shadows of the volumetric clouds: follow the light's ray up to the cloud base and read
+// how much light the clouds let through there (ray-marched each frame, blurred)
 float cloudShadow(vec3 wp) {
-    if (cloudShadowAmt < 0.5 || sunDir.y < 0.03) return 1.0;
-    float hMid = mix(cloudBaseH, cloudTopH, 0.25);
-    vec2 xz = wp.xz + sunDir.xz / sunDir.y * (hMid - wp.y);
-    float w = textureLod(cloudMap, (xz + cloudWind) / cloudMapScale, 2.0).r;
-    return 1.0 - 0.82 * smoothstep(1.0 - cloudCov - 0.04, 1.0 - cloudCov + 0.32, w);
+    if (cloudShadowAmt < 0.5) return 1.0;
+    vec3 L = sunDir;
+    L.y = max(L.y, 0.05);
+    vec2 t = (wp.xz + L.xz / L.y * (csmRect.w - wp.y) - csmRect.xy) * csmRect.z;
+    float far = 1.0 - 0.8 * cloudCov;   // beyond the map: the average
+    if (t.x < 0.0 || t.y < 0.0 || t.x > 1.0 || t.y > 1.0) return far;
+    float e = smoothstep(0.42, 0.5, max(abs(t.x - 0.5), abs(t.y - 0.5)));
+    return mix(texture(cloudMap, t).r, far, e);
 }
 
 // street-light beam: a cone around lightDir squeezed across the road and stretched along it,
@@ -527,6 +529,7 @@ void main() {
     if (debugMode == 6) finalColor = vec4(vec3(rough, spec, film), 1.0);
     if (debugMode == 7) finalColor = vec4(fragColor.a, moorW, screeAmt, 1.0);
     if (debugMode == 8) finalColor = vec4(geo, moist, alt, 1.0);
+    if (debugMode == 9) finalColor = vec4(vec3(cloudShadow(fragPos)), 1.0);
 }
 )";
 

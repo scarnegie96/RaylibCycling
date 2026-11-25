@@ -60,6 +60,9 @@ uniform vec2 windOffset;       // metres the clouds have drifted
 uniform float hazeDensity;
 uniform float cloudSteps;
 uniform float planetR;
+uniform float precipArea;      // fraction of the sky raining (from the weather), 0 = dry
+uniform sampler2D cloudShadowTex;   // cloud shadow map (see the SHADOW_PASS below)
+uniform vec4 csmRect;          // x0, z0, 1/size (m), cloud base it is parametrised at
 uniform float volDebug;
 
 // fog / rain
@@ -114,6 +117,8 @@ float phase2(float c, float k) { return mix(hg(c, 0.78 * k), hg(c, -0.25 * k), 0
 
 // ------------------------------------------------------------ clouds
 float covMask(float w) { return smoothstep(1.0 - coverage - 0.04, 1.0 - coverage + 0.32, w); }
+// where it rains: the weather's rain area as a fraction of the sky (the b channel is uniform)
+float precipMask(float b) { return precipArea <= 0.001 ? 0.0 : smoothstep(1.0 - precipArea - 0.06, 1.0 - precipArea + 0.12, b); }
 
 float heightGrad(float h, float type) {
     float st = smoothstep(0.0, 0.07, h) * (1.0 - smoothstep(0.16, 0.32, h));
@@ -131,7 +136,8 @@ float cloudDensity(vec3 p, bool detail) {
     float h = (altitude(p) - cloudBase) / (cloudTop - cloudBase);
     if (h < 0.0 || h > 1.0) return 0.0;
     vec3 w = textureLod(weatherTex, (p.xz + windOffset) / weatherScale, 0.0).rgb;
-    float cov = covMask(w.r);
+    float rainCell = precipMask(w.b);
+    float cov = max(covMask(w.r), rainCell * 0.97);   // rain always falls out of a solid cloud
     if (cov < 0.002) return 0.0;
     float type = clamp(cloudType + (w.g - 0.5) * 0.45, 0.0, 1.0);
     // wind shear: the tops run ahead of the bases
@@ -210,7 +216,8 @@ vec4 marchClouds(vec3 ro, vec3 rd, float tScene, float jitter, out float avgT) {
         if (dc > 0.0) {
             float dens = cloudDensity(p, true);
             if (dens > 0.001) {
-                float sig = dens * cloudSigma;
+                float rc = precipMask(textureLod(weatherTex, (p.xz + windOffset) / weatherScale, 0.0).b);
+                float sig = dens * cloudSigma * (1.0 + 1.6 * rc);   // rain clouds are thick and dark
                 float od = sunOpticalDepth(p);
                 // multiple scattering octaves (Wrenninge / Hillaire)
                 float a = 1.0, b = 1.0, c = 1.0, lum = 0.0;
@@ -261,11 +268,12 @@ float sunVis(vec3 p) {
 }
 
 float cloudShadowAt(vec3 p) {
-    if (cloudOn < 0.5 || lightDirF.y < 0.03) return 1.0;
-    float hMid = mix(cloudBase, cloudTop, 0.25);
-    vec2 xz = p.xz + lightDirF.xz / lightDirF.y * (hMid - p.y);
-    float w = textureLod(weatherTex, (xz + windOffset) / weatherScale, 2.0).r;
-    return 1.0 - 0.82 * covMask(w);
+    if (cloudOn < 0.5) return 1.0;
+    vec3 L = lightDirF;
+    L.y = max(L.y, 0.05);
+    vec2 t = (p.xz + L.xz / L.y * (csmRect.w - p.y) - csmRect.xy) * csmRect.z;
+    if (t.x < 0.0 || t.y < 0.0 || t.x > 1.0 || t.y > 1.0) return 1.0 - 0.8 * coverage;
+    return textureLod(cloudShadowTex, t, 0.0).r;
 }
 
 float fogDensity(vec3 p) {
@@ -344,7 +352,7 @@ vec4 marchFog(vec3 ro, vec3 rd, float tScene, float jitter) {
 
 // rain falling out of the clouds in grey curtains, beyond the fog volume
 vec4 marchShafts(vec3 ro, vec3 rd, float tScene, float jitter) {
-    if (precip < 0.01 || cloudOn < 0.5) return vec4(0.0, 0.0, 0.0, 1.0);
+    if (precipArea < 0.01 || cloudOn < 0.5) return vec4(0.0, 0.0, 0.0, 1.0);
     float t0 = fogRange, t1 = min(tScene, 14000.0);
     if (rd.y > 0.0) t1 = min(t1, (cloudBase - ro.y) / max(rd.y, 1e-3));
     if (t1 <= t0) return vec4(0.0, 0.0, 0.0, 1.0);
@@ -360,9 +368,9 @@ vec4 marchShafts(vec3 ro, vec3 rd, float tScene, float jitter) {
         // rain slants with the wind as it falls
         vec2 xz = p.xz + windVel.xz * (cloudBase - p.y) * 0.12;
         vec3 w = textureLod(weatherTex, (xz + windOffset) / weatherScale, 1.0).rgb;
-        float cell = covMask(w.r) * smoothstep(0.35, 0.75, w.b);
+        float cell = precipMask(w.b);
         float streak = tex3D(detailTex, vec3(xz / 900.0, 0.37), detailDim).g;
-        float sig = precip * 0.00055 * cell * (0.4 + 1.2 * streak) * smoothstep(cloudBase + 50.0, cloudBase - 300.0, p.y);
+        float sig = (0.4 + 0.6 * precip) * 0.0007 * cell * (0.4 + 1.2 * streak) * smoothstep(cloudBase + 50.0, cloudBase - 300.0, p.y);
         if (sig < 1e-7) continue;
         vec3 S = (amb + lightColF * 0.15) * sig;
         float tr = exp(-sig * ds);
@@ -372,6 +380,26 @@ vec4 marchShafts(vec3 ro, vec3 rd, float tScene, float jitter) {
     return vec4(scat, T);
 }
 
+#ifdef SHADOW_PASS
+// Cloud shadow map: each texel is the sunlight getting through the cloud layer along the
+// light's direction, parametrised by where that ray crosses the cloud base, so any ground
+// point at any height looks itself up exactly (low sun = long, smeared shadows).
+void main() {
+    vec2 u = csmRect.xy + gl_FragCoord.xy / res / csmRect.z;
+    vec3 L = lightDirF;
+    L.y = max(L.y, 0.05);
+    L = normalize(L);
+    float len = min((cloudTop - cloudBase) / L.y, 9000.0);
+    vec3 p0 = vec3(u.x, cloudBase, u.y);
+    const int n = 14;
+    float od = 0.0;
+    for (int i = 0; i < n; i++) od += cloudDensity(p0 + L * (len * (float(i) + 0.5) / float(n)), false);
+    od *= len / float(n);
+    // forward scattering lets light through thin cloud; a deck still lets a little in
+    float T = max(exp(-od * cloudSigma * 0.12), 0.1);
+    finalColor = vec4(T, T, T, 1.0);
+}
+#else
 void main() {
     vec2 uv = gl_FragCoord.xy / res;
     float z = textureLod(depthTex, uv, 0.0).r;
@@ -398,6 +426,7 @@ void main() {
         finalColor = vec4(1.0 - cl.a, covMask(wr), sh, 0.0);
     }
 }
+#endif
 )";
 
 // temporal resolve at the march resolution
