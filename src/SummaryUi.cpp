@@ -6,8 +6,8 @@ using namespace ui;
 
 void App::drawSummary() {
     if (!summaryRec_) { screen_ = Screen::Home; return; }
-    const float W = float(GetScreenWidth()), H = float(GetScreenHeight());
-    DrawRectangle(0, 0, int(W), int(H), Color{15, 23, 42, 60});
+    const float W = ui::screenW(), H = ui::screenH();
+    DrawRectangle(0, 0, int(W), int(H), Color{8, 12, 20, 60});
     Rectangle r{W * 0.03f, H * 0.03f, W * 0.94f, H * 0.94f};
     panel(r, PANEL);
     textRight("Ride saved", r.x + r.width - 250, r.y + 26, F::Body, GOOD, 18);

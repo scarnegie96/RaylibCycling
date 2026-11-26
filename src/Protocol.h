@@ -94,5 +94,36 @@ Bytes wahooUnlock();
 Bytes wahooSetErg(int watts);
 Bytes wahooInitSim(double total_mass_kg, double crr = 0.004, double cw = 0.51);
 Bytes wahooSetGrade(double grade_pct);
+Bytes wahooSetResistance(double level01);  // 0 = easiest .. 1 = hardest
+
+// ------------------------------------------------------------------ Zwift controllers
+// Zwift Click / Play / Ride (as documented by open-source apps such as SwiftControl):
+// custom service 00000001-19ca-4651-86e5-fa29dcdd09d1 (newer firmware: 0xFC82), with an async
+// notify characteristic ...0002, a sync write ...0003 and a sync indicate ...0004.
+// Writing "RideOn" to sync-RX starts plain (unencrypted) button notifications on async.
+namespace zwift {
+extern const char* SERVICE;        // 00000001-19ca-4651-86e5-fa29dcdd09d1
+extern const char* SERVICE_FC82;   // 0000fc82-0000-1000-8000-00805f9b34fb
+extern const char* ASYNC;          // 00000002-19ca-4651-86e5-fa29dcdd09d1 (notify)
+extern const char* SYNC_RX;        // 00000003-19ca-4651-86e5-fa29dcdd09d1 (write)
+extern const char* SYNC_TX;        // 00000004-19ca-4651-86e5-fa29dcdd09d1 (indicate)
+constexpr uint16_t MANUFACTURER_ID = 0x094A;
+Bytes rideOn();                    // "RideOn"
+struct Buttons { bool up = false, down = false; };   // harder / easier gear held
+// A button notification -> which shift buttons are held; nullopt for other messages
+// (battery, idle keep-alives). Click 0x37, Play 0x07, Ride 0x23 (protobuf payloads;
+// Click/Play buttons read 0 = pressed, Ride's button map has a bit cleared per pressed button).
+// clickStyle: a two-button Click v2 reporting in the Ride format - its right-hand button is
+// harder and its left-hand one easier, whichever shift bit each sets.
+std::optional<Buttons> parseButtons(const uint8_t* d, size_t n, bool clickStyle = false);
+std::string hex(const uint8_t* d, size_t n, size_t max = 24);
+// Turns held-state reports into presses: +1 harder, -1 easier, 0 nothing new
+class ShiftEdges {
+public:
+    int update(const Buttons& b);
+private:
+    Buttons prev_;
+};
+}  // namespace zwift
 
 }  // namespace proto

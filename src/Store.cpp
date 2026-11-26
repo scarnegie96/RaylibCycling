@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <sstream>
 
@@ -62,16 +63,18 @@ void load(Profile& p, Prefs& pr) {
     num("lthr", p.lthr);
     flag("hrAlerts", p.hrAlerts); inum("hrAlertLo", p.hrAlertLo); inum("hrAlertHi", p.hrAlertHi);
     flag("hrAlertHigh", p.hrAlertHigh); flag("hrAlertLow", p.hrAlertLow); num("hrAlertGraceS", p.hrAlertGraceS); num("hrAlertRepeatS", p.hrAlertRepeatS);
-    inum("quality", pr.quality); inum("timeOfDay", pr.timeOfDay); inum("camera", pr.camera); flag("startIn3d", pr.startIn3d);
-    inum("courseSeed", pr.courseSeed);
+    inum("quality", pr.quality); inum("renderScale", pr.renderScale); inum("timeOfDay", pr.timeOfDay); inum("camera", pr.camera); flag("startIn3d", pr.startIn3d);
+    inum("courseSeed", pr.courseSeed); inum("scenery", pr.scenery); inum("mapSeed", pr.mapSeed); inum("mapSizeKm", pr.mapSizeKm); inum("mapClimate", pr.mapClimate); inum("freeWorld", pr.freeWorld);
     str("selRoute", pr.selRoute);
     inum("todMode", pr.todMode); num("todHour", pr.todHour); num("cycleMinutes", pr.cycleMinutes);
     inum("weatherMode", pr.weatherMode); str("weatherKind", pr.weatherKind);
     num("lat", pr.lat); num("lon", pr.lon); str("place", pr.place);
+    inum("theme", pr.theme); inum("accent", pr.accent); inum("hudStyle", pr.hudStyle); inum("uiSize", pr.uiSize); inum("hudSize", pr.hudSize);
     flag("wildlife", pr.wildlife); flag("lanterns", pr.lanterns); flag("sound", pr.sound);
+    flag("showFps", pr.showFps); flag("showPerf", pr.showPerf);
     num("weeklyGoalHours", p.weeklyGoalHours);
     int fa = int(p.ftpAuto); inum("ftpAuto", fa); p.ftpAuto = FtpAutoMode(std::clamp(fa, 0, 2));
-    str("trainerId", pr.trainerId); str("trainerName", pr.trainerName); str("hrId", pr.hrId); str("hrName", pr.hrName);
+    str("trainerId", pr.trainerId); str("shifterId", pr.shifterId); str("shifterName", pr.shifterName); str("trainerName", pr.trainerName); str("hrId", pr.hrId); str("hrName", pr.hrName);
     flag("simEnabled", pr.simEnabled);
     num("simEffortW", pr.sim.effortW); num("simPowerW", pr.sim.powerW); num("simHrBpm", pr.sim.hrBpm); num("simCadence", pr.sim.cadenceRpm);
     num("simVariability", pr.sim.variability);
@@ -92,8 +95,9 @@ void save(const Profile& p, const Prefs& pr) {
       << "\nwheelCircM=" << p.wheelCircM << "\nstartGear=" << p.startGear << "\nhrZoneModel=" << int(p.hrZoneModel) << "\nlthr=" << p.lthr
       << "\nhrAlerts=" << p.hrAlerts << "\nhrAlertLo=" << p.hrAlertLo << "\nhrAlertHi=" << p.hrAlertHi << "\nhrAlertHigh=" << p.hrAlertHigh
       << "\nhrAlertLow=" << p.hrAlertLow << "\nhrAlertGraceS=" << p.hrAlertGraceS << "\nhrAlertRepeatS=" << p.hrAlertRepeatS
-      << "\nquality=" << pr.quality << "\ntimeOfDay=" << pr.timeOfDay << "\ncamera=" << pr.camera << "\nstartIn3d=" << pr.startIn3d
-      << "\ncourseSeed=" << pr.courseSeed << "\ntrainerId=" << pr.trainerId << "\ntrainerName=" << pr.trainerName << "\nhrId=" << pr.hrId
+      << "\ntheme=" << pr.theme << "\naccent=" << pr.accent << "\nhudStyle=" << pr.hudStyle << "\nuiSize=" << pr.uiSize << "\nhudSize=" << pr.hudSize
+      << "\nquality=" << pr.quality << "\nrenderScale=" << pr.renderScale << "\ntimeOfDay=" << pr.timeOfDay << "\ncamera=" << pr.camera << "\nstartIn3d=" << pr.startIn3d
+      << "\ncourseSeed=" << pr.courseSeed << "\nscenery=" << pr.scenery << "\nmapSeed=" << pr.mapSeed << "\nmapSizeKm=" << pr.mapSizeKm << "\nmapClimate=" << pr.mapClimate << "\nfreeWorld=" << pr.freeWorld << "\nshifterId=" << pr.shifterId << "\nshifterName=" << pr.shifterName << "\ntrainerId=" << pr.trainerId << "\ntrainerName=" << pr.trainerName << "\nhrId=" << pr.hrId
       << "\nhrName=" << pr.hrName << "\nsimEnabled=" << pr.simEnabled << "\nsimEffortW=" << pr.sim.effortW << "\nsimPowerW=" << pr.sim.powerW
       << "\nsimHrBpm=" << pr.sim.hrBpm << "\nsimCadence=" << pr.sim.cadenceRpm << "\nsimVariability=" << pr.sim.variability
       << "\nsimPowerSource=" << int(pr.sim.powerSource) << "\nsimPattern=" << int(pr.sim.pattern) << "\nsimHrSource=" << int(pr.sim.hrSource)
@@ -101,6 +105,7 @@ void save(const Profile& p, const Prefs& pr) {
       << "\ntodHour=" << pr.todHour << "\ncycleMinutes=" << pr.cycleMinutes << "\nweatherMode=" << pr.weatherMode
       << "\nweatherKind=" << pr.weatherKind << "\nlat=" << pr.lat << "\nlon=" << pr.lon << "\nplace=" << pr.place
       << "\nwildlife=" << pr.wildlife << "\nlanterns=" << pr.lanterns << "\nsound=" << pr.sound
+      << "\nshowFps=" << pr.showFps << "\nshowPerf=" << pr.showPerf
       << "\nweeklyGoalHours=" << p.weeklyGoalHours << "\nftpAuto=" << int(p.ftpAuto) << "\n";
 }
 
@@ -297,6 +302,67 @@ bool importCoreKick(Profile& p, std::vector<wk::Workout>& imported, std::string&
     msg = b;
     return gotProfile || n > 0;
 #endif
+}
+
+std::vector<SavedWorld> loadSavedWorlds() {
+    std::vector<SavedWorld> out;
+    std::ifstream f(fs::path(dir()) / "saved_worlds.json");
+    if (!f) return out;
+    std::string txt((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    json::Value v;
+    if (!json::parse(txt, v)) return out;
+    for (const auto& e : v.arr("worlds")) {
+        SavedWorld w;
+        w.id = e.strOr("id"); w.name = e.strOr("name"); w.savedAt = e.strOr("saved_at");
+        w.seed = uint32_t(e.numOr("seed", 1)); w.sizeKm = int(e.numOr("size_km", 20)); w.climate = int(e.numOr("climate", 0));
+        w.cell = float(e.numOr("cell_m", 20)); w.erosion = float(e.numOr("erosion", 1)); w.aridity = float(e.numOr("aridity", 0)); w.roads = e.boolOr("roads", true);
+        w.generator = int(e.numOr("generator_version", 0));
+        if (auto s = e.get("start"); s && s->type == json::Value::Object) {
+            w.hasStart = true;
+            w.road = int(s->numOr("road", -1)); w.idx = int(s->numOr("point", 0)); w.fwd = s->boolOr("forwards", true);
+            w.startX = float(s->numOr("x", 0)); w.startZ = float(s->numOr("z", 0));
+            w.headX = float(s->numOr("heading_x", 0)); w.headZ = float(s->numOr("heading_z", 1));
+            w.startLabel = s->strOr("label");
+        }
+        w.towns = int(e.numOr("places", 0)); w.roadKm = float(e.numOr("road_km", 0));
+        if (!w.id.empty()) out.push_back(w);
+    }
+    return out;
+}
+
+bool saveSavedWorlds(const std::vector<SavedWorld>& ws) {
+    json::Value root = json::Value::object();
+    root["format"] = 1;
+    json::Value arr = json::Value::array();
+    for (const auto& w : ws) {
+        json::Value e = json::Value::object();
+        e["id"] = w.id; e["name"] = w.name; e["saved_at"] = w.savedAt;
+        e["seed"] = (unsigned long long)w.seed; e["size_km"] = w.sizeKm; e["climate"] = w.climate;
+        e["cell_m"] = double(w.cell); e["erosion"] = double(w.erosion); e["aridity"] = double(w.aridity); e["roads"] = w.roads;
+        e["generator_version"] = w.generator;
+        if (w.hasStart) {
+            json::Value s = json::Value::object();
+            s["road"] = w.road; s["point"] = w.idx; s["forwards"] = w.fwd;
+            s["x"] = double(w.startX); s["z"] = double(w.startZ); s["heading_x"] = double(w.headX); s["heading_z"] = double(w.headZ);
+            s["label"] = w.startLabel;
+            e["start"] = s;
+        }
+        e["places"] = w.towns; e["road_km"] = double(w.roadKm);
+        arr.push(e);
+    }
+    root["worlds"] = arr;
+    // write a temporary file, then swap it in (no half-written list if we crash mid-write)
+    fs::path path = fs::path(dir()) / "saved_worlds.json", tmp = path;
+    tmp += ".tmp";
+    {
+        std::ofstream f(tmp);
+        if (!f) return false;
+        f << json::dump(root);
+        if (!f) return false;
+    }
+    std::error_code ec;
+    fs::rename(tmp, path, ec);
+    return !ec;
 }
 
 }  // namespace store

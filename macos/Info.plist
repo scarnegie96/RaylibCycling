@@ -4,6 +4,8 @@
 <dict>
     <key>CFBundleIdentifier</key>
     <string>com.coreray.app</string>
+    <key>CFBundleIconFile</key>
+    <string>CoreRay</string>
     <key>CFBundleName</key>
     <string>CoreRay</string>
     <key>CFBundleShortVersionString</key>

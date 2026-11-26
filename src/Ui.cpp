@@ -5,26 +5,130 @@
 #include <cstdio>
 
 #include "raymath.h"
+#include "rlgl.h"
 
 namespace ui {
 
-// CoreKick's light, data-forward palette
-const Color BG{243, 245, 248, 255};        // --bg
-const Color PANEL{255, 255, 255, 255};     // --card
-const Color PANEL2{246, 248, 251, 255};    // --card-2
-const Color PANEL_HI{234, 237, 242, 255};  // --card-3
-const Color LINE{15, 23, 42, 20};          // --line
-const Color TEXT{17, 24, 39, 255};         // --text
-const Color DIM{91, 100, 117, 255};        // --muted
-const Color FAINT{139, 148, 165, 255};     // --muted-2
-const Color ACCENT{15, 157, 88, 255};      // --accent
-const Color GOOD{15, 157, 88, 255};
-const Color WARN{201, 130, 0, 255};
-const Color BAD{220, 61, 67, 255};
-const Color HR_RED{229, 70, 107, 255};
-const Color SKY{47, 127, 216, 255};
-const Color GHOST{114, 89, 232, 255};
-const Color INK{31, 36, 48, 255};  // the 3D HUD ink
+// CoreKick's light, data-forward palette (the Light theme); applyTheme() swaps it
+Color BG{243, 245, 248, 255};        // --bg
+Color PANEL{255, 255, 255, 255};     // --card
+Color PANEL2{246, 248, 251, 255};    // --card-2
+Color PANEL_HI{234, 237, 242, 255};  // --card-3
+Color LINE{15, 23, 42, 20};          // --line
+Color TEXT{17, 24, 39, 255};         // --text
+Color DIM{91, 100, 117, 255};        // --muted
+Color FAINT{139, 148, 165, 255};     // --muted-2
+Color ACCENT{15, 157, 88, 255};      // --accent
+Color GOOD{15, 157, 88, 255};
+Color WARN{201, 130, 0, 255};
+Color BAD{220, 61, 67, 255};
+Color HR_RED{229, 70, 107, 255};
+Color SKY{47, 127, 216, 255};
+Color GHOST{114, 89, 232, 255};
+Color INK{31, 36, 48, 255};  // the 3D HUD ink
+Color HOVER{238, 241, 245, 255};
+Color SIDEBAR{251, 252, 253, 255};
+Color HUD_INK{31, 36, 48, 255}, HUD_MUTED{91, 100, 117, 255}, HUD_GLASS{255, 255, 255, 255}, HUD_INV{255, 255, 255, 255};
+
+const char* const THEME_NAMES[4] = {"Light", "Dark", "Midnight", "Sand"};
+const char* const ACCENT_NAMES[6] = {"Green", "Blue", "Orange", "Purple", "Pink", "Teal"};
+const Color ACCENTS[6] = {{15, 157, 88, 255}, {37, 110, 235, 255}, {232, 98, 18, 255}, {124, 78, 230, 255}, {219, 50, 122, 255}, {13, 148, 136, 255}};
+const char* const HUD_STYLE_NAMES[4] = {"Match theme", "Light glass", "Dark glass", "Day / night"};
+
+namespace {
+struct Pal { Color bg, panel, panel2, hi, line, text, dim, faint, hover, sidebar, ink; };
+const Pal PALS[4] = {
+    // Light
+    {{243, 245, 248, 255}, {255, 255, 255, 255}, {246, 248, 251, 255}, {234, 237, 242, 255}, {15, 23, 42, 20}, {17, 24, 39, 255},
+     {91, 100, 117, 255}, {139, 148, 165, 255}, {238, 241, 245, 255}, {251, 252, 253, 255}, {15, 23, 42, 255}},
+    // Dark
+    {{19, 21, 26, 255}, {29, 32, 39, 255}, {35, 39, 47, 255}, {46, 51, 61, 255}, {255, 255, 255, 22}, {236, 239, 244, 255},
+     {164, 171, 184, 255}, {120, 128, 142, 255}, {42, 47, 56, 255}, {23, 25, 31, 255}, {236, 240, 248, 255}},
+    // Midnight: near-black with a cool blue cast
+    {{7, 9, 15, 255}, {15, 19, 30, 255}, {20, 25, 38, 255}, {30, 37, 54, 255}, {150, 180, 255, 24}, {228, 235, 250, 255},
+     {150, 163, 190, 255}, {106, 119, 146, 255}, {26, 32, 47, 255}, {10, 13, 22, 255}, {214, 226, 255, 255}},
+    // Sand: warm paper
+    {{244, 239, 230, 255}, {255, 252, 246, 255}, {249, 244, 235, 255}, {236, 229, 216, 255}, {60, 40, 20, 24}, {40, 32, 24, 255},
+     {112, 100, 86, 255}, {152, 140, 124, 255}, {241, 234, 223, 255}, {250, 246, 239, 255}, {48, 34, 20, 255}},
+};
+int g_theme = 0;
+bool g_hudDark = false;
+Color g_inkBase{15, 23, 42, 255};
+Color g_accentDeep{11, 128, 72, 255};
+}  // namespace
+
+bool themeIsDark(int t) { return t == 1 || t == 2; }
+bool themeIsDark() { return themeIsDark(g_theme); }
+bool hudIsDark() { return g_hudDark; }
+
+void applyTheme(int theme, int accent, bool hudDark) {
+    g_theme = std::clamp(theme, 0, 3);
+    const Pal& p = PALS[g_theme];
+    BG = p.bg; PANEL = p.panel; PANEL2 = p.panel2; PANEL_HI = p.hi; LINE = p.line; TEXT = p.text; DIM = p.dim; FAINT = p.faint;
+    HOVER = p.hover; SIDEBAR = p.sidebar; g_inkBase = p.ink;
+    Color a = ACCENTS[std::clamp(accent, 0, 5)];
+    if (themeIsDark(g_theme)) {  // a touch brighter so it reads on dark cards
+        a = Color{(unsigned char)std::min(255, a.r + 18), (unsigned char)std::min(255, a.g + 18), (unsigned char)std::min(255, a.b + 18), 255};
+    }
+    ACCENT = a;
+    g_accentDeep = Color{(unsigned char)(a.r * 0.8f), (unsigned char)(a.g * 0.8f), (unsigned char)(a.b * 0.8f), 255};
+    g_hudDark = hudDark;
+    if (hudDark) { HUD_INK = {238, 241, 247, 255}; HUD_MUTED = {160, 168, 183, 255}; HUD_GLASS = {20, 24, 32, 255}; HUD_INV = {20, 24, 32, 255}; }
+    else { HUD_INK = {31, 36, 48, 255}; HUD_MUTED = {91, 100, 117, 255}; HUD_GLASS = {255, 255, 255, 255}; HUD_INV = {255, 255, 255, 255}; }
+    INK = HUD_INK;
+}
+
+Color withAlpha(Color c, unsigned char a) { return Color{c.r, c.g, c.b, a}; }
+Color ink(unsigned char a) {
+    // light ink needs a little more alpha to read as strongly as dark ink does
+    if (themeIsDark()) return withAlpha(g_inkBase, (unsigned char)std::min(255, int(a * 1.35f)));
+    return withAlpha(g_inkBase, a);
+}
+Color hudInk(unsigned char a) { return withAlpha(HUD_INK, g_hudDark ? (unsigned char)std::min(255, int(a * 1.35f)) : a); }
+Color shadow(unsigned char a) { return Color{15, 23, 42, (unsigned char)(themeIsDark() ? std::min(255, a * 3) : a)}; }
+Color accentA(unsigned char a) { return withAlpha(ACCENT, a); }
+Color accentDeep() { return g_accentDeep; }
+Color hudPick(Color onLight, Color onDark) { return g_hudDark ? onDark : onLight; }
+
+// ---- scaling
+namespace {
+float g_scale = 1.f, g_last = 1.f;
+int g_depth = 0;
+}
+void pushScale(float s) {
+    rlDrawRenderBatchActive();
+    rlPushMatrix();
+    rlScalef(s, s, 1.f);
+    g_scale = s;
+    g_last = s;
+    ++g_depth;
+    SetMouseScale(1.f / s, 1.f / s);
+}
+void popScale() {
+    if (g_depth <= 0) return;
+    rlDrawRenderBatchActive();
+    rlPopMatrix();
+    --g_depth;
+    g_scale = 1.f;
+    SetMouseScale(1.f, 1.f);
+}
+float scale() { return g_scale; }
+float lastScale() { return g_last; }
+Vector2 mouseLogical() { Vector2 m = GetMousePosition(); float k = g_depth > 0 ? 1.f : g_last; return {m.x / k, m.y / k}; }
+void reapplyScale() { if (g_depth > 0 && g_scale != 1.f) { rlDrawRenderBatchActive(); rlLoadIdentity(); rlScalef(g_scale, g_scale, 1.f); } }
+float screenW() { return GetScreenWidth() / (g_depth > 0 ? g_scale : g_last); }
+float screenH() { return GetScreenHeight() / (g_depth > 0 ? g_scale : g_last); }
+void beginScissor(Rectangle r) {
+    BeginScissorMode(int(std::floor(r.x * g_scale)), int(std::floor(r.y * g_scale)), int(std::ceil(r.width * g_scale)), int(std::ceil(r.height * g_scale)));
+}
+float autoScale(float minW, float minH, float user) {
+    float W = ui::screenW(), H = ui::screenH();
+    float a = std::clamp(std::min(W / 1440.f, H / 900.f), 1.f, 2.2f);
+    float s = a * user;
+    // never so big that the layout runs out of room
+    s = std::min(s, std::min(W / minW, H / minH));
+    return std::max(0.5f, s);
+}
 
 static Font g_fonts[4];
 static Font g_symbols;  // DejaVu Sans: stars, ticks, arrows that Barlow doesn't have
@@ -166,25 +270,25 @@ bool anyTextActive() { return g_textActive; }
 void panel(Rectangle r, Color c, float round) {
     float rr = std::min(1.f, round * 48.f / std::max(1.f, std::min(r.width, r.height)));
     if (c.a > 200) {
-        DrawRectangleRounded({r.x, r.y + 2, r.width, r.height}, rr, 8, Color{15, 23, 42, 8});
-        DrawRectangleRounded({r.x - 1, r.y + 1, r.width + 2, r.height + 3}, rr, 8, Color{15, 23, 42, 5});
+        DrawRectangleRounded({r.x, r.y + 2, r.width, r.height}, rr, 8, ui::shadow(8));
+        DrawRectangleRounded({r.x - 1, r.y + 1, r.width + 2, r.height + 3}, rr, 8, ui::shadow(5));
     }
     DrawRectangleRounded(r, rr, 8, c);
     DrawRectangleRoundedLinesEx(r, rr, 8, 1.f, LINE);
 }
 
-bool hovered(Rectangle r) { return !g_blocked && CheckCollisionPointRec(GetMousePosition(), r); }
+bool hovered(Rectangle r) { return !g_blocked && CheckCollisionPointRec(ui::mouseLogical(), r); }
 bool clicked(Rectangle r) { return hovered(r) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT); }
 
 bool button(Rectangle r, const std::string& label, bool primary, bool enabled, float size) {
     bool h = enabled && hovered(r);
     float rr = std::min(1.f, 20.f / std::max(1.f, r.height));
     if (primary) {
-        if (enabled) DrawRectangleRounded({r.x, r.y + 3, r.width, r.height}, rr, 8, Color{15, 157, 88, 40});
-        DrawRectangleRounded(r, rr, 8, !enabled ? Color{15, 157, 88, 110} : h ? Color{11, 128, 72, 255} : ACCENT);
+        if (enabled) DrawRectangleRounded({r.x, r.y + 3, r.width, r.height}, rr, 8, ui::accentA(40));
+        DrawRectangleRounded(r, rr, 8, !enabled ? ui::accentA(110) : h ? ui::accentDeep() : ACCENT);
     } else {
         DrawRectangleRounded(r, rr, 8, h ? PANEL_HI : PANEL);
-        DrawRectangleRoundedLinesEx(r, rr, 8, 1.f, Color{15, 23, 42, 38});
+        DrawRectangleRoundedLinesEx(r, rr, 8, 1.f, ui::ink(38));
     }
     float sz = size > 0 ? size : std::min(fontSize(F::Small) + 1, r.height * 0.42f);
     Color tc = primary ? WHITE : TEXT;
@@ -196,8 +300,8 @@ bool button(Rectangle r, const std::string& label, bool primary, bool enabled, f
 
 bool chipButton(Rectangle r, const std::string& label, bool sel) {
     bool h = hovered(r);
-    DrawRectangleRounded(r, 1.f, 10, sel ? Color{15, 157, 88, 30} : h ? Color{15, 23, 42, 8} : Color{0, 0, 0, 0});
-    DrawRectangleRoundedLinesEx(r, 1.f, 10, 1.f, sel ? Color{15, 157, 88, 90} : Color{15, 23, 42, 38});
+    DrawRectangleRounded(r, 1.f, 10, sel ? ui::accentA(30) : h ? ui::ink(8) : Color{0, 0, 0, 0});
+    DrawRectangleRoundedLinesEx(r, 1.f, 10, 1.f, sel ? ui::accentA(90) : ui::ink(38));
     textCentered(label, r, F::Small, sel ? ACCENT : h ? TEXT : DIM, std::min(13.f, r.height * 0.5f));
     if (h) SetMouseCursor(MOUSE_CURSOR_POINTING_HAND);
     return h && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
@@ -207,7 +311,7 @@ bool toggle(Rectangle r, const std::string& label, bool on) {
     bool h = hovered(r);
     text(label, r.x, r.y + (r.height - fontSize(F::Body)) / 2, F::Body, TEXT);
     Rectangle sw{r.x + r.width - 40, r.y + (r.height - 23) / 2, 40, 23};
-    DrawRectangleRounded(sw, 1.f, 12, on ? Color{11, 128, 72, 255} : PANEL_HI);
+    DrawRectangleRounded(sw, 1.f, 12, on ? ui::accentDeep() : PANEL_HI);
     DrawCircle(int(on ? sw.x + sw.width - 11.5f : sw.x + 11.5f), int(sw.y + 11.5f), 8.5f, WHITE);
     if (h) SetMouseCursor(MOUSE_CURSOR_POINTING_HAND);
     return h && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
@@ -229,7 +333,7 @@ bool stepper(Rectangle r, const std::string& label, const std::string& value, in
 // CoreKick's segmented control: a recessed track, the selection a raised white pill
 int segmented(Rectangle r, const std::vector<std::string>& items, int sel) {
     float rr = std::min(1.f, 22.f / std::max(1.f, r.height));
-    DrawRectangleRounded(r, rr, 8, Color{236, 239, 244, 255});
+    DrawRectangleRounded(r, rr, 8, ui::PANEL_HI);
     DrawRectangleRoundedLinesEx(r, rr, 8, 1.f, LINE);
     float w = r.width / items.size();
     int out = -1;
@@ -238,8 +342,8 @@ int segmented(Rectangle r, const std::vector<std::string>& items, int sel) {
         bool h = hovered(c);
         float cr = std::min(1.f, 16.f / std::max(1.f, c.height));
         if (int(i) == sel) {
-            DrawRectangleRounded({c.x, c.y + 1, c.width, c.height}, cr, 8, Color{15, 23, 42, 22});
-            DrawRectangleRounded(c, cr, 8, WHITE);
+            DrawRectangleRounded({c.x, c.y + 1, c.width, c.height}, cr, 8, ui::shadow(22));
+            DrawRectangleRounded(c, cr, 8, themeIsDark() ? Color{(unsigned char)std::min(255, PANEL_HI.r + 22), (unsigned char)std::min(255, PANEL_HI.g + 22), (unsigned char)std::min(255, PANEL_HI.b + 24), 255} : PANEL);
         }
         textCentered(items[i], c, F::Small, int(i) == sel || h ? TEXT : DIM, std::min(fontSize(F::Small) + 1, c.height * 0.5f));
         if (h) SetMouseCursor(MOUSE_CURSOR_POINTING_HAND);
@@ -270,12 +374,12 @@ bool textBox(Rectangle r, TextBox& tb, bool multiline, const std::string& placeh
     bool h = hovered(r);
     if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
         if (h) { tb.active = true; g_focus = &tb; }
-        else if (g_focus == &tb && !CheckCollisionPointRec(GetMousePosition(), r)) { tb.active = false; g_focus = nullptr; }
+        else if (g_focus == &tb && !CheckCollisionPointRec(ui::mouseLogical(), r)) { tb.active = false; g_focus = nullptr; }
     }
     if (g_focus != &tb) tb.active = false;
     if (h) SetMouseCursor(MOUSE_CURSOR_IBEAM);
     DrawRectangleRounded(r, multiline ? 0.04f : 0.3f, 6, PANEL);
-    DrawRectangleRoundedLinesEx(r, multiline ? 0.04f : 0.3f, 6, 1.2f, tb.active ? ACCENT : Color{15, 23, 42, 38});
+    DrawRectangleRoundedLinesEx(r, multiline ? 0.04f : 0.3f, 6, 1.2f, tb.active ? ACCENT : ui::ink(38));
     bool changed = false;
     if (tb.active) {
         g_textActive = true;
@@ -296,7 +400,7 @@ bool textBox(Rectangle r, TextBox& tb, bool multiline, const std::string& placeh
         if (mod && IsKeyPressed(KEY_C)) SetClipboardText(tb.text.c_str());
         if (IsKeyPressed(KEY_ESCAPE) || (!multiline && IsKeyPressed(KEY_ENTER))) { tb.active = false; g_focus = nullptr; }
     }
-    BeginScissorMode(int(r.x + 4), int(r.y + 2), int(r.width - 8), int(r.height - 4));
+    beginScissor({r.x + 4, r.y + 2, r.width - 8, r.height - 4});
     float sz = 17, lh = 22;
     if (tb.text.empty() && !tb.active) text(placeholder, r.x + 10, r.y + 8, F::Body, FAINT, sz);
     float y = r.y + 8;
@@ -389,9 +493,9 @@ void powerChart(Rectangle r, const Samples& s, double ftp, double maxHr, int win
     size_t start = n > size_t(window) ? n - window : 0;
     float maxP = float(std::max(ftp * 1.5, 200.0));
     for (size_t i = start; i < n; ++i) maxP = std::max(maxP, s.power[i] * 1.08f);
-    for (int k = 1; k <= 3; ++k) DrawLineEx({r.x, r.y + r.height * k / 4}, {r.x + r.width, r.y + r.height * k / 4}, 1, Color{15, 23, 42, 10});
+    for (int k = 1; k <= 3; ++k) DrawLineEx({r.x, r.y + r.height * k / 4}, {r.x + r.width, r.y + r.height * k / 4}, 1, ui::ink(10));
     float fy = r.y + r.height * (1 - float(ftp) / maxP);
-    for (float x = r.x; x < r.x + r.width; x += 12) DrawLineEx({x, fy}, {std::min(x + 6, r.x + r.width), fy}, 1.2f, Color{15, 23, 42, 54});
+    for (float x = r.x; x < r.x + r.width; x += 12) DrawLineEx({x, fy}, {std::min(x + 6, r.x + r.width), fy}, 1.2f, ui::ink(54));
     if (labels) text("FTP", r.x + 4, fy - 16, F::Small, FAINT, 12);
     float colW = r.width / float(window);
     float off = float(window - std::min<size_t>(n, window)) * colW;
@@ -412,8 +516,8 @@ void powerChart(Rectangle r, const Samples& s, double ftp, double maxHr, int win
             prev = {x, y};
         }
     };
-    if (showTarget) line(s.target, 0, maxP, Color{15, 23, 42, 153}, 1.6f);
-    line(s.cadence, 0, 160, Color{15, 23, 42, 54}, 1.1f);
+    if (showTarget) line(s.target, 0, maxP, ui::ink(153), 1.6f);
+    line(s.cadence, 0, 160, ui::ink(54), 1.1f);
     line(s.hr, 50, float(std::max(maxHr, 120.0)), HR_RED, 2.0f);
     if (labels) {
         textRight(std::to_string(int(maxP)) + " W", r.x + r.width - 4, r.y + 2, F::Small, FAINT, 12);
@@ -434,7 +538,7 @@ void routeProfile(Rectangle r, const RouteProfile& route, double riderD, double 
     if (showClimbs)
         for (auto& c : route.climbs) {
             float x0 = r.x + float(c.startD / L) * r.width, x1 = r.x + float(c.endD / L) * r.width;
-            DrawRectangleRec({x0, r.y, x1 - x0, r.height}, Color{15, 23, 42, 9});
+            DrawRectangleRec({x0, r.y, x1 - x0, r.height}, ui::ink(9));
             if (c.category != "Uncategorised") text(c.category, x0 + 2, r.y + 1, F::Small, DIM, 12);
         }
     for (int i = 0; i < S; ++i) {
@@ -448,8 +552,8 @@ void routeProfile(Rectangle r, const RouteProfile& route, double riderD, double 
     auto marker = [&](double d, Color col, float rad) {
         double ld = std::fmod(std::max(0.0, d), L);
         float x = r.x + float(ld / L) * r.width, y = yOf(route.elevationAt(ld));
-        DrawLineEx({x, y}, {x, r.y + r.height}, 1, Color{15, 23, 42, 72});
-        DrawCircleV({x, y - rad}, rad + 2, WHITE);
+        DrawLineEx({x, y}, {x, r.y + r.height}, 1, ui::ink(72));
+        DrawCircleV({x, y - rad}, rad + 2, PANEL);
         DrawCircleV({x, y - rad}, rad, col);
     };
     if (ghostD >= 0) marker(ghostD, SKY, 4);
@@ -477,7 +581,7 @@ void upcomingProfile(Rectangle r, const RouteProfile& route, double d0, double a
         char buf[16];
         std::snprintf(buf, sizeof buf, "%.1f%%", g);
         float x = r.x + float(k * seg / ahead) * r.width;
-        DrawLineEx({x, r.y}, {x, r.y + r.height}, 1, Color{15, 23, 42, 19});
+        DrawLineEx({x, r.y}, {x, r.y + r.height}, 1, ui::ink(19));
         text(buf, x + 3, r.y + 1, F::Small, TEXT, 12);
     }
     (void)metric;
@@ -499,7 +603,7 @@ void workoutChart(Rectangle r, const std::vector<wk::Step>& steps, double ftp, d
             Color c = st.erg ? powerZoneColor(pct * ftp, ftp) : Color{170, 178, 192, 255};
             c.a = a <= t ? 235 : 120;
             DrawRectangleRec({x0, r.y + r.height - h, std::max(1.f, x1 - x0 - 0.8f), h}, c);
-            if (!st.erg) for (float yy = r.y + r.height - h; yy < r.y + r.height; yy += 6) DrawLineEx({x0, yy}, {x1, yy + 3}, 1, Color{15, 23, 42, 36});
+            if (!st.erg) for (float yy = r.y + r.height - h; yy < r.y + r.height; yy += 6) DrawLineEx({x0, yy}, {x1, yy + 3}, 1, ui::ink(36));
         }
     }
     if (s && wt && !s->power.empty()) {
@@ -511,7 +615,7 @@ void workoutChart(Rectangle r, const std::vector<wk::Step>& steps, double ftp, d
             if (tt < 0 || tt > T) { prev = {-1, -1}; continue; }
             float x = r.x + float(tt / T) * r.width;
             float y = r.y + r.height - std::min(1.f, float(s->power[i] / (maxPct * ftp))) * r.height;
-            if (prev.x >= 0 && x >= prev.x) DrawLineEx(prev, {x, y}, 1.5f, Color{15, 23, 42, 189});
+            if (prev.x >= 0 && x >= prev.x) DrawLineEx(prev, {x, y}, 1.5f, ui::ink(189));
             prev = {x, y};
         }
     }
@@ -529,7 +633,7 @@ void zoneBars(Rectangle r, const double* secs, int n, const std::vector<std::str
         float y = r.y + i * rowH;
         text(labels[i], r.x, y + rowH / 2 - 8, F::Small, DIM, 13);
         Rectangle bar{r.x + 120, y + rowH * 0.2f, r.width - 200, rowH * 0.6f};
-        DrawRectangleRounded(bar, 0.4f, 4, Color{15, 23, 42, 12});
+        DrawRectangleRounded(bar, 0.4f, 4, ui::ink(12));
         if (mx > 0) DrawRectangleRounded({bar.x, bar.y, bar.width * float(secs[i] / mx), bar.height}, 0.4f, 4, colors[i]);
         char b[40];
         std::snprintf(b, sizeof b, "%s  %2.0f%%", fmtDur(secs[i]).c_str(), total > 0 ? secs[i] / total * 100 : 0.0);
@@ -548,13 +652,13 @@ void lineChart(Rectangle r, const std::vector<Series>& series, float lo, float h
     for (int i = 0; i <= yTicks; ++i) {
         float v = lo + (hi - lo) * i / std::max(1, yTicks);
         float y = p.y + p.height - (v - lo) / (hi - lo) * p.height;
-        DrawLineEx({p.x, y}, {p.x + p.width, y}, 1, Color{15, 23, 42, 16});
+        DrawLineEx({p.x, y}, {p.x + p.width, y}, 1, ui::ink(16));
         std::snprintf(b, sizeof b, yFmt, v);
         textRight(b, p.x - 6, y - 8, F::Small, FAINT, 12);
     }
     if (!std::isnan(zeroLine) && zeroLine > lo && zeroLine < hi) {
         float y = p.y + p.height - (zeroLine - lo) / (hi - lo) * p.height;
-        DrawLineEx({p.x, y}, {p.x + p.width, y}, 1.2f, Color{15, 23, 42, 54});
+        DrawLineEx({p.x, y}, {p.x + p.width, y}, 1.2f, ui::ink(54));
     }
     for (size_t i = 0; i < xLabels.size(); ++i) {
         if (xLabels[i].empty()) continue;
@@ -594,7 +698,7 @@ void barChart(Rectangle r, const std::vector<float>& v, const std::vector<std::s
         Rectangle br{r.x + i * bw + bw * 0.16f, py + ph - h, bw * 0.68f, h};
         Color cc = int(i) == highlight ? c : Color{c.r, c.g, c.b, 150};
         if (h > 0.5f) DrawRectangleRounded(br, 0.25f, 4, cc);
-        else DrawRectangleRec({br.x, py + ph - 2, br.width, 2}, Color{15, 23, 42, 22});
+        else DrawRectangleRec({br.x, py + ph - 2, br.width, 2}, ui::ink(22));
         if (valFmt && v[i] > 0) {
             char b[32];
             std::snprintf(b, sizeof b, valFmt, v[i]);
@@ -608,7 +712,7 @@ void barChart(Rectangle r, const std::vector<float>& v, const std::vector<std::s
     }
     if (goal > 0) {
         float y = py + ph - goal / mx * ph;
-        for (float x = r.x; x < r.x + r.width; x += 10) DrawLineEx({x, y}, {std::min(x + 5, r.x + r.width), y}, 1.2f, Color{15, 23, 42, 81});
+        for (float x = r.x; x < r.x + r.width; x += 10) DrawLineEx({x, y}, {std::min(x + 5, r.x + r.width), y}, 1.2f, ui::ink(81));
     }
 }
 
@@ -621,7 +725,7 @@ void scrollBar(Rectangle r, float scroll, float contentH) {
     if (contentH <= r.height + 1) return;
     float h = std::max(30.f, r.height * r.height / contentH);
     float y = r.y + (r.height - h) * scroll / (contentH - r.height);
-    DrawRectangleRounded({r.x + r.width - 4, y, 3, h}, 1, 4, Color{15, 23, 42, 45});
+    DrawRectangleRounded({r.x + r.width - 4, y, 3, h}, 1, 4, ui::ink(45));
 }
 
 std::string fmtDateShort(int y, int m, int d) {

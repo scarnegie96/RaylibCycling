@@ -157,7 +157,10 @@ void RideEngine::difficulty(double d) {
     difficulty_ = std::clamp(difficulty_ + d / 100, 0.0, 1.5);
     char b[48]; std::snprintf(b, sizeof b, "Trainer difficulty %.0f%%", difficulty_ * 100); push("difficulty", b);
 }
-void RideEngine::shift(int d) { gearIdx_ = std::clamp(gearIdx_ + d, 0, phys::GEAR_COUNT - 1); }
+void RideEngine::shift(int d) {
+    int g = std::clamp(gearIdx_ + d, 0, phys::GEAR_COUNT - 1);
+    if (g != gearIdx_) { gearIdx_ = g; forceCmd_ = true; }
+}
 void RideEngine::setFreeMode(FreeMode m) {
     double ftp = std::max(profile_.ftp, 50.0);
     if (m == FreeMode::HeartRate) { double p3 = power3s(); hrW_ = p3 > 30 ? std::round(p3) : std::round(ftp * 0.55); hrCtrlT_ = 0; }
@@ -212,6 +215,14 @@ bool RideEngine::undoSector() {
 void RideEngine::extendRoute(const std::vector<SegmentSpec>& segs) {
     Route r = setup_.route;
     insertSegments(r, r.distance(), segs);
+    setRoute(r);
+    forceCmd_ = true;
+}
+
+void RideEngine::appendRoutePoints(const std::vector<RoutePoint>& pts) {
+    Route r = setup_.route;
+    for (const auto& p : pts)
+        if (r.points.empty() || p.d > r.points.back().d + 1e-6) r.points.push_back(p);
     setRoute(r);
     forceCmd_ = true;
 }
@@ -410,6 +421,16 @@ std::optional<TrainerCommand> RideEngine::tick(double dt, const TrainerInput& in
     cadence_ = in.connected ? std::max(0.0, in.cadenceRpm) : 0.0;
     hr_ = (in.heartRate && *in.heartRate > 0) ? in.heartRate : std::nullopt;
     cadEma_ += (cadence_ - cadEma_) * std::min(1.0, dt / 0.6);
+    // the trainer's flywheel speed, and from it the real gear the rider is in (speed per crank turn)
+    haveTrainerV_ = in.connected && in.trainerSpeedKmh && *in.trainerSpeedKmh > 0.5;
+    if (haveTrainerV_) {
+        trainerV_ += (*in.trainerSpeedKmh / 3.6 - trainerV_) * std::min(1.0, dt / 1.5);
+        trainerVFast_ += (*in.trainerSpeedKmh / 3.6 - trainerVFast_) * std::min(1.0, dt / 0.3);
+        if (cadence_ > 45 && trainerV_ > 2.5) {
+            double est = trainerV_ / (cadence_ / 60.0 * profile_.wheelCircM);
+            if (est > 1.0 && est < 5.0) realRatio_ += (est - realRatio_) * std::min(1.0, dt / 20.0);
+        }
+    } else trainerVFast_ = trainerV_ = cadEma_ / 60.0 * profile_.wheelCircM * realRatio_;
     // the ride clock starts on the first pedal stroke
     bool rolling = activeS_ > 0 || power_ > 0;
     if (!paused_ && !finished_ && dt > 0 && rolling) stepRide(dt);
@@ -428,7 +449,9 @@ void RideEngine::stepRide(double dt) {
     double offset = freeGradientActive() ? freeGradePct_ / 100 : 0;
     double physGrade = routeCompleteAt_ ? 0.0 : route_.gradeAt(lapD, 10) + offset;
     grade_ = physGrade;
+    double v0 = speed_;
     speed_ = phys::integrateSpeed(speed_, power_, physGrade, ele_, params_, dt);
+    accel_ += ((speed_ - v0) / dt - accel_) * std::min(1.0, dt / 0.5);
     maxSpeed_ = std::max(maxSpeed_, speed_);
     if (speed_ > 0.3 || power_ > 0) movingS_ += dt;
     int prevLap = lap_;
@@ -638,6 +661,14 @@ std::optional<TrainerCommand> RideEngine::control(double dt) {
         desired = route_.gradeAt(look, half) * 100 * difficulty_ + (freeGradientActive() ? freeGradePct_ : 0);
     } else if (setup_.kind == RideKind::Free) desired = freeGradePct_;
     else desired = 0;
+    // Momentum. A trainer flywheel stores a fraction of the energy of rider + bike, so a
+    // grade sent as-is brakes the legs at once: at 116 kg, 30 km/h into 8 % the virtual bike
+    // takes ~8 s to slow to 15 km/h, but the trainer stops the cranks in about one. While the
+    // virtual bike is slowing, its momentum pushes it up the road with force m|a|, i.e. the
+    // legs only have to supply the grade minus |a|/g. Only for slowing (speeding up is left to
+    // the flywheel), and nothing once the speed has settled.
+    if (mode == ControlMode::Sim && !(stepGrade && (stepGrade->second || !hasRoute)) && accel_ < 0)
+        desired += std::max(accel_ / phys::G * 100, -15.0) * (hasRoute ? difficulty_ : 1.0);
     if (paused_) desired = 0;
     double alpha = dt > 0 ? std::min(1.0, dt) : 0;
     if (forceCmd_ && !lastCmd_) trainerGradePct_ = desired;
@@ -645,20 +676,34 @@ std::optional<TrainerCommand> RideEngine::control(double dt) {
     trainerGradePct_ = std::clamp(trainerGradePct_, profile_.minTrainerGrade, profile_.maxTrainerGrade);
 
     shiftingActive_ = profile_.virtualShifting && mode_ == ControlMode::Sim && !paused_ && !finished_;
-    std::optional<double> shiftW;
-    if (shiftingActive_) shiftW = std::round(phys::gearTargetPower(cadEma_, gearIdx_, profile_.wheelCircM, trainerGradePct_ / 100, ele_, params_));
+    // virtual shifting stays in SIM mode: the grade is adjusted for the gear (see phys::gearSimGrade)
+    double simGrade = trainerGradePct_, simCw = params_.cw();
+    if (shiftingActive_) {
+        // Fast trainer speed: after a shift the cadence changes within a second, and the aero
+        // part of the gear grade follows it (the old 1.5 s smoothing kept drifting for ~3 s).
+        double k = phys::VIRTUAL_GEARS[gearIdx_] / std::max(0.5, realRatio_);
+        double want = phys::gearSimGrade(trainerGradePct_ / 100, k, trainerVFast_, params_) * 100;
+        simGrade = std::clamp(want, profile_.minTrainerGrade, profile_.maxTrainerGrade);
+        // Past the trainer's grade limit (KICKR CORE: 16 %) the top gears would all feel the
+        // same; put the rest of the force into the wind-resistance coefficient instead:
+        // m g (want - max) = extra cw * v^2   (FTMS cw is 0..2.55 kg/m).
+        if (want > simGrade) {
+            double v = std::max(trainerVFast_, 3.0);
+            simCw = std::min(2.55, simCw + params_.massKg * phys::G * (want - simGrade) / 100 / (v * v));
+        }
+    }
 
     TrainerCommand cmd;
     if (paused_ || finished_) cmd = TrainerCommand::sim(0, params_.crr, params_.cw());
-    else if (mode_ == ControlMode::Sim && shiftW) cmd = TrainerCommand::erg(*shiftW);
-    else if (mode_ == ControlMode::Sim) cmd = TrainerCommand::sim(std::round(trainerGradePct_ * 10) / 10, params_.crr, std::round(params_.cw() * 100) / 100);
+    else if (mode_ == ControlMode::Sim) cmd = TrainerCommand::sim(std::round(simGrade * 10) / 10, params_.crr, std::round(simCw * 100) / 100);
     else if (mode_ == ControlMode::Erg) cmd = TrainerCommand::erg(std::round(targetW_.value_or(100)));
     else cmd = TrainerCommand::level(std::round(freeLevelPct_ * 2) / 2);
+    cmd.massKg = params_.massKg;
 
     double since = nowS_ - lastCmdAt_;
     bool changed = true;
     if (lastCmd_ && lastCmd_->type == cmd.type) {
-        if (cmd.type == TrainerCommand::Simulation) changed = std::fabs(lastCmd_->gradePct - cmd.gradePct) >= 0.1 && since >= 0.5;
+        if (cmd.type == TrainerCommand::Simulation) changed = (std::fabs(lastCmd_->gradePct - cmd.gradePct) >= 0.1 || std::fabs(lastCmd_->cw - cmd.cw) >= 0.01) && since >= 0.5;
         else if (cmd.type == TrainerCommand::TargetPower) changed = std::fabs(lastCmd_->watts - cmd.watts) >= 1 && since >= 0.5;
         else changed = std::fabs(lastCmd_->levelPct - cmd.levelPct) >= 0.5;
     }

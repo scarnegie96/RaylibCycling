@@ -173,7 +173,7 @@ Texture2D makeAsphalt(int n) {
         for (int x = 0; x < n; ++x) {
             float u = float(x) / n, v = float(y) / n;
             float m = tfbm(u, v, 16, 4, 21), f = tnoise(u * 256, v * 256, 256, 22);
-            float g = 0.085f + 0.035f * m + 0.02f * f;
+            float g = 0.095f + 0.02f * m + 0.008f * f;
             int i = y * n + x;
             im.r[i] = g; im.g[i] = g; im.b[i] = g * 1.04f;
             im.h[i] = 0.18f + 0.1f * f;
@@ -185,7 +185,8 @@ Texture2D makeAsphalt(int n) {
         float rad = rng.r(0.7f, 3.2f) * n / 1024.f + 0.4f;
         float ex = rng.r(0.7f, 1.3f), rot = rng.f() * 6.28f;
         float pick = rng.f();
-        float c = pick < 0.08f ? rng.r(0.45f, 0.62f) : pick < 0.4f ? rng.r(0.24f, 0.36f) : rng.r(0.14f, 0.24f);
+        // aggregate close to the binder's tone: a calm, even surface (no salt-and-pepper)
+        float c = pick < 0.03f ? rng.r(0.22f, 0.28f) : pick < 0.35f ? rng.r(0.14f, 0.19f) : rng.r(0.10f, 0.15f);
         float tint = rng.r(-0.02f, 0.02f);
         int r = int(std::ceil(rad * 1.4f)) + 1;
         for (int oy = -r; oy <= r; ++oy)

@@ -13,8 +13,6 @@
 using namespace ui;
 
 static std::string fmt(const char* f, double v) { char b[96]; std::snprintf(b, sizeof b, f, v); return b; }
-static const Color CARD{255, 255, 255, 255};
-static const Color CARD2{246, 248, 251, 255};
 static const Color SUB{246, 248, 251, 255};
 
 static std::string durLabel(int s) {
@@ -86,7 +84,7 @@ void App::drawRideDetail(Rectangle r, RideRecord& rec, bool fresh) {
     float cw = (w - (cols - 1) * 10) / cols, ch = 60;
     for (size_t i = 0; i < items.size(); ++i) {
         float ix = x + (i % cols) * (cw + 10), iy = y + (i / cols) * (ch + 10);
-        panel({ix, iy, cw, ch}, CARD2);
+        panel({ix, iy, cw, ch}, ui::PANEL2);
         text(items[i].l, ix + 12, iy + 6, F::Small, DIM, 12);
         text(items[i].v, ix + 12, iy + 24, F::Title, TEXT, std::min(26.f, cw / std::max(4.f, float(items[i].v.size())) * 1.7f));
     }
@@ -94,7 +92,7 @@ void App::drawRideDetail(Rectangle r, RideRecord& rec, bool fresh) {
 
     if (s.testResult) {
         Rectangle tr{x, y, w, 54};
-        panel(tr, Color{15, 157, 88, 40});
+        panel(tr, ui::accentA(40));
         std::string msg = std::string(s.testResult->valid ? "" : "(incomplete) ") + s.testResult->detail + "  \xE2\x86\x92  FTP " + fmt("%.0f W", s.testResult->ftp);
         text(msg, tr.x + 16, tr.y + 15, F::Body, TEXT, 19);
         if (std::fabs(prof_.ftp - s.testResult->ftp) > 0.5 && s.testResult->ftp > 0) {
@@ -110,7 +108,7 @@ void App::drawRideDetail(Rectangle r, RideRecord& rec, bool fresh) {
     if (fresh && assessment_ && assessment_->triggerRideId && *assessment_->triggerRideId == s.id && !assessment_->dismissed && assessment_->suggestedFtp &&
         prof_.ftpAuto != FtpAutoMode::Off && (assessment_->suggestion == Suggestion::Increase || assessment_->suggestion == Suggestion::Decrease)) {
         Rectangle tr{x, y, w, 50};
-        panel(tr, Color{15, 157, 88, 24});
+        panel(tr, ui::accentA(24));
         std::snprintf(b, sizeof b, "This ride suggests an FTP of %.0f W (%+.0f W).  %s", *assessment_->suggestedFtp, *assessment_->suggestedFtp - prof_.ftp, assessment_->reason.c_str());
         text(b, tr.x + 16, tr.y + 15, F::Body, TEXT, 16);
         if (button({tr.x + tr.width - 220, tr.y + 6, 204, 38}, "Set FTP to " + fmt("%.0f W", *assessment_->suggestedFtp), true)) {
@@ -244,7 +242,7 @@ void App::drawRideDetail(Rectangle r, RideRecord& rec, bool fresh) {
 // ------------------------------------------------------------------ activities
 void App::drawActivitiesPage(Rectangle r) {
     if (detail_) {
-        panel(r, CARD);
+        panel(r, ui::PANEL);
         Rectangle inner{r.x + 22, r.y + 62, r.width - 44, r.height - 74};
         if (button({r.x + 22, r.y + 14, 120, 36}, "< All rides")) { detail_.reset(); deleteArm_ = false; return; }
         // notes
@@ -259,7 +257,7 @@ void App::drawActivitiesPage(Rectangle r) {
         drawRideDetail(inner, *detail_, false);
         return;
     }
-    panel(r, CARD);
+    panel(r, ui::PANEL);
     float x = r.x + 22, y = r.y + 18, w = r.width - 44;
     text("Activities", x, y, F::Title, TEXT);
     char b[220];
@@ -283,7 +281,7 @@ void App::drawActivitiesPage(Rectangle r) {
     float content = 0;
     for (auto& rw : rows) content += rw.header ? 40 : 58;
     scrollUpdate(lr, actScroll_, content);
-    BeginScissorMode(int(lr.x), int(lr.y), int(lr.width), int(lr.height));
+    ui::beginScissor({lr.x, lr.y, lr.width, lr.height});
     float yy = lr.y - actScroll_;
     if (rows.empty()) textWrapped("No rides yet. Rides you finish (and anything imported from CoreKick in Profile) appear here.", {x, y, w, 60}, F::Body, DIM, 17);
     for (auto& rw : rows) {
@@ -296,8 +294,8 @@ void App::drawActivitiesPage(Rectangle r) {
         } else {
             const RideSummary& rd = *rw.ride;
             Rectangle row{x, yy, w - 10, 52};
-            bool hv = hovered(row) && CheckCollisionPointRec(GetMousePosition(), lr);
-            DrawRectangleRounded(row, 0.2f, 6, hv ? Color{238, 241, 245, 255} : CARD2);
+            bool hv = hovered(row) && CheckCollisionPointRec(ui::mouseLogical(), lr);
+            DrawRectangleRounded(row, 0.2f, 6, hv ? ui::HOVER : ui::PANEL2);
             auto d = dates::localDate(rd.startedAt);
             if (d) {
                 text(dates::weekdayShort(d->weekday()), row.x + 14, row.y + 8, F::Small, DIM, 12);
@@ -337,7 +335,7 @@ void App::drawStatsPage(Rectangle r) {
     T totals[] = {{"THIS WEEK", &stats_.thisWeek}, {"LAST WEEK", &stats_.lastWeek}, {"THIS MONTH", &stats_.thisMonth}, {"THIS YEAR", &stats_.thisYear}, {"ALL TIME", &stats_.allTime}};
     for (int i = 0; i < 5; ++i) {
         Rectangle c{r.x + i * (cw + gap), r.y, cw, ch};
-        panel(c, CARD);
+        panel(c, ui::PANEL);
         text(totals[i].l, c.x + 16, c.y + 12, F::Small, DIM, 12);
         const Totals& t = *totals[i].t;
         text(fmt("%.1f h", t.movingS / 3600), c.x + 16, c.y + 30, F::Big, TEXT, 34);
@@ -352,7 +350,7 @@ void App::drawStatsPage(Rectangle r) {
     // ---- fitness / fatigue / form
     {
         Rectangle c{r.x, y, lw, rest * 0.5f - gap / 2};
-        panel(c, CARD);
+        panel(c, ui::PANEL);
         text("FITNESS  \xC2\xB7  FATIGUE  \xC2\xB7  FORM", c.x + 16, c.y + 12, F::Small, DIM, 12);
         int range = segmented({c.x + c.width - 236, c.y + 8, 220, 28}, {"6 wk", "3 mo", "1 yr"}, fitnessRange_);
         if (range >= 0) fitnessRange_ = range;
@@ -385,7 +383,7 @@ void App::drawStatsPage(Rectangle r) {
     // ---- weekly volume
     {
         Rectangle c{r.x, y + rest * 0.5f + gap / 2, lw, rest * 0.5f - gap / 2};
-        panel(c, CARD);
+        panel(c, ui::PANEL);
         text("WEEKLY HOURS  \xC2\xB7  16 WEEKS", c.x + 16, c.y + 12, F::Small, DIM, 12);
         std::vector<float> hv;
         std::vector<std::string> lb;
@@ -402,11 +400,11 @@ void App::drawStatsPage(Rectangle r) {
     float rx = r.x + lw + gap;
     {
         Rectangle c{rx, y, rw, rest * 0.42f};
-        panel(c, CARD);
+        panel(c, ui::PANEL);
         text("POWER CURVE", c.x + 16, c.y + 12, F::Small, DIM, 12);
         int u = segmented({c.x + c.width - 156, c.y + 8, 140, 28}, {"W", "W/kg"}, curveWkg_ ? 1 : 0);
         if (u >= 0) curveWkg_ = u == 1;
-        Series all{{}, Color{15, 23, 42, 99}, 1.6f, false}, d90{{}, ACCENT, 2.5f, true};
+        Series all{{}, ui::ink(99), 1.6f, false}, d90{{}, ACCENT, 2.5f, true};
         std::vector<std::string> xl;
         float hi = 1;
         auto val = [&](const CurvePoint& p) { return float(curveWkg_ ? p.wkg : p.watts); };
@@ -427,7 +425,7 @@ void App::drawStatsPage(Rectangle r) {
     float half = (rw - gap) / 2;
     {
         Rectangle c{rx, y2, half, h2};
-        panel(c, CARD);
+        panel(c, ui::PANEL);
         text("ZONES  \xC2\xB7  LAST 28 DAYS", c.x + 16, c.y + 12, F::Small, DIM, 12);
         std::vector<std::string> zl;
         std::vector<Color> zc;
@@ -452,7 +450,7 @@ void App::drawStatsPage(Rectangle r) {
     }
     {
         Rectangle c{rx + half + gap, y2, half, h2};
-        panel(c, CARD);
+        panel(c, ui::PANEL);
         text("FTP HISTORY", c.x + 16, c.y + 12, F::Small, DIM, 12);
         auto& fh = stats_.ftpHistory;
         if (fh.size() >= 1) {

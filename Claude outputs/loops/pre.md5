@@ -1,0 +1,5 @@
+6d7dcbfded1e80475754cf0b9d4b6bd8  src/world/WorldRoads.cpp
+a909ba4e77e422c7f9dffe1444be7b33  src/world/WorldMap.h
+1533e35adf16aef5f7b3a934bcb7b6a1  tests/world_tests.cpp
+e6393e86d12c0b48b4c0fc639b6d7ac0  src/Shaders.h
+59771d4b6cf03dd6449eb433816a1bef  src/Renderer.cpp

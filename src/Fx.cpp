@@ -220,24 +220,67 @@ void Renderer::drawParticles(const SceneState& s) {
 }
 
 // ------------------------------------------------------------------ lightning
-void Renderer::lightning(float azimuth) {
+Renderer::Strike Renderer::lightning(float azimuth) {
     static uint32_t rs = 999;
-    bolt_.pts.clear();
-    float dist = 1400.f + frand(rs) * 1800.f;
-    Vector3 ground{cam_.position.x + std::sin(azimuth) * dist, 0, cam_.position.z + std::cos(azimuth) * dist};
-    ground.y = course_ ? course_->terrainHeight(ground.x, ground.z) : 0;
-    Vector3 p{ground.x + (frand(rs) - 0.5f) * 200, ground.y + 950.f, ground.z + (frand(rs) - 0.5f) * 200};
-    for (int i = 0; i <= 14; ++i) {
-        float t = i / 14.f;
-        Vector3 q = Vector3Lerp(p, ground, t);
-        if (i > 0 && i < 14) { q.x += (frand(rs) - 0.5f) * 120.f; q.z += (frand(rs) - 0.5f) * 120.f; }
-        bolt_.pts.push_back(q);
+    rs ^= uint32_t(time_ * 1000.f);
+    Strike st;
+    const bool dev = azimuth < -100.f;   // dev: 2.5 km straight ahead of the camera
+    if (dev) {
+        Vector3 f = Vector3Subtract(cam_.target, cam_.position);
+        azimuth = std::atan2(f.x, f.z);
     }
+    bolt_.pts.clear();
+    // find a storm cloud: the densest cloud / rain cell among a few candidates 0.8..6 km away,
+    // preferring the direction the weather picked
+    Vector3 best{};
+    float bestScore = -1;
+    for (int k = 0; k < 14; ++k) {
+        float az = azimuth + (frand(rs) - 0.5f) * (k < 7 ? 1.2f : 6.2832f);
+        float dist = 1500.f + frand(rs) * 3000.f;
+        Vector3 c{cam_.position.x + std::sin(az) * dist, 0, cam_.position.z + std::cos(az) * dist};
+        float cell = precipCellAt(c.x, c.z);
+        float score = cell + frand(rs) * 0.15f;
+        if (score > bestScore) { bestScore = score; best = c; }
+    }
+    if (dev) best = {cam_.position.x + std::sin(azimuth) * 2500.f, 0, cam_.position.z + std::cos(azimuth) * 2500.f};
+    float baseY = cloud_.base;
+    best.y = baseY + 40.f + 160.f * frand(rs);   // just inside the cloud base, so it shines through it
+    bolt_.cloud = best;
+    bolt_.strength = 0.65f + 0.35f * frand(rs);
     bolt_.t = 0;
+    // a third of strikes come down to the ground, from the base of that cloud
+    bolt_.ground = frand(rs) < 0.35f;
+    if (bolt_.ground && course_) {
+        Vector3 ground{best.x + (frand(rs) - 0.5f) * 300, 0, best.z + (frand(rs) - 0.5f) * 300};
+        ground.y = course_->terrainHeight(ground.x, ground.z);
+        Vector3 p{best.x, baseY, best.z};
+        for (int i = 0; i <= 14; ++i) {
+            float t = i / 14.f;
+            Vector3 q = Vector3Lerp(p, ground, t);
+            if (i > 0 && i < 14) { q.x += (frand(rs) - 0.5f) * 120.f; q.z += (frand(rs) - 0.5f) * 120.f; }
+            bolt_.pts.push_back(q);
+        }
+    }
+    Vector3 d = Vector3Subtract(best, cam_.position);
+    st.dist = Vector3Length(d);
+    if (std::getenv("CORERAY_VOLDEBUG")) std::fprintf(stderr, "[strike] dist %.0f height %.0f (base %.0f) ground %d\n", st.dist, best.y - cam_.position.y, cloud_.base - cam_.position.y, int(bolt_.ground));
+    Vector3 f = Vector3Normalize(Vector3Subtract(cam_.target, cam_.position));
+    Vector3 r = Vector3Normalize(Vector3CrossProduct(f, {0, 1, 0}));
+    st.pan = std::clamp(Vector3DotProduct(Vector3Normalize(d), r) * 1.2f, -1.f, 1.f);
+    return st;
+}
+
+// the strike flickers: a main flash, a couple of restrikes, then it dies away
+float Renderer::boltLight() const {
+    float t = bolt_.t;
+    if (t < 0) return 0;
+    float k = t < 0.07f ? 1.f : t < 0.13f ? 0.25f : t < 0.2f ? 0.85f : t < 0.25f ? 0.2f : t < 0.29f ? 0.6f
+            : 0.25f * std::exp(-(t - 0.29f) * 9.f);
+    return k * bolt_.strength;
 }
 
 void Renderer::drawBolt() {
-    if (bolt_.t < 0 || bolt_.pts.size() < 2) return;
+    if (bolt_.t < 0 || !bolt_.ground || bolt_.pts.size() < 2) return;
     float t = bolt_.t;
     float on = (t < 0.07f || (t > 0.13f && t < 0.2f) || (t > 0.25f && t < 0.29f)) ? 1.f : 0.15f;
     for (size_t i = 0; i + 1 < bolt_.pts.size(); ++i)

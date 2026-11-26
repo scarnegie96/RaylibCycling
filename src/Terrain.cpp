@@ -12,6 +12,7 @@
 #include <unordered_map>
 
 #include "Course.h"
+#include "world/WorldMap.h"
 
 namespace terrain {
 namespace {
@@ -139,7 +140,44 @@ struct Field::Impl {
     std::atomic<int> generation{0};
     std::atomic<double> erodeMs{0};
 
-    explicit Impl(const Course& c) : Cp(&c), seed(c.seed() * 747796405u + 2891336453u), serial(g_impl_serial++) {}
+    const wmap::Map* W = nullptr;   // a generated world: everything comes from its map
+    explicit Impl(const Course& c) : Cp(&c), seed(c.seed() * 747796405u + 2891336453u), serial(g_impl_serial++), W(c.world()) {}
+
+    Sample worldSample(float x, float z) const {
+        wmap::Sample w = W->sample(x, z);
+        Sample s;
+        s.h = w.h;
+        s.road = w.road;
+        s.tunnel = w.tunnel;
+        s.water = w.water;
+        s.flowX = w.flowX; s.flowZ = w.flowZ;
+        s.waterW = w.waterW;
+        s.wet = std::min(1.f, w.wet);
+        s.sediment = w.sediment;
+        s.bank = w.bank;
+        s.bankLevel = w.bankLevel;
+        s.moist = w.moist;
+        s.sand = w.sand;
+        using namespace wmap;
+        const float* b = w.w;
+        auto mix = [&](std::initializer_list<float> v) {
+            float a = 0;
+            int q = 0;
+            for (float x : v) a += x * b[q++];
+            return a;
+        };
+        //                 meadow forest boreal alpine steppe savanna scrub dunes badlands wetland
+        float trees = mix({0.22f, 0.92f, 0.78f, 0.35f, 0.03f, 0.13f, 0.14f, 0.f, 0.02f, 0.22f});
+        trees *= sstep(0.08f, 0.45f, w.moist) * sstep(-1.5f, 1.5f, w.temp);   // the tree line
+        s.trees = std::clamp(trees * (1.f - w.sand), 0.f, 1.f);
+        s.shrubs = std::clamp(mix({0.3f, 0.3f, 0.3f, 0.25f, 0.22f, 0.45f, 0.95f, 0.06f, 0.16f, 0.55f}) * (1.f - 0.7f * w.sand), 0.f, 1.f);
+        s.rocks = std::clamp(mix({0.08f, 0.08f, 0.15f, 0.75f, 0.12f, 0.2f, 0.45f, 0.06f, 0.8f, 0.02f}), 0.f, 1.f);
+        s.grass = std::clamp(mix({1.f, 0.6f, 0.6f, 0.5f, 0.9f, 0.85f, 0.45f, 0.04f, 0.1f, 1.f}) * (1.f - w.sand) * sstep(0.03f, 0.25f, w.moist + 0.1f), 0.f, 1.f);
+        s.conifer = std::clamp(mix({0.12f, 0.3f, 0.92f, 0.88f, 0.25f, 0.f, 0.3f, 0.f, 0.3f, 0.15f}), 0.f, 1.f);
+        s.geology = std::clamp(0.55f + 0.45f * b[Alpine] + 0.25f * b[Scrub] + 0.3f * b[Savanna] - 0.65f * b[Badlands] - 0.3f * b[Dunes], 0.f, 1.f);
+        s.arid = std::clamp(b[Badlands] + 0.7f * b[Dunes] + 0.3f * b[Scrub] + 0.25f * b[Savanna] + 0.2f * b[Steppe], 0.f, 1.f);
+        return s;
+    }
 
     // ------------------------------------------------------------ landform
     // the smooth upland the rivers drain: the road's heights spread over the land, broad
@@ -556,6 +594,7 @@ struct Field::Impl {
 
     // ------------------------------------------------------------ macro sample
     Sample macroSample(float x, float z) {
+        if (W) return worldSample(x, z);
         Sample s;
         auto c = cellAt(x, z);
         float dC, rug;
@@ -666,7 +705,7 @@ struct Field::Impl {
                 size_t id = size_t(k) * N + i;
                 h0[id] = h[id] = m.h / HS;
                 roadD[id] = m.road;
-                fixed[id] = m.road < HW + 4.5f || m.bank > 0.45f;  // road formation, river banks
+                fixed[id] = m.road < HW + 4.5f || m.bank > 0.45f || m.tunnel < 16.f;  // road formation, river banks, ground over tunnels
                 sink[id] = m.water > m.h - 0.05f;
                 if (sink[id]) fixed[id] = 1;
             }
@@ -897,7 +936,64 @@ bool Field::tileReady(int tx, int tz) const {
     return true;
 }
 
+void Field::lakeCellsIn(float x0, float z0, float x1, float z1, std::vector<LakeCell>& out) const {
+    const wmap::Map* W = d_->W;
+    if (!W) return;
+    const int n = W->n;
+    int i0 = std::max(0, int(std::floor((x0 - W->x0) / W->cell))), i1 = std::min(n - 1, int(std::ceil((x1 - W->x0) / W->cell)));
+    int k0 = std::max(0, int(std::floor((z0 - W->z0) / W->cell))), k1 = std::min(n - 1, int(std::ceil((z1 - W->z0) / W->cell)));
+    for (int k = k0; k <= k1; ++k)
+        for (int i = i0; i <= i1; ++i) {
+            float cx = W->x0 + i * W->cell, cz = W->z0 + k * W->cell;
+            if (cx < x0 || cx >= x1 || cz < z0 || cz >= z1) continue;   // each cell belongs to one chunk
+            float lvl = -1e9f;
+            for (int dk = -1; dk <= 1; ++dk)
+                for (int di = -1; di <= 1; ++di) {
+                    int a = std::clamp(i + di, 0, n - 1), b = std::clamp(k + dk, 0, n - 1);
+                    int l = W->lakeId[size_t(b) * n + a];
+                    if (l >= 0 && !W->lakes[l].playa) lvl = std::max(lvl, W->lakes[l].level);
+                }
+            if (lvl > -1e8f && W->grid(i, k) < lvl + 3.f) out.push_back({cx, cz, W->cell, lvl});
+        }
+}
+
 void Field::waterIn(float x0, float z0, float x1, float z1, std::vector<Waterway>& ways, std::vector<LakeShape>& lakes) const {
+    if (const wmap::Map* W = d_->W) {
+        // the rivers with a piece whose midpoint is in the box: that stretch, a vertex either side
+        std::unordered_map<int, std::pair<int, int>> span;
+        const float H = 64.f;
+        for (int gz = int(std::floor(z0 / H)) - 1; gz <= int(std::floor(z1 / H)) + 1; ++gz)
+            for (int gx = int(std::floor(x0 / H)) - 1; gx <= int(std::floor(x1 / H)) + 1; ++gx) {
+                auto it = W->riverCells.find((int64_t(gx) << 32) ^ int64_t(uint32_t(gz)));
+                if (it == W->riverCells.end()) continue;
+                for (const auto& r : it->second) {
+                    const wmap::River& R = W->rivers[r.a];
+                    if (R.dry) continue;
+                    const auto& a = R.pts[r.b];
+                    const auto& b = R.pts[r.b + 1];
+                    float mx = 0.5f * (a.x + b.x), mz = 0.5f * (a.z + b.z);
+                    if (mx < x0 - 1 || mx >= x1 + 1 || mz < z0 - 1 || mz >= z1 + 1) continue;
+                    auto [sp, fresh] = span.try_emplace(r.a, r.b, r.b);
+                    if (!fresh) { sp->second.first = std::min(sp->second.first, r.b); sp->second.second = std::max(sp->second.second, r.b); }
+                }
+            }
+        for (auto& [rid, rg] : span) {
+            const wmap::River& R = W->rivers[rid];
+            int a = std::max(0, rg.first - 1), b = std::min(int(R.pts.size()) - 1, rg.second + 2);
+            Waterway w;
+            for (int j = a; j <= b; ++j) {
+                const auto& p = R.pts[j];
+                const auto& q = R.pts[std::min(j + 1, int(R.pts.size()) - 1)];
+                const auto& o = R.pts[std::max(j - 1, 0)];
+                float tx = q.x - o.x, tz = q.z - o.z, tl = std::max(1e-3f, std::hypot(tx, tz));
+                float slope = std::max(0.f, o.level - q.level) / tl;
+                float speed = std::clamp(std::sqrt(slope) * 9.f, 0.25f, 2.6f);
+                w.v.push_back({p.x, p.z, p.level, p.half, tx / tl * speed, tz / tl * speed});
+            }
+            if (w.v.size() >= 2) ways.push_back(std::move(w));
+        }
+        return;
+    }
     int i0 = int(std::floor((x0 - 1.5f * S) / S)), i1 = int(std::floor((x1 + 1.5f * S) / S));
     int k0 = int(std::floor((z0 - 1.5f * S) / S)), k1 = int(std::floor((z1 + 1.5f * S) / S));
     for (int k = k0; k <= k1; ++k)
@@ -934,6 +1030,14 @@ void Field::waterIn(float x0, float z0, float x1, float z1, std::vector<Waterway
 
 std::vector<Bridge> Field::bridgesNear(float x, float z, float radius) const {
     std::vector<Bridge> out;
+    if (const wmap::Map* W = d_->W) {
+        for (const auto& b : W->bridgesNear(x, z, radius)) {
+            Bridge o;
+            o.x = b.x; o.z = b.z; o.roadY = b.roadY; o.level = b.level; o.span = b.span; o.width = b.width; o.hx = b.hx; o.hz = b.hz;
+            out.push_back(o);
+        }
+        return out;
+    }
     int c0 = int(std::floor((x - radius) / RCELL)), c1 = int(std::floor((x + radius) / RCELL));
     int k0 = int(std::floor((z - radius) / RCELL)), k1 = int(std::floor((z + radius) / RCELL));
     for (int k = k0; k <= k1; ++k)
@@ -988,6 +1092,7 @@ void Field::trim(float x, float z, float keep) const {
 
 void Field::rebind(const Course& c, float x0, float z0, float x1, float z1) const {
     d_->Cp.store(&c, std::memory_order_release);
+    d_->W = c.world();
     auto inBox = [&](int64_t k, float size, float off) {
         int a = int(k >> 32);
         int b = int(int32_t(uint32_t(uint64_t(k ^ (int64_t(a) << 32)) & 0xFFFFFFFFull)));

@@ -96,7 +96,12 @@ std::optional<double> CrankCadence::update(uint16_t revs, uint16_t evt, double n
         if (now - last_change_s_ > stale) return 0.0;
         return std::nullopt;
     }
+    // After a stop longer than `stale` the event clock (1/1024 s, wraps every 64 s) can't
+    // tell us how long the gap was, so the first new event only re-arms the baseline:
+    // otherwise it reads as a bogus low cadence (e.g. 1 rev over 40 s = 1.5 rpm).
+    bool resumed = now - last_change_s_ > stale;
     last_revs_ = revs; last_evt_ = evt; last_change_s_ = now;
+    if (resumed) return std::nullopt;
     double rpm = dr * 60.0 * 1024.0 / dt;
     if (rpm > 220.0) return std::nullopt;  // glitch
     return rpm;
@@ -178,6 +183,13 @@ Bytes wahooInitSim(double mass, double crr, double cw) {
     put16(b, int(std::lround(cw * 1000.0)));
     return b;
 }
+Bytes wahooSetResistance(double level01) {
+    // 0x40: resistance mode, (1 - level) * 16383 (GoldenCheetah KickrDevice)
+    double l = std::clamp(level01, 0.0, 1.0);
+    Bytes b{0x40};
+    put16(b, int(std::lround((1.0 - l) * 16383.0)));
+    return b;
+}
 Bytes wahooSetGrade(double grade_pct) {
     double g = std::clamp(grade_pct / 100.0, -1.0, 1.0);
     int norm = int(std::min(65535.0, (g + 1.0) * 65536.0 / 2.0));
@@ -185,5 +197,95 @@ Bytes wahooSetGrade(double grade_pct) {
     put16(b, norm);
     return b;
 }
+
+// ------------------------------------------------------------------ Zwift controllers
+namespace zwift {
+const char* SERVICE = "00000001-19ca-4651-86e5-fa29dcdd09d1";
+const char* SERVICE_FC82 = "0000fc82-0000-1000-8000-00805f9b34fb";
+const char* ASYNC = "00000002-19ca-4651-86e5-fa29dcdd09d1";
+const char* SYNC_RX = "00000003-19ca-4651-86e5-fa29dcdd09d1";
+const char* SYNC_TX = "00000004-19ca-4651-86e5-fa29dcdd09d1";
+
+Bytes rideOn() { return {'R', 'i', 'd', 'e', 'O', 'n'}; }
+
+namespace {
+// the varint fields of a protobuf message (field -> value); other wire types are skipped
+bool varintFields(const uint8_t* d, size_t n, std::vector<std::pair<int, uint64_t>>& out) {
+    size_t i = 0;
+    auto varint = [&](uint64_t& v) {
+        v = 0;
+        for (int sh = 0; sh < 64 && i < n; sh += 7) {
+            uint8_t b = d[i++];
+            v |= uint64_t(b & 0x7F) << sh;
+            if (!(b & 0x80)) return true;
+        }
+        return false;
+    };
+    while (i < n) {
+        uint64_t key;
+        if (!varint(key)) return false;
+        int field = int(key >> 3), wire = int(key & 7);
+        if (wire == 0) { uint64_t v; if (!varint(v)) return false; out.push_back({field, v}); }
+        else if (wire == 2) { uint64_t len; if (!varint(len) || i + len > n) return false; i += size_t(len); }
+        else if (wire == 5) i += 4;
+        else if (wire == 1) i += 8;
+        else return false;
+    }
+    return true;
+}
+}  // namespace
+
+std::string hex(const uint8_t* d, size_t n, size_t max) {
+    std::string o;
+    char b[4];
+    for (size_t i = 0; i < n && i < max; ++i) { std::snprintf(b, sizeof b, "%02X", d[i]); if (i) o += ' '; o += b; }
+    if (n > max) o += " ...";
+    return o;
+}
+
+std::optional<Buttons> parseButtons(const uint8_t* d, size_t n, bool clickStyle) {
+    if (n < 1) return std::nullopt;
+    std::vector<std::pair<int, uint64_t>> f;
+    if (!varintFields(d + 1, n - 1, f)) return std::nullopt;
+    auto get = [&](int k) -> std::optional<uint64_t> { for (auto& [a, v] : f) if (a == k) return v; return std::nullopt; };
+    auto pressed = [&](int k) { auto v = get(k); return v && *v == 0; };   // PlayButtonStatus: ON = 0
+    Buttons b;
+    switch (d[0]) {
+        case 0x37:   // Click: 1 = plus, 2 = minus
+            b.up = pressed(1);
+            b.down = pressed(2);
+            return b;
+        case 0x07: {  // Play: 1 = which pad (0 right), 2 Y/up, 5 B/down, 7 shift paddle
+            bool right = pressed(1);
+            bool shiftBtn = pressed(7);
+            b.up = pressed(2) || (shiftBtn && right);
+            b.down = pressed(5) || (shiftBtn && !right);
+            return b;
+        }
+        case 0x23: {  // Ride: 1 = button map, a bit CLEARED for each held button
+            auto m = get(1);
+            if (!m) return std::nullopt;
+            uint64_t held = ~*m & 0x3FFFF;
+            if (clickStyle) {                    // Click v2: one button each side
+                b.up = held & (0x2000 | 0x4000 | 0x10000);   // right side
+                b.down = held & (0x200 | 0x400 | 0x800);     // left side
+            } else {
+                b.up = held & (0x200 | 0x2000);    // shift up, left / right
+                b.down = held & (0x400 | 0x4000);  // shift down, left / right
+            }
+            return b;
+        }
+        default: return std::nullopt;
+    }
+}
+
+int ShiftEdges::update(const Buttons& b) {
+    int r = 0;
+    if (b.up && !prev_.up) r += 1;
+    if (b.down && !prev_.down) r -= 1;
+    prev_ = b;
+    return r;
+}
+}  // namespace zwift
 
 }  // namespace proto

@@ -267,7 +267,42 @@ int main() {
         CHECK(geocodeUrl("S\xC3\xA3o Paulo").find("name=S%C3%A3o+Paulo") != std::string::npos);
         auto tl = timeline(42, 6);
         CHECK(!tl.empty() && tl[0].start == 0);
-        for (size_t i = 1; i < tl.size(); ++i) CHECK(tl[i].start - tl[i - 1].start >= 480 && tl[i].start - tl[i - 1].start <= 1320);
+        // weather systems: spells of a few minutes to under an hour, the same for the same seed,
+        // never opening in a downpour, and never jumping more than two steps of severity
+        auto sev = [](Kind k) {
+            switch (k) {
+                case Kind::Clear: return 0;
+                case Kind::Fair: case Kind::Windy: case Kind::Sunshower: return 1;
+                case Kind::Cloudy: case Kind::Mist: return 2;
+                case Kind::Overcast: case Kind::Fog: case Kind::Drizzle: return 3;
+                case Kind::Rain: case Kind::Sleet: case Kind::Snow: return 4;
+                default: return 5;
+            }
+        };
+        int jumps = 0, wetSpells = 0, drySpells = 0;
+        for (uint32_t seed = 1; seed <= 200; ++seed) {
+            auto T = timeline(seed, 6);
+            CHECK(sev(T[0].kind) <= 3);
+            for (size_t i = 1; i < T.size(); ++i) {
+                CHECK(T[i].start - T[i - 1].start >= 200 && T[i].start - T[i - 1].start <= 2.5 * 3600);   // settled spells can last a while
+                jumps += std::abs(sev(T[i].kind) - sev(T[i - 1].kind)) > 2;
+                (sev(T[i].kind) >= 4 ? wetSpells : drySpells)++;
+            }
+        }
+        CHECK(jumps == 0);
+        CHECK(wetSpells > 0 && drySpells > 3 * wetSpells);   // mostly dry, some rain
+        auto t2 = timeline(42, 6);
+        CHECK(t2.size() == tl.size() && t2.back().kind == tl.back().kind);
+        // temperatures: London in late November ~5 C mean, July ~18 C; colder with height
+        CHECK(seasonalMean(51.5, 330) > 3 && seasonalMean(51.5, 330) < 8);
+        CHECK(seasonalMean(51.5, 196) > 15 && seasonalMean(51.5, 196) < 21);
+        CHECK(temperature(10, 30, Kind::Fair, 1000) < temperature(10, 30, Kind::Fair, 0) - 6);
+        CHECK(temperature(10, 30, Kind::Snow, 0) <= 0.5);
+        // live: the next hours come from Open-Meteo's hourly arrays (index 0 = this hour)
+        auto lh = parseCurrent(R"({"current":{"temperature_2m":6.4,"weather_code":3,"cloud_cover":100,"precipitation":0,"wind_speed_10m":10,"is_day":1},
+            "hourly":{"weather_code":[3,61,63,0],"temperature_2m":[6,5.5,5,4],"cloud_cover":[100,100,100,10],"wind_speed_10m":[10,12,14,5],"precipitation_probability":[10,60,80,5]}})", "Leeds");
+        CHECK(lh && lh->hourly.size() == 3 && lh->hourly[0].kind == Kind::Drizzle && lh->hourly[1].kind == Kind::Rain && lh->hourly[2].tempC == 4);
+        CHECK(forecastUrl(51.5, 0).find("hourly=") != std::string::npos);
         Sim s(1);
         s.mode = Mode::Fixed; s.fixed = Kind::Storm;
         bool flashed = false;

@@ -11,13 +11,11 @@
 using namespace ui;
 
 static std::string fmt(const char* f, double v) { char b[96]; std::snprintf(b, sizeof b, f, v); return b; }
-static const Color CARD{255, 255, 255, 255};
-static const Color CARD2{246, 248, 251, 255};
 
 // ------------------------------------------------------------------ shell
 void App::drawShell() {
-    const float W = float(GetScreenWidth()), H = float(GetScreenHeight());
-    DrawRectangle(0, 0, int(W), int(H), Color{15, 23, 42, 0});
+    const float W = ui::screenW(), H = ui::screenH();
+    DrawRectangle(0, 0, int(W), int(H), Color{8, 12, 20, 0});
     Rectangle side{0, 0, 232, H};
     drawSidebar(side);
     Rectangle body{side.width + 24, 22, W - side.width - 48, H - 44};
@@ -44,7 +42,7 @@ void App::drawShell() {
 }
 
 void App::drawSidebar(Rectangle r) {
-    DrawRectangleRec(r, Color{251, 252, 253, 255});
+    DrawRectangleRec(r, ui::SIDEBAR);
     DrawLineEx({r.x + r.width, 0}, {r.x + r.width, r.height}, 1, LINE);
     text("CORE", 26, 22, F::Big, TEXT, 44);
     float cw = measure("CORE", F::Big, 44).x;
@@ -57,8 +55,8 @@ void App::drawSidebar(Rectangle r) {
         if (i == PDevices) y += 14;
         Rectangle it{12, y, r.width - 24, 42};
         bool sel = page_ == i, h = hovered(it);
-        if (sel) DrawRectangleRounded(it, 0.3f, 8, Color{15, 157, 88, 40});
-        else if (h) DrawRectangleRounded(it, 0.3f, 8, Color{15, 23, 42, 12});
+        if (sel) DrawRectangleRounded(it, 0.3f, 8, ui::accentA(40));
+        else if (h) DrawRectangleRounded(it, 0.3f, 8, ui::ink(12));
         if (sel) DrawRectangleRounded({it.x, it.y + 10, 3, 22}, 1, 4, ACCENT);
         text(names[i], it.x + 20, it.y + 10, F::Body, sel ? TEXT : DIM, 19);
         if (i == PEvents) {
@@ -89,7 +87,7 @@ void App::drawSidebar(Rectangle r) {
     // weather / time chip: click to cycle
     Rectangle wr{12, by + 54, r.width - 24, 58};
     bool wh = hovered(wr);
-    DrawRectangleRounded(wr, 0.25f, 8, wh ? Color{15, 23, 42, 16} : Color{15, 23, 42, 8});
+    DrawRectangleRounded(wr, 0.25f, 8, wh ? ui::ink(16) : ui::ink(8));
     std::string wl = prefs_.weatherMode == 1 ? (live_ ? std::string(weather::kindLabel(live_->kind)) + fmt("  %.0f\xC2\xB0", live_->temperatureC) : "Live weather...")
                                                : weather::kindLabel(wx_.currentKind(wxElapsed_));
     text(wl, wr.x + 12, wr.y + 8, F::Body, TEXT, 16);
@@ -101,7 +99,7 @@ void App::drawSidebar(Rectangle r) {
     text(b, wr.x + 12, wr.y + 32, F::Small, FAINT, 12);
     if (wh && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) cycleWeather();
     if (wh && IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) cycleTime();
-    text("W weather  T time  M sound", 18, by + 122, F::Small, Color{15, 23, 42, 63}, 12);
+    text("W weather  T time  M sound", 18, by + 122, F::Small, ui::ink(63), 12);
     text(sfx::muted() ? "Sound off" : "", 18, by + 140, F::Small, WARN, 12);
 }
 
@@ -134,7 +132,7 @@ void App::drawHomePage(Rectangle r) {
         (assessment_->suggestion == Suggestion::Increase || assessment_->suggestion == Suggestion::Decrease)) {
         Rectangle br{r.x, y, r.width, 58};
         bool up = assessment_->suggestion == Suggestion::Increase;
-        panel(br, up ? Color{15, 157, 88, 26} : Color{201, 130, 0, 26});
+        panel(br, up ? ui::accentA(26) : Color{201, 130, 0, 26});
         std::snprintf(b, sizeof b, "%s Your recent rides point to an FTP of %.0f W (%+.0f W).", up ? "\xE2\x86\x91" : "\xE2\x86\x93", *assessment_->suggestedFtp,
                       *assessment_->suggestedFtp - prof_.ftp);
         text(b, br.x + 18, br.y + 8, F::Body, TEXT, 18);
@@ -154,7 +152,7 @@ void App::drawHomePage(Rectangle r) {
     float gap = 16, cw = (r.width - 3 * gap) / 4, ch = 150;
     auto card = [&](int i, const char* title) {
         Rectangle c{r.x + i * (cw + gap), y, cw, ch};
-        panel(c, CARD);
+        panel(c, ui::PANEL);
         text(title, c.x + 18, c.y + 14, F::Small, DIM, 13);
         return c;
     };
@@ -211,7 +209,7 @@ void App::drawHomePage(Rectangle r) {
     Rectangle R{r.x + colW + gap, y, r.width - colW - gap, rest};
     {
         Rectangle s{L.x, L.y, L.width, 168};
-        panel(s, CARD);
+        panel(s, ui::PANEL);
         text("SUGGESTED TODAY", s.x + 18, s.y + 14, F::Small, DIM, 13);
         int sinceHard = 99;
         for (auto& rd : rides_) {
@@ -237,7 +235,7 @@ void App::drawHomePage(Rectangle r) {
             }
         }
         Rectangle u{L.x, L.y + 184, L.width, L.height - 184};
-        panel(u, CARD);
+        panel(u, ui::PANEL);
         text("UPCOMING", u.x + 18, u.y + 14, F::Small, DIM, 13);
         if (button({u.x + u.width - 120, u.y + 8, 104, 30}, "Events", false, true, 14)) page_ = PEvents;
         auto up = upcoming(events_, today, 7);
@@ -247,7 +245,7 @@ void App::drawHomePage(Rectangle r) {
         for (auto& o : up) {
             if (yy > u.y + u.height - 50) break;
             Rectangle row{u.x + 12, yy, u.width - 24, 44};
-            DrawRectangleRounded(row, 0.25f, 6, CARD2);
+            DrawRectangleRounded(row, 0.25f, 6, ui::PANEL2);
             Color ec = GOOD;
             if (o.color.size() == 7) {
                 unsigned v = std::strtoul(o.color.c_str() + 1, nullptr, 16);
@@ -268,7 +266,7 @@ void App::drawHomePage(Rectangle r) {
     {
         float vh = 190;
         Rectangle v{R.x, R.y, R.width, vh};
-        panel(v, CARD);
+        panel(v, ui::PANEL);
         text("WEEKLY HOURS  \xC2\xB7  12 WEEKS", v.x + 18, v.y + 14, F::Small, DIM, 13);
         std::vector<float> hv;
         std::vector<std::string> lb;
@@ -280,7 +278,7 @@ void App::drawHomePage(Rectangle r) {
         }
         barChart({v.x + 18, v.y + 36, v.width - 36, vh - 48}, hv, lb, ACCENT, int(hv.size()) - 1, "%.1f", float(prof_.weeklyGoalHours));
         Rectangle rr{R.x, R.y + vh + 16, R.width, R.height - vh - 16};
-        panel(rr, CARD);
+        panel(rr, ui::PANEL);
         text("RECENT RIDES", rr.x + 18, rr.y + 14, F::Small, DIM, 13);
         if (button({rr.x + rr.width - 120, rr.y + 8, 104, 30}, "All rides", false, true, 14)) { page_ = PActivities; detail_.reset(); }
         float yy = rr.y + 46;
@@ -289,7 +287,7 @@ void App::drawHomePage(Rectangle r) {
             if (yy > rr.y + rr.height - 46) break;
             Rectangle row{rr.x + 12, yy, rr.width - 24, 42};
             bool h = hovered(row);
-            DrawRectangleRounded(row, 0.25f, 6, h ? Color{238, 241, 245, 255} : CARD2);
+            DrawRectangleRounded(row, 0.25f, 6, h ? ui::HOVER : ui::PANEL2);
             auto d = dates::localDate(rd.startedAt);
             text(d ? fmtDateShort(d->y, d->m, d->d) : "", row.x + 12, row.y + 12, F::Small, DIM, 13);
             text(rd.name, row.x + 74, row.y + 11, F::Body, TEXT, 16);
@@ -305,7 +303,7 @@ void App::drawHomePage(Rectangle r) {
 void App::drawRidePage(Rectangle r) {
     float lw = std::min(600.f, r.width * 0.46f);
     Rectangle L{r.x, r.y, lw, r.height};
-    panel(L, CARD);
+    panel(L, ui::PANEL);
     float x = L.x + 22, y = L.y + 18, w = L.width - 44;
     text("Start a ride", x, y, F::Title, TEXT);
     y += 50;
@@ -327,13 +325,13 @@ void App::drawRidePage(Rectangle r) {
             static float sc = 0;
             float rowH = 46;
             scrollUpdate(list, sc, routes_.size() * (rowH + 4));
-            BeginScissorMode(int(list.x), int(list.y), int(list.width), int(list.height));
+            ui::beginScissor({list.x, list.y, list.width, list.height});
             for (size_t i = 0; i < routes_.size(); ++i) {
                 const Route& ro = routes_[i];
                 Rectangle row{list.x, list.y + i * (rowH + 4) - sc, list.width - 8, rowH};
                 if (row.y + rowH < list.y || row.y > list.y + list.height) continue;
-                bool sel = ro.id == selRoute_, h = hovered(row) && CheckCollisionPointRec(GetMousePosition(), list);
-                DrawRectangleRounded(row, 0.25f, 6, sel ? Color{15, 157, 88, 55} : h ? Color{238, 241, 245, 255} : CARD2);
+                bool sel = ro.id == selRoute_, h = hovered(row) && CheckCollisionPointRec(ui::mouseLogical(), list);
+                DrawRectangleRounded(row, 0.25f, 6, sel ? ui::accentA(55) : h ? ui::HOVER : ui::PANEL2);
                 text((ro.favourite ? "\xE2\x98\x85 " : "") + ro.name, row.x + 12, row.y + 5, F::Body, TEXT, 16);
                 auto st = profileFor(ro);
                 double gain = 0;
@@ -383,7 +381,7 @@ void App::drawRidePage(Rectangle r) {
             for (auto& t : wk::testCatalogue()) {
                 Rectangle c{x, y, w, 88};
                 bool sel = t.kind == selTest_;
-                DrawRectangleRounded(c, 0.15f, 8, sel ? Color{15, 157, 88, 55} : hovered(c) ? Color{238, 241, 245, 255} : CARD2);
+                DrawRectangleRounded(c, 0.15f, 8, sel ? ui::accentA(55) : hovered(c) ? ui::HOVER : ui::PANEL2);
                 if (sel) DrawRectangleRoundedLinesEx(c, 0.15f, 8, 1.5f, ACCENT);
                 text(t.name, c.x + 14, c.y + 8, F::Body, TEXT, 20);
                 textRight("~" + std::to_string(t.approxMinutes) + " min", c.x + c.width - 14, c.y + 10, F::Small, DIM);
@@ -427,9 +425,26 @@ void App::drawRidePage(Rectangle r) {
             break;
         }
     }
+    const bool freeGen = setupKind_ == RideKind::Free && prefs_.freeWorld >= 1;
     if (setupKind_ != RideKind::Route) {
-        bool endless = setupKind_ == RideKind::Free || sceneryEndless_ || !(rt && rt->isLoop);
-        if (setupKind_ != RideKind::Free) {
+        bool endless = !freeGen && (setupKind_ == RideKind::Free || sceneryEndless_ || !(rt && rt->isLoop));
+        if (setupKind_ == RideKind::Free) {
+            text("World", x, y, F::Small, DIM);
+            y += 22;
+            int wv = segmented({x, y, w, 38}, {"Endless road", "Generated world", "Saved worlds"}, std::clamp(prefs_.freeWorld, 0, 2));
+            if (wv >= 0 && wv != prefs_.freeWorld) {
+                prefs_.freeWorld = wv;
+                if (wv == 2) {   // open on a saved world (the current one if it is saved, else the newest)
+                    auto& sl = savedWorlds();
+                    if (!sl.empty() && !savedWorldFor(uint32_t(prefs_.mapSeed), prefs_.mapSizeKm, prefs_.mapClimate)) selectSavedWorld(sl.back());
+                }
+                if (wv >= 1) requestMap();
+                store::save(prof_, prefs_);
+            }
+            y += 50;
+            if (freeGen && prefs_.freeWorld == 2) drawSavedWorlds(x, y, w, L.y + L.height - 92);
+            else if (freeGen) drawWorldOptions(x, y, w);
+        } else {
             text("Scenery", x, y, F::Small, DIM);
             y += 22;
             bool loopOk = rt && rt->isLoop;
@@ -452,12 +467,20 @@ void App::drawRidePage(Rectangle r) {
         }
     }
     bool ready = ble_.trainer().state == LinkState::Connected || simActive();
+    const bool worldWait = freeGen && !mapIfReady();
     Rectangle sb{x, L.y + L.height - 92, w, 70};
-    if (button(sb, ready ? "START RIDE" : "START  (no trainer - connect one or use the simulator)", true, true, ready ? 24 : 17)) startRide();
+    std::string sl = worldWait ? "GENERATING WORLD..." : ready ? "START RIDE" : "START  (no trainer - connect one or use the simulator)";
+    if (button(sb, sl, true, !worldWait, ready || worldWait ? 24 : 17)) startRide();
+
+    // ---- right: a generated world to pick the start on
+    if (freeGen) {
+        drawWorldPicker({L.x + L.width + 20, r.y, r.width - L.width - 20, r.height});
+        return;
+    }
 
     // ---- right: route card
     Rectangle R{L.x + L.width + 20, r.y, r.width - L.width - 20, std::min(360.f, r.height)};
-    panel(R, CARD);
+    panel(R, ui::PANEL);
     if (rt) {
         x = R.x + 22; y = R.y + 18; w = R.width - 44;
         bool endlessCard = setupKind_ != RideKind::Route && (setupKind_ == RideKind::Free || sceneryEndless_ || !rt->isLoop);
@@ -468,7 +491,7 @@ void App::drawRidePage(Rectangle r) {
                              "While you ride, choose how hilly the road ahead is and how much each kilometre climbs or falls; "
                              "every kilometre not yet built is shaped to match.", {x, y, w, 120}, F::Body, DIM, 16) + 14;
             std::snprintf(b, sizeof b, "Starts %s, %s", hillinessName(hillNext_), netNext_ == 0 ? "level" : (std::string(netNext_ > 0 ? "climbing " : "descending ") + std::to_string(std::abs(netNext_)) + " m per km").c_str());
-            DrawRectangleRounded({x, y, measure(b, F::Small).x + 24, 28}, 1, 8, Color{15, 157, 88, 26});
+            DrawRectangleRounded({x, y, measure(b, F::Small).x + 24, 28}, 1, 8, ui::accentA(26));
             text(b, x + 12, y + 7, F::Small, ACCENT);
             goto afterCard;
         }
@@ -487,7 +510,7 @@ void App::drawRidePage(Rectangle r) {
             std::snprintf(b, sizeof b, "%s  %.1f km @ %.1f%%", c.category == "Uncategorised" ? "Climb" : c.category.c_str(), c.lengthM / 1000, c.avgGradePct);
             float cwid = measure(b, F::Small).x + 20;
             if (cx + cwid > x + w) break;
-            DrawRectangleRounded({cx, y, cwid, 26}, 1, 8, Color{234, 237, 242, 255});
+            DrawRectangleRounded({cx, y, cwid, 26}, 1, 8, ui::PANEL_HI);
             text(b, cx + 10, y + 5, F::Small, TEXT);
             cx += cwid + 8;
         }
@@ -495,7 +518,7 @@ void App::drawRidePage(Rectangle r) {
 afterCard:
     Rectangle T{R.x, R.y + R.height + 16, R.width, r.height - R.height - 16};
     if (T.height > 120) {
-        panel(T, CARD);
+        panel(T, ui::PANEL);
         float ty = T.y + 16;
         text("While riding", T.x + 22, ty, F::Body, TEXT);
         ty += 30;

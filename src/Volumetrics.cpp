@@ -196,7 +196,11 @@ RenderTexture2D colorRT(int w, int h, int format) {
 void freeRT(RenderTexture2D& t) {
     if (!t.id) return;
     if (t.texture.id) rlUnloadTexture(t.texture.id);
-    rlUnloadFramebuffer(t.id);   // the shared scene depth is not ours to free
+    // rlUnloadFramebuffer frees whatever depth is attached: detach the shared scene depth first
+    rlEnableFramebuffer(t.id);
+    rlFramebufferAttach(t.id, 0, RL_ATTACHMENT_DEPTH, RL_ATTACHMENT_TEXTURE2D, 0);
+    rlDisableFramebuffer();
+    rlUnloadFramebuffer(t.id);
     t = RenderTexture2D{};
 }
 
@@ -299,6 +303,8 @@ void Renderer::updateCloudParams(const SceneState& s, float dt) {
     // rain falls from cells: drizzle from about a third of a grey sky, rain from nearly all of
     // it, a sunshower from a few cumulus with the sun out between them
     c.precipArea = std::clamp(w.rain * 1.25f * (0.35f + 0.65f * w.cloud) + w.snow + w.hail * 0.5f, 0.f, 1.f);
+    // rain only falls from cloud; storm rain only from the cores of the cells
+    c.precipArea = std::min(c.precipArea, c.coverage * (1.f - 0.45f * std::clamp(w.storm, 0.f, 1.f)));
     float speed = 5.f + w.wind * 16.f + w.gust * 6.f;
     c.wind = Vector2Add(c.wind, {std::sin(w.windDir) * speed * dt, std::cos(w.windDir) * speed * dt});
     if (std::fabs(c.wind.x) > 1e6f || std::fabs(c.wind.y) > 1e6f) c.wind = {0, 0};
@@ -393,7 +399,7 @@ void Renderer::renderVolumetrics(const SceneState& s) {
     float tanHalf = std::tan(cam_.fovy * 0.5f * DEG2RAD);
     float aspect = float(rtW_) / float(std::max(1, rtH_));
     Matrix view = MatrixLookAt(cam_.position, cam_.target, cam_.up);
-    Matrix proj = MatrixPerspective(cam_.fovy * DEG2RAD, aspect, 0.3, 12000.0);
+    Matrix proj = MatrixPerspective(cam_.fovy * DEG2RAD, aspect, 0.3, farClip());
     Matrix vp = MatrixMultiply(view, proj);
     Texture2D depthT{scene_.depth.id, rtW_, rtH_, 1, 19};
     const bool hi = quality_ >= 2;
@@ -404,7 +410,7 @@ void Renderer::renderVolumetrics(const SceneState& s) {
         setV3(sh, "camUp", up);
         setF(sh, "tanHalf", tanHalf);
         setF(sh, "aspect", aspect);
-        setV2(sh, "clipNF", {0.3f, 12000.f});
+        setV2(sh, "clipNF", {0.3f, farClip()});
     };
 
     // ---- march
@@ -468,6 +474,8 @@ void Renderer::renderVolumetrics(const SceneState& s) {
         bindTex(7, csm_.texture.id); setI(sh, "cloudShadowTex", 7);
         setV4(sh, "csmRect", csmRect_);
         setF(sh, "precipArea", cloud_.precipArea);
+        setV3(sh, "boltPos", bolt_.cloud);
+        setF(sh, "boltI", boltLight());
     }, {1, 2, 3, 4, 5, 6, 7});
 
     // ---- temporal resolve
@@ -497,7 +505,7 @@ void Renderer::renderVolumetrics(const SceneState& s) {
         bindTex(3, scene_.depth.id); setI(sh, "depthTex", 3);
         setV2(sh, "fullRes", {float(rtW_), float(rtH_)});
         setV2(sh, "lowRes", {float(volW_), float(volH_)});
-        setV2(sh, "clipNF", {0.3f, 12000.f});
+        setV2(sh, "clipNF", {0.3f, farClip()});
     }, {1, 2, 3});
     (void)depthT;
 }

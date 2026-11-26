@@ -7,7 +7,11 @@ namespace phys {
 
 constexpr double G = 9.80665;
 constexpr double ROTATIONAL_MASS_KG = 1.4;
-constexpr double MIN_PROPULSION_SPEED = 1.5;
+// Propulsion force is P*eta/v, floored at this speed so a standing start is finite.
+// It must sit well below any real climbing speed: at 1.5 m/s a heavy rider on a steep
+// grade (e.g. 110 kg, 230 W, 13.6 %) could never get going even though the steady
+// speed is ~5 km/h. 0.3 m/s caps the start force at ~3x body weight equivalent.
+constexpr double MIN_PROPULSION_SPEED = 0.3;
 
 struct Params {
     double massKg = 83.0;
@@ -30,5 +34,12 @@ extern const double VIRTUAL_GEARS[GEAR_COUNT];
 int gearIndexFromGear(int gear1Based);
 double speedForCadence(double cadenceRpm, int gearIdx, double wheelCircM);
 double gearTargetPower(double cadenceRpm, int gearIdx, double wheelCircM, double grade, double eleM, const Params& p);
+// Virtual shifting in SIM mode: the grade to send so a trainer whose flywheel turns at
+// trainerSpeedMps (in the rider's real gear) resists exactly like the virtual bike in a gear
+// k times taller (k = virtual ratio / real ratio) on a road of `grade`:
+//   m g (s' + crr) + cw v^2  =  k [ m g (s + crr) + cw (k v)^2 ]
+// The trainer's own physics then does the rest (resistance rises with speed, like a real
+// bike) - no power target to chase, so no ERG feedback loop. Returns a fraction.
+double gearSimGrade(double grade, double k, double trainerSpeedMps, const Params& p);
 
 }  // namespace phys

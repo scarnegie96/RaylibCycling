@@ -12,33 +12,50 @@
 using namespace ui;
 
 static std::string fmt(const char* f, double v) { char b[96]; std::snprintf(b, sizeof b, f, v); return b; }
-static const Color CARD{255, 255, 255, 255};
-static const Color CARD2{246, 248, 251, 255};
 
 // ------------------------------------------------------------------ devices
 void App::drawDevicesPage(Rectangle r) {
     float lw = std::min(720.f, r.width * 0.55f);
     Rectangle L{r.x, r.y, lw, r.height};
-    panel(L, CARD);
+    panel(L, ui::PANEL);
+    drawDeviceList(L);
+    Rectangle R{L.x + L.width + 20, r.y, r.width - L.width - 20, r.height};
+    // with a shifter connected, its live test sits above the simulator
+    if (ble_.shifter().state != LinkState::Disconnected) {
+        Rectangle T{R.x, R.y, R.width, std::min(430.f, R.height * 0.55f)};
+        panel(T, ui::PANEL);
+        drawShifterTest({T.x + 20, T.y + 16, T.width - 40, T.height - 28});
+        R.y += T.height + 16;
+        R.height -= T.height + 16;
+    }
+    panel(R, ui::PANEL);
+    drawSimPanel({R.x + 20, R.y + 16, R.width - 40, R.height - 32}, R.height < 600);
+}
+
+// the device links (trainer, heart rate, shifter), scanning and the devices found, in L
+void App::drawDeviceList(Rectangle L) {
     float x = L.x + 22, y = L.y + 16, w = L.width - 44;
     char b[200];
     text("Devices", x, y, F::Title, TEXT);
     textRight(ble_.status(), x + w, y + 12, F::Small, ble_.available() ? DIM : WARN);
     y += 52;
     TrainerInput live = ble_.input();
-    for (int k = 0; k < 2; ++k) {
-        Link l = k == 0 ? ble_.trainer() : ble_.hrm();
+    for (int k = 0; k < 3; ++k) {
+        Link l = k == 0 ? ble_.trainer() : k == 1 ? ble_.hrm() : ble_.shifter();
+        if (k == 2 && l.state == LinkState::Disconnected && prefs_.shifterId.empty()) continue;   // only once there is one
         Rectangle c{x, y, w, 64};
-        panel(c, CARD2);
+        panel(c, ui::PANEL2);
         Color dot = l.state == LinkState::Connected ? GOOD : l.state == LinkState::Disconnected ? FAINT : WARN;
         DrawCircle(int(c.x + 20), int(c.y + 32), 7, dot);
-        text(k == 0 ? "Smart trainer" : "Heart rate", c.x + 38, c.y + 8, F::Body, TEXT);
+        text(k == 0 ? "Smart trainer" : k == 1 ? "Heart rate" : "Shifter", c.x + 38, c.y + 8, F::Body, TEXT);
         static const char* st[] = {"not connected", "connecting...", "connected", "reconnecting..."};
         std::snprintf(b, sizeof b, "%s  %s  %s", l.name.c_str(), st[int(l.state)], l.detail.c_str());
         text(b, c.x + 38, c.y + 36, F::Small, DIM, 14);
         if (l.state != LinkState::Disconnected && button({c.x + c.width - 130, c.y + 14, 116, 36}, "Disconnect")) {
-            if (k == 0) { ble_.disconnectTrainer(); prefs_.trainerId.clear(); } else { ble_.disconnectHrm(); prefs_.hrId.clear(); }
-            ble_.setAutoConnect(prefs_.trainerId, prefs_.hrId);
+            if (k == 0) { ble_.disconnectTrainer(); prefs_.trainerId.clear(); }
+            else if (k == 1) { ble_.disconnectHrm(); prefs_.hrId.clear(); }
+            else { ble_.disconnectShifter(); prefs_.shifterId.clear(); }
+            ble_.setAutoConnect(prefs_.trainerId, prefs_.hrId, prefs_.shifterId);
             store::save(prof_, prefs_);
         }
         y += 74;
@@ -60,27 +77,99 @@ void App::drawDevicesPage(Rectangle r) {
     for (auto& d : devs) {
         if (y > L.y + L.height - 140) break;
         Rectangle c{x, y, w, 50};
-        DrawRectangleRounded(c, 0.25f, 8, CARD2);
+        DrawRectangleRounded(c, 0.25f, 8, ui::PANEL2);
         text(d.name, c.x + 14, c.y + 6, F::Body, TEXT, 19);
-        const char* tag = d.kind == DevKind::Trainer ? (d.ftms ? "FTMS trainer" : "Trainer") : d.kind == DevKind::HeartRate ? "Heart rate" : "Power meter";
+        const char* tag = d.kind == DevKind::Trainer ? (d.ftms ? "FTMS trainer" : "Trainer") : d.kind == DevKind::HeartRate ? "Heart rate" : d.kind == DevKind::Shifter ? "Zwift shifter" : "Power meter";
         std::snprintf(b, sizeof b, "%s  \xC2\xB7  %d dBm", tag, d.rssi);
         text(b, c.x + 14, c.y + 29, F::Small, DIM, 13);
         Link lt = ble_.trainer(), lh = ble_.hrm();
-        if (d.kind == DevKind::Trainer) {
+        if (d.kind == DevKind::Trainer || d.kind == DevKind::Power) {
+            // power-only devices (CPS, no FTMS) work as a read-only power + cadence source
             bool on = lt.id == d.id && lt.state == LinkState::Connected;
-            if (button({c.x + c.width - 150, c.y + 8, 136, 34}, on ? "Trainer \xE2\x9C\x93" : "Use as trainer", !on)) ble_.connectTrainer(d.id);
+            const char* lbl = on ? "Trainer \xE2\x9C\x93" : d.kind == DevKind::Power ? "Use for power" : "Use as trainer";
+            if (button({c.x + c.width - 150, c.y + 8, 136, 34}, lbl, !on)) ble_.connectTrainer(d.id);
         } else if (d.kind == DevKind::HeartRate) {
             bool on = lh.id == d.id && lh.state == LinkState::Connected;
             if (button({c.x + c.width - 150, c.y + 8, 136, 34}, on ? "Heart rate" : "Use as HRM", !on)) ble_.connectHrm(d.id);
+        } else if (d.kind == DevKind::Shifter) {
+            Link ls = ble_.shifter();
+            bool on = ls.id == d.id && ls.state == LinkState::Connected;
+            if (button({c.x + c.width - 150, c.y + 8, 136, 34}, on ? "Shifter \xE2\x9C\x93" : "Use as shifter", !on)) ble_.connectShifter(d.id);
         }
         y += 58;
     }
     textWrapped("KICKR CORE: update firmware in the Wahoo app (FTMS control arrived in 2021). COROS / Garmin watches: enable heart-rate broadcast, "
                 "and disconnect the watch from your phone first. If the trainer drops out, CoreRay reconnects and re-sends the target.",
                 {x, L.y + L.height - 74, w, 70}, F::Small, FAINT, 13);
-    Rectangle R{L.x + L.width + 20, r.y, r.width - L.width - 20, r.height};
-    panel(R, CARD);
-    drawSimPanel({R.x + 20, R.y + 16, R.width - 40, R.height - 32}, false);
+}
+
+// the device list over the ride (cog button, bottom right): reconnect or swap devices
+// without leaving the ride - the ride carries on underneath
+void App::drawDevicesModal() {
+    const float W = ui::screenW(), H = ui::screenH();
+    DrawRectangle(0, 0, int(W), int(H), Color{8, 12, 20, 70});
+    Rectangle r{W / 2 - 380, std::max(24.f, H / 2 - 330), 760, std::min(660.f, H - 48)};
+    panel(r, PANEL);
+    drawDeviceList({r.x, r.y, r.width, r.height - 56});
+    textWrapped("The ride keeps going while this is open.  Esc to close.", {r.x + 22, r.y + r.height - 44, r.width - 200, 30}, F::Small, FAINT, 13);
+    if (button({r.x + r.width - 142, r.y + r.height - 50, 120, 38}, "Done", true)) devicesModal_ = false;
+    // clicks on the window stay in the window; outside it closes it
+    if (GetTime() - devicesOpenedAt_ > 0.25 && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !CheckCollisionPointRec(ui::mouseLogical(), r)) devicesModal_ = false;
+}
+
+void App::drawShifterTest(Rectangle r) {
+    Link l = ble_.shifter();
+    auto d = ble_.shifterDiag();
+    float x = r.x, y = r.y, w = r.width;
+    text("Shifter test", x, y, F::Title, TEXT, 26);
+    textRight(l.name, x + w, y + 8, F::Small, DIM, 14);
+    y += 38;
+    textWrapped("Press each button on the shifter. Every press should count below; if nothing counts, press \xE2\x80\x9C" "Copy log\xE2\x80\x9D and send it over.",
+                {x, y, w, 40}, F::Small, DIM, 14);
+    y += 40;
+    // status chips: handshake, messages, presses
+    auto chipBox = [&](float cx, const std::string& label, bool good) {
+        float cw = measure(label, F::Small, 13).x + 22;
+        DrawRectangleRounded({cx, y, cw, 26}, 1, 8, good ? ui::accentA(30) : Color{201, 130, 0, 30});
+        text(label, cx + 11, y + 6, F::Small, good ? ACCENT : WARN, 13);
+        return cw + 8;
+    };
+    float cx = x;
+    cx += chipBox(cx, d.handshakeAck ? "Handshake accepted" : "No handshake reply yet", d.handshakeAck);
+    cx += chipBox(cx, std::to_string(d.messages - d.idle) + " button messages", d.messages - d.idle > 0);
+    char b[64];
+    std::snprintf(b, sizeof b, "Harder %d  \xC2\xB7  Easier %d", d.harder, d.easier);
+    chipBox(cx, b, d.harder + d.easier > 0);
+    y += 36;
+    // no answer to either handshake: the Click's firmware predates plain (unencrypted) mode
+    bool retried = false;
+    for (auto& ln : d.lines) if (ln.find("(with response)") != std::string::npos) retried = true;
+    if (retried && !d.handshakeAck && d.messages == 0) {
+        Rectangle hint{x, y, w, 58};
+        DrawRectangleRounded(hint, 0.2f, 8, Color{201, 130, 0, 26});
+        textWrapped("The shifter isn't answering. Its firmware is probably older than the version that works with apps other than Zwift: "
+                    "update it in the Zwift Companion app on your phone, then reconnect it here.", {hint.x + 12, hint.y + 8, hint.width - 24, 46}, F::Small, WARN, 13);
+        y += 66;
+    }
+    // the raw log
+    Rectangle box{x, y, w, r.y + r.height - y - 46};
+    DrawRectangleRounded(box, 0.06f, 8, ui::PANEL2);
+    ui::beginScissor({box.x, box.y, box.width, box.height});
+    float ly = box.y + 8;
+    std::vector<std::string> rows;
+    for (auto& ln : d.lines) {   // the first line carries the service list: show it line by line
+        size_t s0 = 0;
+        while (true) { size_t e = ln.find('\n', s0); rows.push_back(ln.substr(s0, e == std::string::npos ? std::string::npos : e - s0)); if (e == std::string::npos) break; s0 = e + 1; }
+    }
+    size_t first = rows.size() > size_t(box.height / 17) ? rows.size() - size_t(box.height / 17) : 0;
+    for (size_t i = first; i < rows.size(); ++i) { text(rows[i], box.x + 10, ly, F::Small, TEXT, 12); ly += 17; }
+    EndScissorMode();
+    if (button({x, r.y + r.height - 38, 130, 34}, "Copy log")) {
+        std::string all = "CoreRay shifter log - " + l.name + "\n";
+        for (auto& ln : d.lines) all += ln + "\n";
+        SetClipboardText(all.c_str());
+        toast("Shifter log copied - paste it into the chat", GOOD);
+    }
 }
 
 void App::drawSimPanel(Rectangle r, bool compact) {
@@ -138,7 +227,7 @@ void App::drawSimPanel(Rectangle r, bool compact) {
 
 // ------------------------------------------------------------------ profile
 void App::drawProfilePage(Rectangle r) {
-    int t = segmented({r.x, r.y, 520, 40}, {"Rider & training", "Connections", "World"}, profileTab_);
+    int t = segmented({r.x, r.y, 680, 40}, {"Rider & training", "Connections", "World", "Appearance"}, profileTab_);
     if (t >= 0) profileTab_ = t;
     Rectangle body{r.x, r.y + 56, r.width, r.height - 56};
     float colW = (body.width - 40) / 3;
@@ -151,7 +240,7 @@ void App::drawProfilePage(Rectangle r) {
     };
     if (profileTab_ == 0) {
         Rectangle A{body.x, body.y, colW, body.height};
-        panel(A, CARD);
+        panel(A, ui::PANEL);
         float y = A.y + 16;
         text("Rider", A.x + 20, y, F::Title, TEXT);
         y += 52;
@@ -184,7 +273,7 @@ void App::drawProfilePage(Rectangle r) {
         if (assessment_) textWrapped(assessment_->reason, {A.x + 20, y, A.width - 40, 40}, F::Small, FAINT, 13);
 
         Rectangle B{A.x + colW + 20, body.y, colW, body.height};
-        panel(B, CARD);
+        panel(B, ui::PANEL);
         y = B.y + 16;
         text("Heart rate", B.x + 20, y, F::Title, TEXT);
         y += 52;
@@ -216,7 +305,7 @@ void App::drawProfilePage(Rectangle r) {
         row(B, y, "Warm-up grace", fmtTime(prof_.hrAlertGraceS), [&](int k) { prof_.hrAlertGraceS = std::clamp(prof_.hrAlertGraceS + k * 60, 0.0, 1800.0); });
 
         Rectangle C{B.x + colW + 20, body.y, colW, body.height};
-        panel(C, CARD);
+        panel(C, ui::PANEL);
         y = C.y + 16;
         text("Bike & trainer", C.x + 20, y, F::Title, TEXT);
         y += 52;
@@ -255,7 +344,7 @@ void App::drawProfilePage(Rectangle r) {
         // ---- Strava
         float half = (body.width - 20) / 2;
         Rectangle A{body.x, body.y, half, body.height};
-        panel(A, CARD);
+        panel(A, ui::PANEL);
         float x = A.x + 22, y = A.y + 16, w = A.width - 44;
         text("Strava", x, y, F::Title, TEXT);
         auto st = strava::status(db_);
@@ -306,7 +395,7 @@ void App::drawProfilePage(Rectangle r) {
 
         // ---- CoreKick
         Rectangle B{body.x + half + 20, body.y, half, body.height};
-        panel(B, CARD);
+        panel(B, ui::PANEL);
         x = B.x + 22; y = B.y + 16; w = B.width - 44;
         text("CoreKick", x, y, F::Title, TEXT);
         y += 54;
@@ -335,10 +424,124 @@ void App::drawProfilePage(Rectangle r) {
         text(Db::defaultPath(), x, y, F::Small, FAINT, 13);
         y += 20;
         text(store::dir() + "  (profile, workouts)", x, y, F::Small, FAINT, 13);
+    } else if (profileTab_ == 3) {
+        // ---- appearance: theme, accent, sizes, the ride HUD's glass
+        Rectangle A{body.x, body.y, colW, body.height};
+        panel(A, ui::PANEL);
+        float x = A.x + 20, y = A.y + 16, w = A.width - 40;
+        text("Theme", x, y, F::Title, TEXT);
+        y += 52;
+        // four theme cards, each a miniature of the app in that theme
+        const float cw = (w - 12) / 2, ch = 104;
+        static const Color previewBg[4] = {{243, 245, 248, 255}, {19, 21, 26, 255}, {7, 9, 15, 255}, {244, 239, 230, 255}};
+        static const Color previewCard[4] = {{255, 255, 255, 255}, {29, 32, 39, 255}, {15, 19, 30, 255}, {255, 252, 246, 255}};
+        static const Color previewText[4] = {{17, 24, 39, 255}, {236, 239, 244, 255}, {228, 235, 250, 255}, {40, 32, 24, 255}};
+        for (int i = 0; i < 4; ++i) {
+            Rectangle c{x + (i % 2) * (cw + 12), y + (i / 2) * (ch + 12), cw, ch};
+            bool sel = prefs_.theme == i, h = hovered(c);
+            DrawRectangleRounded(c, 0.14f, 8, previewBg[i]);
+            Rectangle card{c.x + 12, c.y + 12, c.width - 24, 44};
+            DrawRectangleRounded(card, 0.25f, 8, previewCard[i]);
+            DrawRectangleRounded({card.x + 10, card.y + 10, card.width * 0.45f, 8}, 1, 4, previewText[i]);
+            DrawRectangleRounded({card.x + 10, card.y + 26, card.width * 0.3f, 7}, 1, 4, withAlpha(previewText[i], 90));
+            DrawRectangleRounded({card.x + card.width - 46, card.y + 13, 36, 18}, 1, 6, ACCENTS[std::clamp(prefs_.accent, 0, 5)]);
+            text(THEME_NAMES[i], c.x + 12, c.y + ch - 30, F::Small, previewText[i], 14);
+            DrawRectangleRoundedLinesEx(c, 0.14f, 8, sel ? 2.5f : 1.f, sel ? ACCENT : h ? ink(60) : LINE);
+            if (h) SetMouseCursor(MOUSE_CURSOR_POINTING_HAND);
+            if (h && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !sel) { prefs_.theme = i; changed = true; }
+        }
+        y += 2 * (ch + 12) + 18;
+        text("Accent colour", x, y, F::Small, DIM);
+        y += 24;
+        for (int i = 0; i < 6; ++i) {
+            Vector2 c{x + 20 + i * 52.f, y + 20};
+            bool sel = prefs_.accent == i, h = CheckCollisionPointCircle(ui::mouseLogical(), c, 20) && mouseFree();
+            if (sel) DrawRing(c, 18, 21, 0, 360, 36, TEXT);
+            DrawCircleV(c, sel || h ? 15.f : 14.f, ACCENTS[i]);
+            if (h) SetMouseCursor(MOUSE_CURSOR_POINTING_HAND);
+            if (h && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !sel) { prefs_.accent = i; changed = true; }
+        }
+        y += 48;
+        text(ACCENT_NAMES[std::clamp(prefs_.accent, 0, 5)], x, y, F::Small, FAINT, 13);
+
+        Rectangle B{A.x + colW + 20, body.y, colW, body.height};
+        panel(B, ui::PANEL);
+        x = B.x + 20; y = B.y + 16; w = B.width - 40;
+        text("Size", x, y, F::Title, TEXT);
+        y += 52;
+        textWrapped("Everything grows with the window: 100% is sized for a 1440 x 900 screen and bigger screens get bigger text on their own. These sizes go on top.",
+                    {x, y, w, 80}, F::Small, DIM, 13);
+        y += 70;
+        text("Menus and pages", x, y, F::Small, DIM);
+        y += 20;
+        {
+            const int opts[5] = {90, 100, 110, 125, 150};
+            int cur = -1;
+            for (int i = 0; i < 5; ++i) if (prefs_.uiSize == opts[i]) cur = i;
+            int k = segmented({x, y, w, 34}, {"90%", "100%", "110%", "125%", "150%"}, cur);
+            if (k >= 0 && opts[k] != prefs_.uiSize) { prefs_.uiSize = opts[k]; changed = true; }
+        }
+        y += 48;
+        text("Ride HUD (power, speed, map, cards)", x, y, F::Small, DIM);
+        y += 20;
+        {
+            const int opts[6] = {100, 115, 130, 150, 175, 200};
+            int cur = -1;
+            for (int i = 0; i < 6; ++i) if (prefs_.hudSize == opts[i]) cur = i;
+            int k = segmented({x, y, w, 34}, {"100%", "115%", "130%", "150%", "175%", "200%"}, cur);
+            if (k >= 0 && opts[k] != prefs_.hudSize) { prefs_.hudSize = opts[k]; changed = true; }
+        }
+        y += 52;
+        std::snprintf(b, sizeof b, "On this screen: menus x%.2f  \xC2\xB7  ride HUD x%.2f", ui::autoScale(1180, 740, prefs_.uiSize / 100.f),
+                      ui::autoScale(1000, 640, prefs_.hudSize / 100.f));
+        text(b, x, y, F::Small, FAINT, 13);
+        y += 22;
+        text("Sizes stop growing when the layout would run out of room.", x, y, F::Small, FAINT, 13);
+
+        Rectangle C{B.x + colW + 20, body.y, colW, body.height};
+        panel(C, ui::PANEL);
+        x = C.x + 20; y = C.y + 16; w = C.width - 40;
+        text("Ride HUD", x, y, F::Title, TEXT);
+        y += 52;
+        text("Glass", x, y, F::Small, DIM);
+        y += 20;
+        int hs = segmented({x, y, w, 34}, {"Match theme", "Light", "Dark", "Day / night"}, prefs_.hudStyle);
+        if (hs >= 0 && hs != prefs_.hudStyle) { prefs_.hudStyle = hs; changed = true; }
+        y += 44;
+        textWrapped(prefs_.hudStyle == 3 ? "Light glass by day, dark glass once the sun is down in the ride."
+                                          : prefs_.hudStyle == 0 ? "Light glass with the Light and Sand themes, dark glass with Dark and Midnight."
+                                                                  : "The ride cards always use this glass.",
+                    {x, y, w, 40}, F::Small, FAINT, 13);
+        y += 44;
+        // a preview: a HUD card over a bit of sky and road
+        Rectangle pv{x, y, w, 190};
+        DrawRectangleGradientV(int(pv.x), int(pv.y), int(pv.width), int(pv.height * 0.6f), Color{150, 190, 230, 255}, Color{214, 228, 238, 255});
+        DrawRectangle(int(pv.x), int(pv.y + pv.height * 0.6f), int(pv.width), int(pv.height * 0.4f), Color{92, 140, 70, 255});
+        DrawTriangle({pv.x + pv.width * 0.45f, pv.y + pv.height * 0.6f}, {pv.x + pv.width * 0.2f, pv.y + pv.height}, {pv.x + pv.width * 0.8f, pv.y + pv.height}, Color{52, 54, 60, 255});
+        DrawTriangle({pv.x + pv.width * 0.45f, pv.y + pv.height * 0.6f}, {pv.x + pv.width * 0.8f, pv.y + pv.height}, {pv.x + pv.width * 0.55f, pv.y + pv.height * 0.6f}, Color{52, 54, 60, 255});
+        {
+            bool dark = prefs_.hudStyle == 2 || (prefs_.hudStyle == 0 && themeIsDark(prefs_.theme));
+            Color glassC = dark ? Color{20, 24, 32, 178} : Color{255, 255, 255, 190};
+            Color inkC = dark ? Color{238, 241, 247, 255} : Color{31, 36, 48, 255};
+            Color mutedC = dark ? Color{160, 168, 183, 255} : Color{91, 100, 117, 255};
+            Rectangle g{pv.x + 16, pv.y + 16, 170, 92};
+            DrawRectangleRounded({g.x, g.y + 5, g.width, g.height}, 0.35f, 10, Color{31, 36, 48, 18});
+            DrawRectangleRounded(g, 0.35f, 10, glassC);
+            text("248", g.x + 14, g.y + 6, F::Big, inkC, 50);
+            text("W", g.x + 14 + measure("248", F::Big, 50).x + 6, g.y + 30, F::Small, mutedC, 15);
+            text("Z3  \xC2\xB7  3.2 W/kg", g.x + 14, g.y + 64, F::Small, mutedC, 12);
+            Rectangle g2{pv.x + pv.width - 136, pv.y + 16, 120, 56};
+            DrawRectangleRounded(g2, 0.4f, 10, glassC);
+            text("32.4", g2.x + 12, g2.y + 8, F::Title, inkC, 22);
+            text("km/h", g2.x + 12, g2.y + 34, F::Small, mutedC, 11);
+        }
+        DrawRectangleRoundedLinesEx(pv, 0.06f, 8, 1, LINE);
+        y += pv.height + 18;
+        textWrapped("The 3D world keeps its own colours; themes change the menus, cards and HUD.", {x, y, w, 40}, F::Small, FAINT, 13);
     } else {
         // ---- world
         Rectangle A{body.x, body.y, colW, body.height};
-        panel(A, CARD);
+        panel(A, ui::PANEL);
         float x = A.x + 20, y = A.y + 16, w = A.width - 40;
         text("Location", x, y, F::Title, TEXT);
         y += 50;
@@ -363,7 +566,7 @@ void App::drawProfilePage(Rectangle r) {
             if (y > A.y + A.height - 120) break;
             Rectangle rr{x, y, w, 34};
             bool h = hovered(rr);
-            DrawRectangleRounded(rr, 0.3f, 6, h ? Color{238, 241, 245, 255} : CARD2);
+            DrawRectangleRounded(rr, 0.3f, 6, h ? ui::HOVER : ui::PANEL2);
             text(p.name, rr.x + 10, rr.y + 8, F::Small, TEXT, 14);
             if (h && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                 prefs_.place = p.name; prefs_.lat = p.lat; prefs_.lon = p.lon;
@@ -385,7 +588,7 @@ void App::drawProfilePage(Rectangle r) {
         text(b, x, y, F::Small, DIM, 14);
 
         Rectangle B{A.x + colW + 20, body.y, colW, body.height};
-        panel(B, CARD);
+        panel(B, ui::PANEL);
         x = B.x + 20; y = B.y + 16; w = B.width - 40;
         text("Time & weather", x, y, F::Title, TEXT);
         y += 52;
@@ -431,7 +634,7 @@ void App::drawProfilePage(Rectangle r) {
         text(b, x, y, F::Small, DIM, 13);
 
         Rectangle C{B.x + colW + 20, body.y, colW, body.height};
-        panel(C, CARD);
+        panel(C, ui::PANEL);
         x = C.x + 20; y = C.y + 16; w = C.width - 40;
         text("World & sound", x, y, F::Title, TEXT);
         y += 52;
@@ -440,6 +643,38 @@ void App::drawProfilePage(Rectangle r) {
         int q = segmented({x, y, w, 32}, {"Battery", "Balanced", "High"}, prefs_.quality);
         if (q >= 0 && q != prefs_.quality) { prefs_.quality = q; renderer_.setQuality(q); changed = true; }
         y += 46;
+        text("3D resolution", x, y, F::Small, DIM);
+        y += 20;
+        int rs = segmented({x, y, w, 32}, {"Auto", "100%", "85%", "75%", "50%"}, prefs_.renderScale);
+        if (rs >= 0 && rs != prefs_.renderScale) { prefs_.renderScale = rs; renderer_.setRenderScale(renderScaleOf(rs)); changed = true; }
+        y += 46;
+        text("Scenery", x, y, F::Small, DIM);
+        y += 20;
+        int sc = segmented({x, y, w - 112, 32}, {"Around the road", "Generated map"}, prefs_.scenery);
+        if (sc >= 0 && sc != prefs_.scenery) { prefs_.scenery = sc; if (sc == 1) requestMap(); changed = true; }
+        if (button({x + w - 104, y, 104, 32}, prefs_.scenery == 1 ? TextFormat("Map %d: new", prefs_.mapSeed) : "New map", false, prefs_.scenery == 1)) {
+            prefs_.mapSeed = prefs_.mapSeed % 9999 + 1;
+            requestMap();
+            toast(TextFormat("Generating map %d - a %d km world with its own climate, rivers and roads", prefs_.mapSeed, prefs_.mapSizeKm), TEXT);
+            changed = true;
+        }
+        y += 46;
+        if (prefs_.scenery == 1) {
+            const float hw = (w - 12) / 2;
+            text("Map size", x, y, F::Small, DIM);
+            text("Climate", x + hw + 12, y, F::Small, DIM);
+            y += 20;
+            const int sizes[4] = {10, 20, 30, 40};
+            int cur = 1;
+            for (int i = 0; i < 4; ++i) if (prefs_.mapSizeKm == sizes[i]) cur = i;
+            int sz = segmented({x, y, hw, 32}, {"10 km", "20", "30", "40"}, cur);
+            if (sz >= 0 && sizes[sz] != prefs_.mapSizeKm) { prefs_.mapSizeKm = sizes[sz]; requestMap(); changed = true; }
+            int cl = segmented({x + hw + 12, y, hw, 32}, {"Any", "Mild", "Desert", "Cold"}, std::clamp(prefs_.mapClimate, 0, 3));
+            if (cl >= 0 && cl != prefs_.mapClimate) { prefs_.mapClimate = cl; requestMap(); changed = true; }
+            y += 42;
+            if (button({x, y, w, 32}, "Explore this map (fly over it, no ride)", false, false)) { store::save(prof_, prefs_); startExplore(); return; }
+            y += 44;
+        }
         if (toggle({x, y, w, 34}, "Wildlife (sheep, cows, horses, deer, birds)", prefs_.wildlife)) { prefs_.wildlife = !prefs_.wildlife; changed = true; }
         y += 44;
         if (toggle({x, y, w, 34}, "Lanterns light the road at night", prefs_.lanterns)) { prefs_.lanterns = !prefs_.lanterns; changed = true; }

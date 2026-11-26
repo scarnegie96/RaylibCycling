@@ -53,6 +53,51 @@ int main() {
         CHECK(vc == 0);
         double s = steadySpeed(0, -0.06, 0, d) * 3.6;
         CHECK(s > 45 && s < 80);
+        // steep climbs from a standstill: a heavy rider at modest power must still move
+        // (regression: 110 kg + bike, 230 W, 13.6 % used to stall at 0 km/h)
+        for (double mass : {83.0, 119.0, 140.0})
+            for (double gr : {0.10, 0.136, 0.20}) {
+                Params h; h.massKg = mass;
+                double vs = steadySpeed(230, gr, 260, h), vh = 0;
+                for (int i = 0; i < 400; ++i) vh = integrateSpeed(vh, 230, gr, 260, h, 1.0 / 30);
+                CHECK(vs > 0.5);
+                NEAR(vh, vs, 0.05);
+            }
+        // virtual gears in SIM mode: the trainer, turning at v in the real gear, must cost the
+        // same power as the virtual bike at k*v on the real road - for any gear, grade, speed
+        {
+            Params q; q.massKg = 83;
+            for (double k : {0.4, 1.0, 1.6, 2.2})
+                for (double gr : {-0.03, 0.0, 0.05, 0.1})
+                    for (double v : {3.0, 7.0, 10.0}) {
+                        double s2 = gearSimGrade(gr, k, v, q);
+                        double trainerP = (q.massKg * G * (s2 + q.crr) + q.cw() * v * v) * v;
+                        double virtualP = (q.massKg * G * (gr + q.crr) + q.cw() * (k * v) * (k * v)) * (k * v);
+                        NEAR(trainerP, virtualP, 0.5);
+                    }
+            NEAR(gearSimGrade(0.04, 1.0, 8, q), 0.04, 1e-9);                 // same gear: same road
+            CHECK(gearSimGrade(0.0, 2.0, 8, q) > gearSimGrade(0.0, 1.2, 8, q));   // taller gear: harder
+            CHECK(gearSimGrade(0.08, 0.5, 3, q) < 0.08);                      // climbing gear: easier
+        }
+        {
+            Profile vp; vp.virtualShifting = true; vp.weightKg = 75;
+            RideSetup vs; vs.kind = RideKind::Free;
+            RideEngine ve(vp, withRoute(vs, flatRoute()));
+            std::optional<TrainerCommand> lastV;
+            bool anyErg = false;
+            auto ride = [&](int n) { for (int i = 0; i < n; ++i) if (auto c = ve.tick(0.25, {220, 90, {}, true, 30.0})) { lastV = c; anyErg |= c->type == TrainerCommand::TargetPower; } };
+            ride(40);
+            CHECK(lastV && lastV->type == TrainerCommand::Simulation);
+            double g0 = lastV->gradePct;
+            for (int i = 0; i < 6; ++i) ve.shift(1);
+            ride(8);
+            CHECK(lastV->gradePct > g0 + 0.5);    // six gears up: clearly harder
+            for (int i = 0; i < 12; ++i) ve.shift(-1);
+            ride(8);
+            CHECK(lastV->gradePct < g0);          // down past the start: easier
+            CHECK(!anyErg);                       // never a power target (that was the ERG feedback loop)
+            CHECK(ve.realGearRatio() > 1.0 && ve.realGearRatio() < 5.0);
+        }
         Params g; g.massKg = 83;
         double w = gearTargetPower(90, gearIndexFromGear(14), 2.105, 0, 0, g);
         CHECK(w > 150 && w < 230);
@@ -289,11 +334,51 @@ int main() {
         RideEngine sh(vs, withRoute(fs, flatRoute()));
         std::optional<TrainerCommand> sc;
         for (int i = 0; i < 20; ++i) if (auto c = sh.tick(0.25, {200, 90, {}, true})) sc = c;
-        CHECK(sc && sc->type == TrainerCommand::TargetPower && sc->watts > 50 && sc->watts < 120);
-        double before2 = sc->watts;
+        // gears stay in SIM mode (the trainer's own physics), never an ERG target
+        CHECK(sc && sc->type == TrainerCommand::Simulation);
+        double before2 = sc->gradePct;
         sh.shift(3);
         for (int i = 0; i < 20; ++i) if (auto c = sh.tick(0.25, {200, 90, {}, true})) sc = c;
-        CHECK(sc->watts > before2);
+        CHECK(sc->type == TrainerCommand::Simulation && sc->gradePct > before2);
+
+        // momentum: riding into a climb, the trainer grade ramps as the virtual bike slows
+        {
+            Profile hp = pr; hp.weightKg = 108;
+            RideSetup hs; hs.kind = RideKind::Route; hs.laps = 1;
+            RideEngine he(hp, withRoute(hs, hillRoute()));
+            std::optional<TrainerCommand> hc;
+            int i = 0;
+            for (; i < 4000 && he.distance() < 1010; ++i) if (auto c = he.tick(0.25, {250, 90, {}, true})) hc = c;
+            CHECK(he.speedMps() * 3.6 > 25);
+            for (int j = 0; j < 8; ++j) if (auto c = he.tick(0.25, {250, 90, {}, true})) hc = c;  // 2 s into 6 %
+            CHECK(hc && hc->gradePct < 4.0);   // momentum still carrying the rider
+            for (int j = 0; j < 4 * 40; ++j) if (auto c = he.tick(0.25, {250, 90, {}, true})) hc = c;
+            NEAR(hc->gradePct, 6.0, 0.4);      // settled: the full grade
+        }
+
+        // virtual shifting on a steep climb: every top gear is still harder than the one below,
+        // past the trainer's grade cap the extra goes into cw; a shift is sent at once
+        {
+            Profile vp = pr; vp.weightKg = 108; vp.virtualShifting = true;
+            RideSetup fsg; fsg.kind = RideKind::Free; fsg.freeGradePct = 8;
+            RideEngine ve(vp, fsg);
+            std::optional<TrainerCommand> vc;
+            for (int i = 0; i < 40; ++i) if (auto c = ve.tick(0.25, {250, 80, {}, true, 25.0})) vc = c;
+            ve.shift(phys::GEAR_COUNT);   // to the top
+            double prevForce = -1; bool rising = true, capped = true, sentAtOnce = true;
+            for (int g = 0; g < phys::GEAR_COUNT; ++g) {
+                if (g) ve.shift(-1);
+                auto c = ve.tick(0.05, {250, 80, {}, true, 25.0});
+                sentAtOnce &= bool(c);
+                if (c) vc = c;
+                double v = 25 / 3.6;
+                double force = vp.weightKg * G * vc->gradePct / 100 + vc->cw * v * v;   // what the trainer resists with
+                capped &= vc->gradePct <= vp.maxTrainerGrade + 1e-9;
+                if (prevForce >= 0) rising &= force < prevForce + 1e-6;   // going down the gears: never harder
+                prevForce = force;
+            }
+            CHECK(sentAtOnce); CHECK(capped); CHECK(rising);
+        }
 
         // summary + FIT export
         auto rec = fe.finish("2026-11-20T18:00:00+00:00", "ride-1");

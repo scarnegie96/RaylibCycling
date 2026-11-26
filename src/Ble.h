@@ -12,7 +12,7 @@
 
 #include "core/Engine.h"
 
-enum class DevKind { Trainer, HeartRate, Power };
+enum class DevKind { Trainer, HeartRate, Power, Shifter };
 enum class LinkState { Disconnected, Connecting, Connected, Reconnecting };
 
 struct DeviceInfo {
@@ -46,10 +46,17 @@ public:
     void disconnectTrainer();
     void connectHrm(const std::string& id);
     void disconnectHrm();
+    // Zwift Click / Play / Ride shifters: presses become virtual gear changes
+    void connectShifter(const std::string& id);
+    void disconnectShifter();
+    Link shifter() const;
+    int takeShifts();   // net presses since the last call: + harder, - easier
+    struct ShifterDiag { bool handshakeAck = false; int messages = 0, idle = 0, harder = 0, easier = 0; std::vector<std::string> lines; };
+    ShifterDiag shifterDiag() const;   // for the Devices page's shifter test
     Link trainer() const;
     Link hrm() const;
     // reconnect these automatically when a scan finds them
-    void setAutoConnect(const std::string& trainerId, const std::string& hrId);
+    void setAutoConnect(const std::string& trainerId, const std::string& hrId, const std::string& shifterId = "");
 
     void send(const TrainerCommand& c);
     // Current readings as engine input. Data older than 3 s counts as "not riding".

@@ -7,6 +7,12 @@
 
 #include "raylib.h"
 
+// Bike wheel: 700x25c (ETRTO 622 bead + 2 x 25 mm) is 336 mm free radius; under load the
+// tyre squashes ~2 mm, so the axle sits (and the wheel rolls) at 334 mm. The wheels are
+// drawn and spun with these, so tread speed = ground speed (2.099 m per revolution).
+constexpr float WHEEL_FREE_R = 0.336f;
+constexpr float WHEEL_ROLL_R = 0.334f;
+
 struct RiderPose {
     double crank = 0;    // radians, 0 = right pedal at the bottom, increasing = pedalling forward
     float stand = 0;     // 0 seated .. 1 out of the saddle

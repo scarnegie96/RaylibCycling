@@ -1,0 +1,7 @@
+d78f48a51e88255e698f80ace11b047b  src/App.h
+9b4c624ab9aeac00d03e4917219f7dd0  src/Ble.cpp
+06abbc788877dd0fdc06cd4b660de961  src/Ble.h
+28536485df1377119cf9ffd473a314ce  src/Protocol.cpp
+3b4dd5cd95ead4fd28f8a9e9ca14dccc  src/Protocol.h
+95e48da8d7625274f405dd31759bf997  src/SettingsUi.cpp
+17cc47ad764eb52dd0ca24e5a84a2598  tests/protocol_tests.cpp

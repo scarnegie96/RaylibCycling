@@ -14,6 +14,8 @@
 #include "Textures.h"
 #include "Trees.h"
 #include "Rider.h"
+#include "body/Body.h"
+#include <future>
 #include "raylib.h"
 
 // CoreKick's five (chase, cinematic, side, rider, drone) plus a close chase and the rider's eyes
@@ -52,7 +54,15 @@ struct SceneState {
     WeatherFx wx;
     bool wildlife = true;
     bool lanterns = true;
+    // explore mode: a free camera, no rider
+    bool freeCam = false;
+    Vector3 camPos{}, camTarget{};
+    float fov = 60;
+    bool hideRider = false;
 };
+
+// vegetation instance sets: tree types, then bushes, then rocks
+constexpr int VEG_BUSH0 = trees::TYPES, VEG_ROCK0 = trees::TYPES + trees::BUSHES, VEG_SETS = trees::TYPES + trees::BUSHES + trees::ROCKS;
 
 class Renderer {
 public:
@@ -61,6 +71,18 @@ public:
     bool init(int quality);
     void shutdown();
     void setQuality(int q);
+    // 3D resolution as a fraction of the window's pixels (0 = auto: 75 % on high-DPI screens)
+    // the rider: greybox human (true) or the kitted RiderRig
+    void setGreyboxRider(bool on) { greyOn_ = on; }
+    bool greyboxRider() const { return greyOn_; }
+    void setRenderScale(float s) { renderScale_ = s; }
+    // how far terrain, trees, roads and structures are drawn (1 = normal; explore mode uses 3)
+    void setViewScale(float s) { viewScale_ = s; }
+    float viewScale() const { return viewScale_; }
+    float farClip() const { return 12000.f * std::max(1.f, viewScale_); }
+    float renderScale() const;
+    int renderWidth() const { return rtW_; }
+    int renderHeight() const { return rtH_; }
     void setCourse(std::shared_ptr<const Course> c);         // new road; streams in the new world
     void updateCourse(std::shared_ptr<const Course> c);      // same world, road ahead re-laid
     // endless road grew: only chunks inside the box (x0,z0,x1,z1) are rebuilt
@@ -70,20 +92,26 @@ public:
     void render(const SceneState& s, float dt);
     Camera3D camera() const { return cam_; }
     int triangles() const { return tris_; }
-    void lightning(float azimuth);                           // spawn a visible bolt
+    // a lightning strike: a flickering ball of light inside a storm cloud (and sometimes a bolt
+    // to the ground under it). Returns where it is, for the thunder.
+    struct Strike { float dist = 3000, pan = 0; };
+    Strike lightning(float azimuth);
+    // what the rider hears: rain / hail falling here, showers off to either side
+    struct PrecipSound { float rain = 0, hail = 0, farL = 0, farR = 0; };
+    PrecipSound precipSound() const { return precipSound_; }
 
 private:
     // ---- world streaming (World.cpp)
     struct ChunkData;  // CPU side, built by workers
     struct Chunk {
         int cx = 0, cz = 0, lod = -1, version = -1;
-        Mesh mesh{}, water{};
+        Mesh mesh{}, water{}, roads{};   // roads: a generated world's other roads
         bool fine = false;  // built with the particle-eroded surface
         Vector3 center{};
         float radius = 0;
         bool hasVeg = false;
-        std::vector<Matrix> veg[trees::TYPES + 1];   // tree types..., rocks
-        std::vector<Vector3> vegPos[trees::TYPES + 1];
+        std::vector<Matrix> veg[VEG_SETS];   // tree types..., bushes..., rocks...
+        std::vector<Vector3> vegPos[VEG_SETS];
         std::vector<float> hgrid, rgrid, wgrid;  // full-detail chunks keep height, road distance, water depth (grass)
         int gridQ = 0;
     };
@@ -107,6 +135,17 @@ private:
     void updateRoad(double riderDist);
     void buildMeshes();
     void drawWorld(bool shadowPass, int cascade, const Vector3& focus, float radius);
+    // far trees as impostors (Impostors.cpp)
+    static constexpr int IMP_VIEWS = 8;
+    struct ImpInfo { float size = 10, cy = 5; } imp_[trees::TYPES];
+    Shader impSh_{};
+    Material impMat_{};
+    Texture2D impAlb_{}, impNrm_{};
+    Mesh impQuad_{};
+    std::vector<Matrix> visFar_;
+    void bakeImpostors();
+    void unloadImpostors();
+    void drawImpostors(int set, const std::vector<Matrix>& inst);
     void drawLanterns(bool shadowPass, const Vector3& focus, float radius);
     void drawLightShafts();
     void updateLanterns(const SceneState& s, float dt);
@@ -185,6 +224,7 @@ private:
 
     std::shared_ptr<const Course> course_;
     int quality_ = 2;
+    float viewScale_ = 1.f;
     bool ready_ = false;
 
     struct Lighting {
@@ -198,6 +238,15 @@ private:
     Shader grassSh_{}, animalSh_{}, volumeSh_{}, particleSh_{}, kitSh_{};
     Material kitMat_{};
     RiderRig rig_, ghostRig_;
+    // greybox human (src/body): built off-thread at start, skinned on the CPU each frame
+    std::future<body::Body> greyFuture_;
+    body::Body grey_;
+    bool greyReady_ = false, greyOn_ = true;
+    Mesh greyMesh_{};
+    body::Globals greyG_;
+    std::vector<body::V3> greyPos_, greyNrm_;
+    void poseGrey(const SceneState& s);
+    void drawGrey(const Matrix& base, bool shadowPass);
     Material grassMat_{}, animalMat_{}, volumeMat_{};
     tex::Set tex_;
     Mesh tuft_{}, flowerTuft_{}, shaftCone_{}, pyramid_{};
@@ -213,14 +262,26 @@ private:
     // world
     std::map<std::pair<int, int>, Chunk> chunks_;
     std::vector<RoadChunk> road_;
+    // generated worlds: tunnels (tube, portals, lamps) and bridges, built along their roads
+    struct Structure { Mesh mesh{}; Vector3 center{}; float radius = 0; };
+    std::map<std::pair<int, int>, Structure> structs_;   // (0 bridge / 1 tunnel, index)
+    struct Portal { Vector3 p; float heading; };          // heading: into the tunnel
+    std::vector<Portal> portals_;
+    std::vector<Vector3> tunnelLamps_;
+    const wmap::Map* structMap_ = nullptr;
+    void updateStructures();
+    void drawStructures(bool shadowPass, const Vector3& focus, float radius);
+    void clearStructures();
     std::vector<Lantern> lanterns_;
     std::unordered_map<int, float> lit_;   // lantern index -> time it lit
     std::vector<Light> lights_;  // lanterns + headlight this frame
     int courseVersion_ = 0, worldId_ = 0;
     Mesh water_{}, skyDome_{};
     Mesh cyl_{}, sphere_{}, cube_{}, cone_{}, wheelTire_{}, wheelRim_{};
-    Mesh rockMesh_{};
+    Mesh spokesFront_{}, spokesRear_{}, rotor_{}, chainring_{}, cassette_{};  // baked bike parts
+    Mesh rocks_[trees::ROCKS]{};
     trees::Built trees_[trees::TYPES];
+    trees::Built bushes_[trees::BUSHES];
     Texture2D leafAtlas_{};
     std::vector<Matrix> visHi_, visLo_;
     std::vector<Matrix> signposts_;
@@ -247,10 +308,16 @@ private:
     Vector3 partOrigin_{};
     std::map<int, Herd> herds_;
     std::vector<Bird> birds_;
-    struct Bolt { std::vector<Vector3> pts; float t = -1; } bolt_;
+    struct Bolt { std::vector<Vector3> pts; float t = -1; Vector3 cloud{}; float strength = 0; bool ground = false; } bolt_;
+    float boltLight() const;   // flicker of the current strike (0 when none)
+    PrecipSound precipSound_;
+    float wetLocal_ = -1;      // wet ground from the rain that has actually fallen here
 
     // render targets
     int rtW_ = 0, rtH_ = 0, shadowRes_ = 2048;
+    float renderScale_ = 0;
+    int targetW() const;
+    int targetH() const;
     RenderTexture2D scene_{}, bright_{}, blurA_{}, blurB_{}, qA_{}, qB_{}, ldr_{};
     RenderTexture2D refr_{};
     Shader refrCopySh_{};

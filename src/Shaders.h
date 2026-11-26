@@ -27,6 +27,76 @@ void main() {
 }
 )";
 
+// Terrain: as VS_STATIC, plus the low-frequency fields computed per vertex on the CPU
+static const char* VS_TERRAIN = R"(#version 330
+in vec3 vertexPosition;
+in vec2 vertexTexCoord;
+in vec3 vertexNormal;
+in vec4 vertexColor;
+in vec4 vertexTangent;
+in vec2 vertexTexCoord2;
+uniform mat4 mvp;
+uniform mat4 matModel;
+uniform mat4 matNormal;
+out vec3 fragPos;
+out vec2 fragUV;
+out vec3 fragNormal;
+out vec4 fragColor;
+out float fragVar;
+out vec4 fragField;
+out float fragBand;
+out float fragSand;
+void main() {
+    fragPos = (matModel * vec4(vertexPosition, 1.0)).xyz;
+    fragUV = vertexTexCoord;
+    fragNormal = normalize((matNormal * vec4(vertexNormal, 0.0)).xyz);
+    fragColor = vertexColor;
+    fragVar = 0.0;
+    fragField = vertexTangent;
+    fragBand = vertexTexCoord2.x;
+    fragSand = vertexTexCoord2.y;
+    gl_Position = mvp * vec4(vertexPosition, 1.0);
+}
+)";
+
+// Far trees: impostors. A camera-facing (around the vertical) quad per tree, showing the
+// tree as baked from the two nearest of 8 directions around it, blended.
+static const char* VS_IMPOSTOR = R"(#version 330
+in vec3 vertexPosition;   // quad: x -0.5..0.5, y 0..1
+layout(location = 10) in mat4 instanceTransform;
+uniform mat4 mvp;
+uniform vec3 camPos;
+uniform float impSize;    // tile size (tree units)
+uniform float impCy;      // tile centre height (tree units)
+uniform float impViews;
+out vec3 fragPos;
+out vec2 fragUV;
+out vec3 fragNormal;
+out vec4 fragColor;
+out float fragVar;
+void main() {
+    vec3 o = instanceTransform[3].xyz;
+    vec3 c0 = instanceTransform[0].xyz, c1 = instanceTransform[1].xyz, c2 = instanceTransform[2].xyz;
+    float sx = length(c0), sy = length(c1);
+    vec3 f = camPos - o;
+    f.y = 0.0;
+    f = dot(f, f) > 1e-6 ? normalize(f) : vec3(0.0, 0.0, 1.0);
+    vec3 R = vec3(f.z, 0.0, -f.x);
+    // where the camera is, around the tree, in the tree's own frame
+    float az = atan(dot(f, c0 / sx), dot(f, c2 / length(c2)));
+    float t = mod(az / 6.2831853 * impViews + impViews, impViews);
+    float k0 = floor(t);
+    float k1 = mod(k0 + 1.0, impViews);
+    vec3 wp = o + R * (vertexPosition.x * impSize * sx) + vec3(0.0, ((vertexPosition.y - 0.5) * impSize + impCy) * sy, 0.0);
+    fragPos = wp;
+    fragUV = vec2(vertexPosition.x + 0.5, vertexPosition.y);
+    fragNormal = f;
+    fragColor = vec4(k0, k1, t - k0, 0.0);
+    fragVar = fract(sin(dot(o.xz, vec2(12.9898, 78.233))) * 43758.5453);
+    gl_Position = mvp * vec4(wp, 1.0);
+}
+)";
+
 // Instanced: trees (leaf cards + bark) & rocks. Branches sway with height, leaves flutter.
 static const char* VS_INSTANCED = R"(#version 330
 in vec3 vertexPosition;
@@ -176,7 +246,7 @@ const vec2 poisson[12] = vec2[](
     vec2(0.962, -0.195), vec2(0.473, -0.480), vec2(0.519, 0.767), vec2(0.185, -0.893),
     vec2(0.507, 0.064), vec2(0.896, 0.412), vec2(-0.322, -0.933), vec2(-0.792, -0.598));
 
-float shadowSample(sampler2D sm, mat4 vp, vec3 wp, float bias, float radius) {
+float shadowSample(sampler2D sm, mat4 vp, vec3 wp, float bias, float radius, int taps) {
     vec4 lp = vp * vec4(wp, 1.0);
     vec3 p = lp.xyz / lp.w * 0.5 + 0.5;
     if (p.x <= 0.001 || p.x >= 0.999 || p.y <= 0.001 || p.y >= 0.999 || p.z >= 1.0) return 1.0;
@@ -184,10 +254,11 @@ float shadowSample(sampler2D sm, mat4 vp, vec3 wp, float bias, float radius) {
     mat2 R = mat2(cos(rot), sin(rot), -sin(rot), cos(rot));
     float lit = 0.0;
     for (int i = 0; i < 12; i++) {
+        if (i >= taps) break;
         float d = texture(sm, p.xy + R * poisson[i] * shadowTexel * radius).r;
         lit += (p.z - bias > d) ? 0.0 : 1.0;
     }
-    return lit / 12.0;
+    return lit / float(taps);
 }
 
 float shadowFactor(vec3 wp, vec3 n) {
@@ -201,15 +272,16 @@ float shadowFactor(vec3 wp, vec3 n) {
     float t1 = cascadeRange.y * 2.0 * shadowTexel.x;
     float slope = sqrt(max(0.0, 1.0 - ndl * ndl)) / max(ndl, 0.15);
     if (max(d.x, d.z) < r0) {
-        float s = shadowSample(shadowMap0, lightVP0, wp + n * t0 * 1.5, 0.0004 + 0.0006 * slope, 1.6);
+        float s = shadowSample(shadowMap0, lightVP0, wp + n * t0 * 1.5, 0.0004 + 0.0006 * slope, 1.6, 12);
         float edge = smoothstep(r0 * 0.8, r0, max(d.x, d.z));
-        if (edge > 0.0) s = mix(s, shadowSample(shadowMap1, lightVP1, wp + n * t1 * 1.5, 0.0006 + 0.001 * slope, 1.2), edge);
+        if (edge > 0.0) s = mix(s, shadowSample(shadowMap1, lightVP1, wp + n * t1 * 1.5, 0.0006 + 0.001 * slope, 1.2, 5), edge);
         return s;
     }
     float r1 = cascadeRange.y * 0.95;
     float m = max(d1.x, d1.z);
     if (m < r1) {
-        float s = shadowSample(shadowMap1, lightVP1, wp + n * t1 * 1.5, 0.0006 + 0.001 * slope, 1.2);
+        // the far cascade is soft anyway: fewer taps
+        float s = shadowSample(shadowMap1, lightVP1, wp + n * t1 * 1.5, 0.0006 + 0.001 * slope, 1.2, 5);
         return mix(s, 1.0, smoothstep(r1 * 0.75, r1, m));
     }
     return 1.0;
@@ -297,7 +369,8 @@ vec3 localLight(vec3 albedo, vec3 n, vec3 wp, vec3 V, float shin, float spec) {
 // the grass ground, cartoon style: a clean painted green with broad, soft variation (lush,
 // dry meadow, damp patches) and only a whisper of the blade texture up close. The grass
 // tufts use the same colour at their roots, so they grow out of the ground seamlessly.
-vec3 meadowGreen(vec2 xz) {
+// the grass tufts' own colour (unchanged)
+vec3 tuftGreen(vec2 xz) {
     float m1 = vnoise(xz * 0.0065), m2 = vnoise(xz * 0.021 + 7.0), m3 = vnoise(xz * 0.09 + 3.0);
     vec3 c = vec3(0.28, 0.43, 0.15);
     c *= 0.9 + 0.16 * m2;
@@ -305,13 +378,24 @@ vec3 meadowGreen(vec2 xz) {
     c = mix(c, c * vec3(0.80, 0.95, 0.85), smoothstep(0.62, 0.8, m3) * 0.3);  // damp patches
     return c;
 }
+// the ground's base green, Zwift-like: bright, saturated, warm, with broad soft swathes of
+// lighter yellow-green and deeper green and no fine noise
+vec3 meadowGreen(vec2 xz) {
+    float m1 = vnoise(xz * 0.0045), m2 = vnoise(xz * 0.016 + 7.0), m3 = vnoise(xz * 0.05 + 3.0);
+    vec3 c = vec3(0.31, 0.52, 0.14);
+    c *= 0.94 + 0.1 * m2;
+    c = mix(c, vec3(0.42, 0.57, 0.15), smoothstep(0.55, 0.85, m1) * 0.55);   // sunny, lighter swathes
+    c = mix(c, vec3(0.23, 0.44, 0.13), smoothstep(0.6, 0.85, m3) * 0.45);    // deeper green
+    return c;
+}
 vec3 grassAlbedo(sampler2D g, vec2 xz, out float h) {
-    vec4 a = texture(g, xz * 0.31);
+    // the blade texture at half the frequency and blurred (mip bias): soft clumps, not grain
+    vec4 a = texture(g, xz * 0.16, 1.5);
     float lum = dot(a.rgb, vec3(0.3, 0.55, 0.15));
     float mean = dot(textureLod(g, vec2(0.5), 12.0).rgb, vec3(0.3, 0.55, 0.15));
     float fadeDetail = 1.0 - smoothstep(6.0, 40.0, length(camPos.xz - xz));
-    vec3 c = meadowGreen(xz) * (1.0 + clamp(lum - mean, -0.2, 0.2) * 0.9 * fadeDetail);
-    h = 0.35 + 0.3 * a.a;
+    vec3 c = meadowGreen(xz) * (1.0 + clamp(lum - mean, -0.2, 0.2) * 0.12 * fadeDetail);   // a hint of blades, not speckle
+    h = 0.35 + 0.3 * texture(g, xz * 0.16, 3.0).a;   // height for the bump: smooth
     return c;
 }
 
@@ -359,6 +443,13 @@ vec3 shade(vec3 albedo, vec3 n, vec3 wp, float rough, float spec, float shadow, 
 
 // ---------------------------------------------------------------- terrain
 static const char* FS_TERRAIN = R"(
+in vec4 fragField;   // per-vertex (CPU): geology region, moisture, 100 m patches, broad tone
+in float fragBand;   // per-vertex: strata band offset
+in float fragSand;   // generated worlds: loose sand at the surface
+uniform int worldMode;        // 1: a generated world (fragField.w = desert tint, fragSand)
+uniform int numPortals;       // tunnel portals: the hillside is open in front of them
+uniform vec4 portalPos[12];   // xyz: the road at the portal, w: half width
+uniform vec4 portalDir[12];   // xyz: into the tunnel (horizontal), w: height
 uniform float waterLevel;
 uniform float snowLine;
 uniform float landBase;       // the route's lowest ground
@@ -386,7 +477,8 @@ vec4 triplanar(sampler2D t, vec3 p, vec3 n, float sc) {
 }
 // anti-tiling: a second, rotated and rescaled lookup blended in by a noise mask, with the
 // variance restored around the texture's mean so the blend doesn't wash out
-vec4 untile(sampler2D t, vec2 uv) {
+vec4 untile(sampler2D t, vec2 uv, bool far) {
+    if (far) return texture(t, uv);   // past ~250 m the tiling can't be seen: one lookup
     float k = smoothstep(0.3, 0.7, vnoise(uv * 0.21));
     vec2 uv2 = mat2(0.8, -0.6, 0.6, 0.8) * uv * 0.87 + vec2(0.37, 0.61);
     vec4 a = texture(t, uv), b = texture(t, uv2);
@@ -403,6 +495,14 @@ vec4 hblend(vec4 h, vec4 w) {
 }
 
 void main() {
+    for (int i = 0; i < 12; i++) {
+        if (i >= numPortals) break;
+        vec3 d = fragPos - portalPos[i].xyz;
+        vec3 f = portalDir[i].xyz;
+        float along = dot(d, f);
+        float lat = abs(d.x * f.z - d.z * f.x);
+        if (along > -6.5 && along < 18.0 && lat < portalPos[i].w && d.y > -1.0 && d.y < portalDir[i].w) discard;
+    }
     vec3 n0 = normalize(fragNormal);
     vec3 n = n0;
     vec2 xz = fragPos.xz;
@@ -415,12 +515,16 @@ void main() {
     float under = smoothstep(0.48, 0.6, shore);
 
     // ---- regional fields, domain-warped so boundaries flow with the land
-    vec2 warp = vec2(fbm3(xz * 0.0018 + 3.1), fbm3(xz * 0.0018 + 7.7)) - 0.5;
-    float region = fbm3(xz * 0.0009 + warp * 1.6);            // geology: bedded rock .. granite
-    float moist = fbm3(xz * 0.0024 + warp * 1.2 + 11.0);       // wetter .. drier country
-    float patchA = fbm3(xz * 0.011 + warp * 2.0);             // ~100 m patches
-    float n1 = vnoise(xz * 0.06), n2 = vnoise(xz * 0.45), n3 = vnoise(xz * 2.7);
-    float dn = n1 * 0.55 + n2 * 0.3 + n3 * 0.15;
+    // (computed per vertex on the CPU: they change over hundreds of metres)
+    float region = fragField.x;   // geology: bedded rock .. granite
+    float moist = fragField.y;    // wetter .. drier country
+    float patchA = fragField.z;   // ~100 m patches
+    float arid = worldMode == 1 ? fragField.w : 0.0;      // desert tint (generated worlds)
+    float tone = worldMode == 1 ? patchA : fragField.w;
+    float sandCover = worldMode == 1 ? clamp(fragSand, 0.0, 1.0) : 0.0;
+    bool far = camD > 250.0;
+    float n1 = vnoise(xz * 0.06), n2 = vnoise(xz * 0.45), n3 = vnoise(xz * 1.1);
+    float dn = n1 * 0.6 + n2 * 0.3 + n3 * 0.1;
     float alt = clamp((h - landBase) / max(snowLine - landBase, 400.0), 0.0, 1.2);   // valley floor 0 .. snow line 1
     float facing = dot(n0.xz, vec2(0.35, -0.94)) * 2.5;      // slopes turned to the midday sun dry out
     moist = clamp(moist + curv * 0.6 + stream * 0.5 - facing * 0.25 - alt * 0.15 + shore * 0.4, 0.0, 1.0);
@@ -428,12 +532,12 @@ void main() {
     // ---- the green layer: meadow -> drier grass -> moorland -> alpine tundra
     float gh;
     vec3 grass = grassAlbedo(texture0, xz, gh);
-    float dry = clamp(0.55 - moist + facing * 0.15, 0.0, 1.0);
-    grass = mix(grass, grass * vec3(1.35, 1.12, 0.62), smoothstep(0.1, 0.5, dry) * 0.55);     // straw
+    float dry = clamp(0.55 - moist + facing * 0.15 + arid * 0.35, 0.0, 1.0);
+    grass = mix(grass, grass * vec3(1.35, 1.12, 0.62), smoothstep(0.1, 0.5, dry) * (0.55 + 0.4 * arid));     // straw (golden in dry country)
     grass = mix(grass, grass * vec3(0.82, 1.03, 0.86), smoothstep(0.55, 0.85, moist) * 0.5);  // lush hollows
     float moorW = smoothstep(0.42, 0.72, alt + (patchA - 0.5) * 0.45 - curv * 0.3) * (1.0 - shoulder);
     moorW = max(moorW, smoothstep(0.78, 0.92, patchA) * 0.55 * smoothstep(0.2, 0.4, alt));   // heathy patches lower down
-    vec4 moor = moorW > 0.01 ? untile(texMoor, xz * 0.19) : vec4(0.0);
+    vec4 moor = moorW > 0.01 ? untile(texMoor, xz * 0.19, far) : vec4(0.0);
     vec3 green = mix(grass, moor.rgb, moorW);
     float tundra = smoothstep(0.78, 1.0, alt + (n1 - 0.5) * 0.2);
     green = mix(green, vec3(dot(green, vec3(0.35))) * vec3(1.02, 1.04, 0.9), tundra * 0.5);
@@ -444,24 +548,28 @@ void main() {
     vec4 rockA = geo < 0.99 ? triplanar(texture1, fragPos, n0, 0.11) : vec4(0.0);
     vec4 rockB = geo > 0.01 ? triplanar(texGranite, fragPos, n0, 0.075) : vec4(0.0);
     vec4 rock = mix(rockA, rockB, geo);
-    float band = fract(h * 0.043 + warp.x * 2.5 + fbm3(xz * 0.004) * 0.9);
+    float band = fract(h * 0.043 + fragBand);
     vec3 strata = mix(vec3(1.07, 0.98, 0.87), vec3(0.84, 0.83, 0.86), smoothstep(0.25, 0.75, band));
     strata = mix(strata, vec3(1.15, 0.88, 0.70), smoothstep(0.86, 0.96, band) * 0.7);   // ironstone
     rock.rgb *= mix(strata, vec3(1.0), geo);
+    // desert country: red-brown strata, ochre soil
+    rock.rgb = mix(rock.rgb, rock.rgb * vec3(1.28, 0.86, 0.66), arid * (1.0 - geo) * 0.85);
     rock.rgb = mix(rock.rgb, rock.rgb * vec3(0.82, 1.0, 0.68), smoothstep(0.55, 0.3, slope) * moist * 0.5);   // moss on the gentler rock
 
     // ---- loose ground: bare earth, and scree collecting under the cliffs
-    vec4 soil = untile(texSoil, xz * 0.25);
+    vec4 soil = untile(texSoil, xz * 0.25, far);
     float screeAmt = smoothstep(0.12, 0.26, slope) * (1.0 - smoothstep(0.48, 0.62, slope))
                    * clamp(curv * 2.4 + (n2 - 0.5) * 0.7 + scour * 0.4 + alt * 0.4 - 0.05, 0.0, 1.0) * (1.0 - shoulder);
-    vec4 scree = screeAmt > 0.01 ? untile(texScree, xz * 0.17) : vec4(0.0);
+    vec4 scree = screeAmt > 0.01 ? untile(texScree, xz * 0.17, far) : vec4(0.0);
     vec4 loose = mix(soil, scree, screeAmt);
+    loose.rgb = mix(loose.rgb, loose.rgb * vec3(1.2, 0.95, 0.75), arid * 0.6);
 
     vec4 grav = texture(texture2, xz * 0.55);
-    vec4 sand = untile(texSand, xz * 0.21);
+    vec4 sand = untile(texSand, xz * 0.21, far);
     // sediment: sand where it's slack, gravel bars by the current
     float gravBar = smoothstep(0.35, 0.7, vnoise(xz * 0.08) + stream * 0.4);
-    vec4 sedT = mix(sand, grav * vec4(0.95, 0.95, 0.92, 1.0), gravBar);
+    vec4 sedT = mix(sand, grav * vec4(0.95, 0.95, 0.92, 1.0), gravBar * (1.0 - sandCover));
+    sedT.rgb = mix(sedT.rgb, sedT.rgb * vec3(1.18, 1.02, 0.78), sandCover * 0.75);   // warm desert sand
 
     // layer weights: green | rock | loose | sediment
     float rockW = smoothstep(0.30, 0.52, slope + (dn - 0.5) * 0.22 - curv * 0.1) + scour * smoothstep(0.12, 0.3, slope) * 0.6;
@@ -472,15 +580,18 @@ void main() {
     // fresh, bare deposits by streams and shores; older ones on the slopes are grassed over
     float sedW = max(smoothstep(0.3, 1.0, sed) * (0.1 + 0.9 * clamp(max(smoothstep(0.5, 0.9, stream), shore * 2.0), 0.0, 1.0)), smoothstep(0.12, 0.5, shore + (dn - 0.5) * 0.15) * 0.95)
                + smoothstep(0.6, 0.95, stream) * 0.6;
+    // generated worlds: dunes, washes and salt flats are sand; dry country shows its soil
+    sedW = max(sedW, smoothstep(0.15, 0.7, sandCover + (n2 - 0.5) * 0.2));
+    soilW = max(soilW, arid * smoothstep(0.35, 0.85, dry + (dn - 0.5) * 0.4) * 0.9);
     float grassW = max(1.0 - rockW - soilW * 0.7 - sedW, 0.0);
     vec4 W = hblend(vec4(greenH, rock.a, loose.a, sedT.a), vec4(grassW, rockW, soilW, sedW));
     vec3 albedo = green * W.x + rock.rgb * W.y + loose.rgb * W.z + sedT.rgb * W.w;
     float hgt = greenH * 0.015 * W.x + rock.a * 0.3 * W.y + loose.a * mix(0.06, 0.18, screeAmt) * W.z + sedT.a * 0.05 * W.w;
     // broad tonal variation so wide views don't flatten out
-    albedo *= 0.9 + 0.2 * fbm3(xz * 0.03 + warp * 3.0);
+    albedo *= 0.9 + 0.2 * tone;
 
     // relief from the blended height (surface-gradient bump mapping), fading with distance
-    float bumpAmt = 1.0 - smoothstep(30.0, 140.0, camD);
+    float bumpAmt = (1.0 - smoothstep(20.0, 100.0, camD)) * 0.6;   // softer: fine relief read as noise
     if (bumpAmt > 0.0) {
         vec3 dpdx = dFdx(fragPos), dpdy = dFdy(fragPos);
         float dhdx = dFdx(hgt), dhdy = dFdy(hgt);
@@ -491,7 +602,7 @@ void main() {
     // gentle macro detail normal
     float e = 0.35;
     float hx = vnoise((xz + vec2(e, 0)) * 0.45) - n2, hz = vnoise((xz + vec2(0, e)) * 0.45) - n2;
-    n = normalize(n + vec3(-hx, 0.0, -hz) * 0.5 * (1.0 - W.y));
+    n = normalize(n + vec3(-hx, 0.0, -hz) * 0.18 * (1.0 - W.y));   // gentle (it read as noise)
 
     vec3 snow = vec3(0.90, 0.93, 0.98);
     // snow lies in hollows first and is blown off the crests
@@ -557,12 +668,16 @@ void main() {
 
     // ---- asphalt
     vec2 rp = vec2(across, v);
-    vec4 a1 = texture(texture0, rp / 2.3);
-    vec4 a2 = texture(texture0, rp / 7.9 + 0.31);
+    // aggregate at a coarser scale and slightly blurred (mip bias): calm, not a pixel-level grain
+    vec4 a1 = texture(texture0, rp / 4.6, 1.0);
+    vec4 a2 = texture(texture0, rp / 13.0 + 0.31, 0.5);
     vec3 asph = mix(a1.rgb, a2.rgb, 0.3);
+    // calm the aggregate: pull the texture halfway to its mean (detail fades out with distance too)
+    vec3 aMean = textureLod(texture0, vec2(0.5), 12.0).rgb;
+    asph = mix(aMean, asph, mix(0.22, 0.08, smoothstep(8.0, 40.0, camD)));
     float ah = a1.a * 0.7 + a2.a * 0.3;
     float macro = vnoise(rp * vec2(0.4, 0.08));
-    asph *= 0.82 + 0.3 * macro;
+    asph *= 0.93 + 0.12 * macro;
     // repair patches: darker, smoother tar rectangles
     // repair patches: irregular, slightly darker and smoother tar, with a sealed seam
     float pn = vnoise(rp * vec2(0.9, 0.22) + 11.0) * 0.8 + vnoise(rp * vec2(3.0, 0.9)) * 0.2;
@@ -574,7 +689,7 @@ void main() {
     float cn = vnoise(rp * vec2(0.9, 0.35)) + 0.5 * vnoise(rp * vec2(2.4, 1.1));
     float crack = (1.0 - smoothstep(0.0, 0.025, abs(cn - 0.75))) * smoothstep(0.35, 0.75, vnoise(rp * 0.21 + 5.0));
     crack *= 0.35 + 0.65 * smoothstep(1.5, 3.4, abs(across));
-    asph = mix(asph, vec3(0.025), crack * (1.0 - patchA) * 0.9);
+    asph = mix(asph, vec3(0.04), crack * (1.0 - patchA) * 0.45);
     // tyre tracks: polished and a little darker, oil drips mid-lane
     float track = exp(-pow((abs(across) - 1.75) * 2.2, 2.0)) + 0.6 * exp(-pow((abs(across) - 0.75) * 2.6, 2.0));
     asph *= 1.0 - 0.12 * clamp(track, 0.0, 1.0);
@@ -591,15 +706,16 @@ void main() {
     asph = mix(asph, vec3(0.80, 0.80, 0.76) * (0.85 + 0.15 * macro), paint);
 
     // ---- gravel shoulder + grass
-    vec4 gv = texture(texture1, fragPos.xz / 1.3);
-    vec4 gv2 = texture(texture1, fragPos.xz / 4.1 + 0.5);
-    vec3 grav = mix(gv.rgb, gv2.rgb, 0.3) * (0.8 + 0.3 * vnoise(fragPos.xz * 0.5));
+    vec4 gv = texture(texture1, fragPos.xz / 2.2, 0.75);
+    vec4 gv2 = texture(texture1, fragPos.xz / 6.5 + 0.5, 0.5);
+    vec3 gMean = textureLod(texture1, vec2(0.5), 12.0).rgb;
+    vec3 grav = mix(gMean, mix(gv.rgb, gv2.rgb, 0.3), 0.35) * (0.9 + 0.12 * vnoise(fragPos.xz * 0.5));
     grav = mix(grav, grav * vec3(0.55, 0.5, 0.42), smoothstep(0.1, 0.6, out1) * 0.35);  // dusty/damp away from the edge
     float gh;
     vec3 grass = grassAlbedo(texture2, fragPos.xz, gh);
     // stray grass growing through the gravel
-    float tuft = smoothstep(0.55, 0.8, vnoise(fragPos.xz * 3.1)) * smoothstep(0.15, 0.9, out1);
-    vec3 verge = mix(grav, grass, max(grassMix, tuft * 0.8));
+    float tuft = smoothstep(0.6, 0.85, vnoise(fragPos.xz * 1.6)) * smoothstep(0.15, 0.9, out1);
+    vec3 verge = mix(grav, grass, max(grassMix, tuft * 0.5));
     float vh = mix(gv.a, gh, grassMix);
 
     vec3 albedo = mix(verge, asph, onTar);
@@ -607,10 +723,11 @@ void main() {
 
     // relief normal from the height maps (fades with distance)
     if (camD < 45.0) {
-        float k = (1.0 - smoothstep(15.0, 45.0, camD)) * 0.9;
-        float hx = mix(texture(texture1, (fragPos.xz + vec2(0.02, 0.0)) / 1.3).a, texture(texture0, (rp + vec2(0.02, 0.0)) / 2.3).a, onTar);
-        float hz = mix(texture(texture1, (fragPos.xz + vec2(0.0, 0.02)) / 1.3).a, texture(texture0, (rp + vec2(0.0, 0.02)) / 2.3).a, onTar);
-        float hc = mix(gv.a, a1.a, onTar);
+        // a soft relief from blurred heights over 6 cm (2 cm on full-res height read as grain)
+        float k = (1.0 - smoothstep(8.0, 30.0, camD)) * 0.18;
+        float hx = mix(texture(texture1, (fragPos.xz + vec2(0.06, 0.0)) / 2.2, 2.0).a, texture(texture0, (rp + vec2(0.06, 0.0)) / 4.6, 2.0).a, onTar);
+        float hz = mix(texture(texture1, (fragPos.xz + vec2(0.0, 0.06)) / 2.2, 2.0).a, texture(texture0, (rp + vec2(0.0, 0.06)) / 4.6, 2.0).a, onTar);
+        float hc = mix(texture(texture1, fragPos.xz / 2.2, 2.0).a, texture(texture0, rp / 4.6, 2.0).a, onTar);
         n = normalize(n + vec3(hc - hx, 0.0, hc - hz) * k * 2.0);
     }
 
@@ -712,6 +829,9 @@ void main() {
 static const char* FS_FOLIAGE = R"(
 uniform int kind;    // 0 tree, 3 rock
 uniform sampler2D texture0;   // leaf atlas
+uniform int bakeMode;         // impostor baking: 1 = albedo, 2 = normal (camera basis) + ao
+uniform vec3 bakeRight;
+uniform vec3 bakeBack;
 void main() {
     vec3 n = normalize(fragNormal);
     float v = fragVar;
@@ -720,8 +840,14 @@ void main() {
     bool leaf = false;
     vec3 V = normalize(camPos - fragPos);
     if (kind == 3) {
-        albedo = mix(vec3(0.36, 0.35, 0.33), vec3(0.50, 0.48, 0.44), v) * (0.8 + 0.3 * vnoise(fragPos.xz * 3.0 + fragPos.y));
-        rough = 0.8; spec = 0.1;
+        // Zwift-style rock: clean warm grey facets with broad, soft colour shifts, darker where
+        // it meets the ground, a cap of moss on the faces that look up
+        vec3 base = mix(vec3(0.56, 0.54, 0.50), vec3(0.66, 0.60, 0.52), v);
+        base *= 0.9 + 0.18 * vnoise(fragPos.xz * 0.35 + fragPos.y * 0.3 + v * 7.0);
+        float mossy = smoothstep(0.78, 0.93, n.y + (vnoise(fragPos.xz * 1.4 + v * 3.0) - 0.5) * 0.25) * smoothstep(0.25, 0.6, v + 0.3);
+        albedo = mix(base, vec3(0.40, 0.55, 0.18), mossy * 0.6);
+        ao = mix(0.55, 1.0, fragColor.g);
+        rough = 0.85; spec = 0.08;
     } else if (fragColor.r < 0.25) {
         leaf = true;
         vec4 t = texture(texture0, fragUV);
@@ -730,16 +856,19 @@ void main() {
         float lod = max(0.0, 0.5 * log2(max(dot(dx, dx), dot(dy, dy))));
         if (t.a * (1.0 + lod * 0.32) < 0.5) discard;
         float hue = fragColor.b;
-        albedo = t.rgb * mix(vec3(0.92, 1.0, 0.86), vec3(1.12, 1.04, 0.78), hue) * (0.82 + 0.32 * v);
+        // species tint (blue-green conifers .. warm yellow-green aspen), and tree to tree
+        albedo = t.rgb * mix(vec3(0.88, 1.0, 0.95), vec3(1.08, 1.04, 0.8), hue) * (0.88 + 0.24 * v);
         albedo = mix(albedo, albedo * vec3(1.4, 0.95, 0.45), smoothstep(0.86, 1.0, v) * 0.45);   // the odd tree turning
-        ao = fragColor.g;
-        rough = 0.7; spec = 0.12;
+        // darker under the canopy, as in a painted tree
+        ao = fragColor.g * mix(0.75, 1.0, smoothstep(-0.6, 0.5, n.y));
+        rough = 0.9; spec = 0.02;
     } else {
         // bark, per species: brown furrowed, birch white, pine orange plates, spruce grey scales
         float bt = fragColor.b;
-        float furrow = vnoise(vec2(fragUV.x * 14.0, fragUV.y * 0.9));
-        float detail = vnoise(vec2(fragUV.x * 42.0, fragUV.y * 7.0));
-        vec3 brown = vec3(0.27, 0.21, 0.16) * (0.55 + 0.55 * furrow) * (0.85 + 0.3 * detail);
+        // painted bark: soft vertical streaks, little fine noise (the Zwift look)
+        float furrow = vnoise(vec2(fragUV.x * 9.0, fragUV.y * 0.6));
+        float detail = vnoise(vec2(fragUV.x * 24.0, fragUV.y * 3.0));
+        vec3 brown = vec3(0.31, 0.26, 0.21) * (0.78 + 0.3 * furrow) * (0.94 + 0.1 * detail);
         albedo = brown;
         if (bt > 0.2 && bt < 0.5) {
             float marks = smoothstep(0.64, 0.72, vnoise(vec2(fragUV.x * 5.0, fragUV.y * 8.0)));
@@ -752,18 +881,26 @@ void main() {
         } else if (bt >= 0.85) {
             albedo = vec3(0.30, 0.27, 0.24) * (0.6 + 0.45 * vnoise(vec2(fragUV.x * 22.0, fragUV.y * 4.0)));
         }
-        n = normalize(n + (vec3(furrow, 0.0, detail) - 0.5) * 0.35);
+        n = normalize(n + (vec3(furrow, 0.0, detail) - 0.5) * 0.15);
         ao = fragColor.g;
     }
     albedo *= albedo * 1.5;
+    if (bakeMode == 1) { finalColor = vec4(albedo * 0.6, 1.0); return; }
+    if (bakeMode == 2) {
+        vec3 nb = vec3(dot(n, bakeRight), n.y, dot(n, bakeBack));
+        if (nb.z < 0.0) nb.xy = -nb.xy;   // leaf cards are two-sided: always face the viewer
+        finalColor = vec4(nb.xy * 0.5 + 0.5, ao, 1.0);
+        return;
+    }
     float up = leaf ? n.y : normalize(fragNormal).y;
     float sn = snowCover * smoothstep(0.1, 0.6, up + (v - 0.5) * 0.3);
     albedo = mix(albedo * mix(1.0, 0.75, wetness), vec3(0.78, 0.81, 0.86), sn);
     float sh = shadowFactor(fragPos, normalize(fragNormal));
     vec3 col = shade(albedo, n, fragPos, rough, spec, sh, ao);
     if (leaf) {
-        float trans = pow(max(dot(-V, sunDir), 0.0), 4.0) * 0.9 + 0.15;
-        col += albedo * sunColor * trans * sh * ao * 0.6;
+        // a little light through the leaves when looking towards the sun (painted, not glowing)
+        float trans = pow(max(dot(-V, sunDir), 0.0), 4.0) * 0.7 + 0.08;
+        col += albedo * sunColor * trans * sh * ao * 0.35;
     }
     finalColor = vec4(applyFog(col, fragPos), 1.0);
 }
@@ -1028,6 +1165,39 @@ void main() {
 )";
 
 
+// ---------------------------------------------------------------- tree impostors
+static const char* FS_IMPOSTOR = R"(
+uniform sampler2D texture0;   // albedo atlas (premultiplied by coverage)
+uniform sampler2D texture1;   // normal atlas: rg = normal xy (camera basis), b = ao, a = coverage
+uniform vec2 impGrid;         // views, types
+uniform float impRow;
+uniform int impDebug;
+void main() {
+    if (impDebug == 1) { finalColor = vec4(1.0, 0.0, 0.0, 1.0); return; }
+    float k0 = fragColor.r, k1 = fragColor.g, w = fragColor.b;
+    vec2 a0 = (vec2(k0, impRow) + fragUV) / impGrid, a1 = (vec2(k1, impRow) + fragUV) / impGrid;
+    vec4 c0 = texture(texture0, a0), c1 = texture(texture0, a1);
+    float cov = mix(c0.a, c1.a, w);
+    if (cov < 0.42) discard;
+    vec3 albedo = (c0.rgb * (1.0 - w) + c1.rgb * w) / max(cov, 1e-3) / 0.6;
+    vec4 n0 = texture(texture1, a0), n1 = texture(texture1, a1);
+    vec4 nn = (n0 * (1.0 - w) + n1 * w) / max(mix(n0.a, n1.a, w), 1e-3);
+    vec2 nxy = nn.rg * 2.0 - 1.0;
+    float ao = nn.b;
+    vec3 B = normalize(fragNormal);
+    vec3 R = vec3(B.z, 0.0, -B.x);
+    vec3 n = normalize(R * nxy.x + vec3(0.0, 1.0, 0.0) * nxy.y + B * sqrt(max(1.0 - dot(nxy, nxy), 0.0)));
+    albedo *= 0.82 + 0.32 * fragVar;
+    float sn = snowCover * smoothstep(0.1, 0.6, n.y + (fragVar - 0.5) * 0.3);
+    albedo = mix(albedo * mix(1.0, 0.75, wetness), vec3(0.78, 0.81, 0.86), sn);
+    float sh = shadowFactor(fragPos, n);
+    vec3 col = shade(albedo, n, fragPos, 0.72, 0.1, sh, ao);
+    vec3 V = normalize(camPos - fragPos);
+    col += albedo * sunColor * (pow(max(dot(-V, sunDir), 0.0), 4.0) * 0.9 + 0.15) * sh * ao * 0.5;
+    finalColor = vec4(applyFog(col, fragPos), 1.0);
+}
+)";
+
 // ---------------------------------------------------------------- instanced grass tufts
 static const char* VS_GRASS = R"(#version 330
 in vec3 vertexPosition;
@@ -1091,7 +1261,7 @@ void main() {
     if (hash12(gl_FragCoord.xy + fragVar * 31.0) > fade) discard;
     float t = fragColor.a;   // 0 root .. 1 tip
     // painted: the ground's green at the root, bright yellow-green at the tips
-    vec3 base = meadowGreen(fragRoot.xz) * (fragColor.rgb * 2.0);
+    vec3 base = tuftGreen(fragRoot.xz) * (fragColor.rgb * 2.0);
     vec3 tip = base * vec3(1.25, 1.22, 0.7) + vec3(0.07, 0.08, 0.0);
     vec3 albedo = mix(base * 0.7, tip, smoothstep(0.05, 1.0, t));
     albedo = mix(albedo, albedo * vec3(1.15, 1.05, 0.75), fragVar * 0.35);   // clump to clump
@@ -1406,6 +1576,7 @@ float hash(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx
 
 static const char* FS_FXAA = R"(
 uniform vec2 texel;
+uniform float sharpen;
 void main() {
     vec2 uv = fragTexCoord;
     const vec3 L = vec3(0.299, 0.587, 0.114);
@@ -1424,7 +1595,17 @@ void main() {
     vec3 a = 0.5 * (texture(texture0, uv + dir * (1.0 / 3.0 - 0.5)).rgb + texture(texture0, uv + dir * (2.0 / 3.0 - 0.5)).rgb);
     vec3 b = a * 0.5 + 0.25 * (texture(texture0, uv + dir * -0.5).rgb + texture(texture0, uv + dir * 0.5).rgb);
     float lB = dot(b, L);
-    finalColor = vec4((lB < lMin || lB > lMax) ? a : b, 1.0);
+    vec3 c = (lB < lMin || lB > lMax) ? a : b;
+    if (sharpen > 0.0) {
+        // contrast-adaptive sharpen (after AMD's CAS): push away from the local average, less
+        // where the neighbourhood already has strong contrast, never past its min / max
+        vec3 avg = (rgbNW + rgbNE + rgbSW + rgbSE) * 0.25;
+        vec3 mn = min(rgbM, min(min(rgbNW, rgbNE), min(rgbSW, rgbSE)));
+        vec3 mx = max(rgbM, max(max(rgbNW, rgbNE), max(rgbSW, rgbSE)));
+        vec3 amp = clamp(min(mn, 1.0 - mx) / max(mx, 1e-3), 0.0, 1.0);
+        c = clamp(c + (c - avg) * sharpen * sqrt(amp), mn, mx);
+    }
+    finalColor = vec4(c, 1.0);
 }
 )";
 

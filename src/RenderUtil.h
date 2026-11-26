@@ -18,6 +18,7 @@ constexpr float PI_F = 3.14159265358979f;
 
 struct MeshBuilder {
     std::vector<float> v, n, t;
+    std::vector<float> tg, t2;   // optional: tangent slot (4) and texcoords2 (2), used as free per-vertex data
     std::vector<unsigned char> c;
     std::vector<unsigned short> idx;
     unsigned short add(Vector3 p, Vector3 nn, Vector2 uv, Color col = WHITE) {
@@ -27,6 +28,7 @@ struct MeshBuilder {
         c.insert(c.end(), {col.r, col.g, col.b, col.a});
         return (unsigned short)(v.size() / 3 - 1);
     }
+    void extra(Vector4 a, Vector2 b) { tg.insert(tg.end(), {a.x, a.y, a.z, a.w}); t2.insert(t2.end(), {b.x, b.y}); }
     void tri(unsigned short a, unsigned short b, unsigned short d) { idx.insert(idx.end(), {a, b, d}); }
     Mesh build(bool colors = false) const {
         Mesh m{};
@@ -41,6 +43,12 @@ struct MeshBuilder {
         if (colors) {
             m.colors = (unsigned char*)MemAlloc(c.size());
             std::memcpy(m.colors, c.data(), c.size());
+        }
+        if (!tg.empty() && tg.size() == v.size() / 3 * 4) {
+            m.tangents = (float*)MemAlloc(sizeof(float) * tg.size());
+            std::memcpy(m.tangents, tg.data(), sizeof(float) * tg.size());
+            m.texcoords2 = (float*)MemAlloc(sizeof(float) * t2.size());
+            std::memcpy(m.texcoords2, t2.data(), sizeof(float) * t2.size());
         }
         m.indices = (unsigned short*)MemAlloc(sizeof(unsigned short) * idx.size());
         std::memcpy(m.indices, idx.data(), sizeof(unsigned short) * idx.size());

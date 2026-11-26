@@ -61,6 +61,8 @@ uniform float hazeDensity;
 uniform float cloudSteps;
 uniform float planetR;
 uniform float precipArea;      // fraction of the sky raining (from the weather), 0 = dry
+uniform vec3 boltPos;          // lightning inside a cloud
+uniform float boltI;           // its flicker (0 = none)
 uniform sampler2D cloudShadowTex;   // cloud shadow map (see the SHADOW_PASS below)
 uniform vec4 csmRect;          // x0, z0, 1/size (m), cloud base it is parametrised at
 uniform float volDebug;
@@ -231,6 +233,13 @@ vec4 marchClouds(vec3 ro, vec3 rd, float tScene, float jitter, out float avgT) {
                 float h = clamp((altitude(p) - cloudBase) / (cloudTop - cloudBase), 0.0, 1.0);
                 vec3 amb = mix(ambBot, ambTop, h) * ambK + vec3(0.75, 0.8, 1.0) * flash * 2.5;
                 vec3 S = (sunCloudCol * lum * powder * 1.15 + amb) * sig;
+                if (boltI > 0.001) {   // lightning: the cloud glows from inside around the strike
+                    float bd = length(p - boltPos);
+                    // a hot core a couple of hundred metres across inside a broad glow
+                    float core = 1.0 / (1.0 + bd * bd / (260.0 * 260.0));
+                    float halo = exp(-bd / 700.0);
+                    S += vec3(0.78, 0.82, 1.0) * boltI * (160.0 * core * core + 6.0 * halo) * sig;
+                }
                 float tr = exp(-sig * ds);
                 scat += T * (S - S * tr) / sig;
                 float absorbed = T * (1.0 - tr);
@@ -342,6 +351,7 @@ vec4 marchFog(vec3 ro, vec3 rd, float tScene, float jitter) {
         if (sig < 1e-6) continue;
         vec3 Li = lightColF * ph * sunVis(p) * cloudShadowAt(p) + amb;
         Li += lampScatter(p, rd);
+        if (boltI > 0.001) { float bd = length(p - boltPos); Li += vec3(0.78, 0.82, 1.0) * boltI * 1.2 * exp(-bd / 900.0); }
         vec3 S = Li * sig;
         float tr = exp(-sig * ds);
         scat += T * (S - S * tr) / sig;
@@ -370,7 +380,7 @@ vec4 marchShafts(vec3 ro, vec3 rd, float tScene, float jitter) {
         vec3 w = textureLod(weatherTex, (xz + windOffset) / weatherScale, 1.0).rgb;
         float cell = precipMask(w.b);
         float streak = tex3D(detailTex, vec3(xz / 900.0, 0.37), detailDim).g;
-        float sig = (0.4 + 0.6 * precip) * 0.0007 * cell * (0.4 + 1.2 * streak) * smoothstep(cloudBase + 50.0, cloudBase - 300.0, p.y);
+        float sig = (0.4 + 0.6 * precip) * 0.00018 * cell * (0.4 + 1.2 * streak) * smoothstep(cloudBase + 50.0, cloudBase - 300.0, p.y);
         if (sig < 1e-7) continue;
         vec3 S = (amb + lightColF * 0.15) * sig;
         float tr = exp(-sig * ds);

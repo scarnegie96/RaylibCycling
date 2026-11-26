@@ -37,6 +37,13 @@ struct Sample {
     float scour = 0;             // eroded, bare ground (0..1)
     float bank = 0;              // river / lake shore (0..1)
     float bankLevel = -1e9f;     // water surface of the nearby river (banks stay above it)
+    // generated worlds (wmap::Map) only: what the ground is and what grows on it
+    float moist = -1.f;          // soil moisture 0..1 (-1: not a generated world)
+    float sand = 0;              // loose sand at the surface
+    float geology = 0.5f;        // 0 bedded / red strata .. 1 crystalline
+    float arid = 0;              // desert tint
+    float trees = -1.f, shrubs = 0, rocks = 0, grass = 1.f, conifer = 0.f;   // densities 0..1
+    float tunnel = 1e4f;         // distance to a tunnel under the ground here
 };
 
 // a river passing under the road
@@ -45,6 +52,7 @@ struct Bridge {
     float roadY = 0, level = 0;  // deck height, water surface
     float span = 0;              // total length along the road (m)
     float width = 0;             // river width
+    float hx = 0, hz = 0;        // generated worlds: the road's direction over the bridge
 };
 
 // a river's centreline, for drawing its water as a smooth ribbon
@@ -57,6 +65,8 @@ struct LakeShape {
 };
 
 struct Stats { int windows = 0, nodes = 0, cells = 0; double erodeMs = 0; };
+// generated worlds: a grid cell of a lake (lakes there follow their basin, not a round shore)
+struct LakeCell { float x, z, size, level; };
 
 class Field {
 public:
@@ -75,6 +85,8 @@ public:
     std::vector<Bridge> bridgesNear(float x, float z, float radius) const;
     // rivers with a piece whose midpoint lies in the box (whole polylines), lakes centred in it
     void waterIn(float x0, float z0, float x1, float z1, std::vector<Waterway>& ways, std::vector<LakeShape>& lakes) const;
+    // generated worlds: lake cells (and a cell around them) in the box
+    void lakeCellsIn(float x0, float z0, float x1, float z1, std::vector<LakeCell>& cells) const;
     void trim(float x, float z, float keepRadius) const;  // forget caches far away
     void setErosion(bool on, int quality) const;           // quality 0..2: droplet budget
     // the road was extended: follow the new course, forget everything inside the box

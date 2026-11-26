@@ -51,6 +51,7 @@ struct TrainerCommand {
     double gradePct = 0, windMps = 0, crr = 0.004, cw = 0.51;
     double watts = 0;
     double levelPct = 0;
+    double massKg = 0;   // rider + bike (sim mode on trainers that take it, e.g. Wahoo legacy); 0 = unknown
     static TrainerCommand sim(double g, double crr, double cw) { TrainerCommand c; c.type = Simulation; c.gradePct = g; c.crr = crr; c.cw = cw; return c; }
     static TrainerCommand erg(double w) { TrainerCommand c; c.type = TargetPower; c.watts = w; return c; }
     static TrainerCommand level(double l) { TrainerCommand c; c.type = Resistance; c.levelPct = l; return c; }
@@ -60,6 +61,7 @@ struct TrainerInput {
     double powerW = 0, cadenceRpm = 0;
     std::optional<double> heartRate;
     bool connected = false;
+    std::optional<double> trainerSpeedKmh;   // the trainer's own flywheel speed (FTMS), for virtual gears (last: positional init elsewhere)
 };
 
 // ------------------------------------------------------------------ route profile (fast, uniformly sampled)
@@ -132,6 +134,8 @@ public:
     void grade(double deltaPct);
     void difficulty(double deltaPct);
     void shift(int delta);
+    void setVirtualShifting(bool on) { profile_.virtualShifting = on; forceCmd_ = true; }
+    bool virtualShifting() const { return profile_.virtualShifting; }
     void setFreeMode(FreeMode m);
     void freeWatts(double deltaW);
     void level(double deltaPct);
@@ -142,6 +146,8 @@ public:
     void addSector(const SectorSpec& spec);
     // endless roads: append to the end of the road (no sector, no message)
     void extendRoute(const std::vector<SegmentSpec>& segs);
+    // free roaming: the road ahead grows by these points (distances continue the route's)
+    void appendRoutePoints(const std::vector<RoutePoint>& pts);
     bool freeGradientActive() const;  // free ride following the road (Up/Down offset the gradient)
     bool undoSector();
     void extendStep(int seconds);
@@ -225,6 +231,7 @@ public:
     bool shiftingActive() const { return shiftingActive_; }
     int gear() const { return gearIdx_ + 1; }
     double gearRatio() const { return phys::VIRTUAL_GEARS[gearIdx_]; }
+    double realGearRatio() const { return realRatio_; }   // the rider's actual chainring/cog, learnt from trainer speed vs cadence
     double splitElapsed() const { return activeS_ - splitStartS_; }
     double splitDistance() const { return distance_ - splitStartD_; }
     double splitAvgPower() const;
@@ -286,6 +293,10 @@ private:
     bool testDone_ = false;
     int gearIdx_ = 9;
     double cadEma_ = 0;
+    double accel_ = 0;  // virtual bike acceleration (m/s^2, smoothed) - momentum for the trainer grade
+    double trainerVFast_ = 0;  // trainer speed with a short (0.3 s) smoothing, for the gear maths
+    double trainerV_ = 0, realRatio_ = 2.43;   // trainer speed (m/s, smoothed); real gear (34x14, the Zwift Cog, until learnt)
+    bool haveTrainerV_ = false;
     bool shiftingActive_ = false;
     std::vector<HrZone> hrZones_;
     double npTimer_ = 0;

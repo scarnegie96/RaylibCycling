@@ -68,41 +68,137 @@ static double mulberry(uint32_t& a) {
     return double((t ^ (t >> 14))) / 4294967296.0;
 }
 
-std::vector<Segment> timeline(uint32_t seed, double hours, bool alpine) {
-    struct Opt { Kind k; double w; };
-    auto next = [](Kind k) -> std::vector<Opt> {
-        switch (k) {
-            case Kind::Clear: return {{Kind::Clear, 3}, {Kind::Fair, 5}, {Kind::Cloudy, 1}, {Kind::Windy, 0.6}, {Kind::Mist, 0.5}};
-            case Kind::Fair: return {{Kind::Clear, 3}, {Kind::Fair, 2}, {Kind::Cloudy, 4}, {Kind::Windy, 1}, {Kind::Sunshower, 0.7}, {Kind::Drizzle, 0.5}};
-            case Kind::Windy: return {{Kind::Fair, 2}, {Kind::Cloudy, 2}, {Kind::Clear, 1}};
-            case Kind::Cloudy: return {{Kind::Fair, 3}, {Kind::Overcast, 3}, {Kind::Drizzle, 2}, {Kind::Rain, 1}, {Kind::Windy, 0.8}, {Kind::Mist, 0.6}};
-            case Kind::Overcast: return {{Kind::Cloudy, 3}, {Kind::Drizzle, 3}, {Kind::Rain, 2.5}, {Kind::Storm, 0.8}, {Kind::Mist, 0.8}, {Kind::Fog, 0.4}, {Kind::Sleet, 0.3}};
-            case Kind::Mist: return {{Kind::Fair, 2}, {Kind::Cloudy, 3}, {Kind::Overcast, 1}, {Kind::Fog, 1}};
-            case Kind::Fog: return {{Kind::Mist, 3}, {Kind::Cloudy, 2}, {Kind::Fair, 1}};
-            case Kind::Drizzle: return {{Kind::Cloudy, 3}, {Kind::Rain, 2}, {Kind::Fair, 1.5}, {Kind::Sunshower, 0.8}};
-            case Kind::Sunshower: return {{Kind::Fair, 3}, {Kind::Clear, 1}, {Kind::Drizzle, 1}};
-            case Kind::Rain: return {{Kind::Drizzle, 2}, {Kind::Cloudy, 2.5}, {Kind::Fair, 2}, {Kind::Storm, 0.8}, {Kind::Sleet, 0.3}};
-            case Kind::Storm: return {{Kind::Rain, 3}, {Kind::Cloudy, 2}, {Kind::Hail, 0.6}};
-            case Kind::Hail: return {{Kind::Storm, 1}, {Kind::Rain, 2}, {Kind::Cloudy, 1}};
-            case Kind::Sleet: return {{Kind::Rain, 2}, {Kind::Drizzle, 2}, {Kind::Snow, 1}, {Kind::Overcast, 1}};
-            case Kind::Snow: return {{Kind::Overcast, 2}, {Kind::Snow, 2}, {Kind::Blizzard, 0.6}, {Kind::Sleet, 0.5}};
-            default: return {{Kind::Snow, 3}};
-        }
-    };
-    uint32_t a = seed * 7717u + 3u;
-    std::vector<Segment> segs;
-    Kind kind = mulberry(a) < 0.55 ? Kind::Clear : mulberry(a) < 0.6 ? Kind::Fair : Kind::Cloudy;
-    double t = 0;
-    while (t < hours * 3600) {
-        segs.push_back({t, kind});
-        t += 480 + mulberry(a) * 840;
-        auto opts = next(kind);
-        double total = 0;
-        for (auto& o : opts) { if (alpine && (o.k == Kind::Rain || o.k == Kind::Drizzle)) o.w *= 0.6; total += o.w; }
-        double pick = mulberry(a) * total;
-        for (auto& o : opts) { pick -= o.w; if (pick <= 0) { kind = o.k; break; } }
+// "Changing" weather, driven by weather systems rather than a free-running chain of names.
+// A slowly drifting pressure (a few long waves, plus fronts that pass every couple of hours:
+// pressure falls ahead of the front, bottoms out as it passes, recovers behind it) and a
+// wandering humidity decide each spell: high and dry -> clear / fair; falling -> cloud thickens
+// to drizzle and rain; the trough of a front -> heavy rain, sometimes a storm; behind it,
+// clearing with showers; humid unsettled spells pop sunshowers. Spells run 6-18 minutes (shorter
+// when unsettled), and no spell jumps more than two steps of severity from the last one
+// (sky clouds over before it rains), so it reads like real weather moving through.
+namespace {
+int severity(Kind k) {
+    switch (k) {
+        case Kind::Clear: return 0;
+        case Kind::Fair: case Kind::Windy: case Kind::Sunshower: return 1;
+        case Kind::Cloudy: case Kind::Mist: return 2;
+        case Kind::Overcast: case Kind::Fog: case Kind::Drizzle: return 3;
+        case Kind::Rain: case Kind::Sleet: case Kind::Snow: return 4;
+        default: return 5;   // storm, hail, blizzard
     }
-    return segs;
+}
+}  // namespace
+
+std::vector<Segment> timeline(uint32_t seed, double hours, bool alpine) {
+    uint32_t a = seed * 7717u + 3u;
+    auto R = [&]() { return mulberry(a); };
+    // pressure: three long waves (1.5-5 h) ...
+    double ph[3], per[3], amp[3];
+    for (int i = 0; i < 3; ++i) { ph[i] = R() * 6.2832; per[i] = (1.5 + R() * 3.5) * 3600; amp[i] = 0.25 + R() * 0.3; }
+    double base = (R() - 0.35) * 0.8;   // most rides start fairly settled
+    // ... and fronts, every ~1.5-3.5 h (sometimes none in the first hours)
+    std::vector<std::pair<double, double>> fronts;   // time, depth
+    for (double t = (0.4 + R() * 2.5) * 3600; t < hours * 3600 + 3600; t += (1.5 + R() * 2.0) * 3600) fronts.push_back({t, 0.6 + R() * 0.9});
+    double hph[2] = {R() * 6.2832, R() * 6.2832}, hper[2] = {(0.6 + R() * 0.8) * 3600, (1.2 + R() * 1.5) * 3600};
+    double windBias = R();
+    auto pressure = [&](double t) {
+        double p = base;
+        for (int i = 0; i < 3; ++i) p += amp[i] * std::sin(t / per[i] * 6.2832 + ph[i]);
+        for (auto& [ft, depth] : fronts) {
+            double x = (t - ft) / 2400.0;   // ~40 min each side of the front
+            p -= depth * std::exp(-x * x) * (x < 0 ? 1.0 : 0.75);
+        }
+        return std::clamp(p, -1.6, 1.4);
+    };
+    auto humidity = [&](double t) {
+        return std::clamp(0.5 + 0.3 * std::sin(t / hper[0] * 6.2832 + hph[0]) + 0.2 * std::sin(t / hper[1] * 6.2832 + hph[1]) - 0.25 * pressure(t), 0.0, 1.0);
+    };
+    auto frontNear = [&](double t) {
+        double best = 1e9;
+        for (auto& f : fronts) best = std::min(best, std::fabs(t - f.first));
+        return best;
+    };
+    auto pick = [&](double t) -> Kind {
+        double p = pressure(t), h = humidity(t), fn = frontNear(t);
+        double dp = pressure(t + 600) - pressure(t - 600);   // rising (+) or falling (-)
+        double r = R();
+        if (fn < 900 && p < -0.6) {   // the front itself
+            if (r < 0.18 && h > 0.5) return Kind::Storm;
+            if (r < 0.22 && h > 0.6) return Kind::Hail;
+            return r < 0.8 ? Kind::Rain : Kind::Overcast;
+        }
+        if (p < -0.7) return h > 0.55 ? (r < 0.65 ? Kind::Rain : Kind::Drizzle) : Kind::Overcast;
+        if (p < -0.3) {
+            if (dp < 0) return h > 0.6 ? (r < 0.5 ? Kind::Drizzle : Kind::Overcast) : Kind::Cloudy;   // thickening ahead of rain
+            return h > 0.6 && r < 0.4 ? Kind::Sunshower : (r < 0.6 ? Kind::Cloudy : Kind::Fair);    // clearing behind, showers
+        }
+        if (p < 0.2) {
+            if (h > 0.75 && r < 0.25) return Kind::Mist;
+            if (windBias > 0.6 && r < 0.3) return Kind::Windy;
+            if (h > 0.6 && r < 0.2) return Kind::Sunshower;
+            return h > 0.5 ? Kind::Cloudy : Kind::Fair;
+        }
+        if (h > 0.8 && r < 0.3) return p > 0.8 ? Kind::Fog : Kind::Mist;   // still, damp high pressure
+        if (windBias > 0.7 && r < 0.2) return Kind::Windy;
+        return h < 0.45 || r < 0.5 ? Kind::Clear : Kind::Fair;
+    };
+    std::vector<Segment> segs;
+    double t = 0;
+    Kind prev = pick(0);
+    if (severity(prev) > 3) prev = Kind::Cloudy;   // don't open a ride in a downpour
+    while (t < hours * 3600) {
+        Kind k = segs.empty() ? prev : pick(t);
+        if (alpine && (k == Kind::Rain || k == Kind::Drizzle) && R() < 0.3) k = Kind::Overcast;
+        // no more than two steps of severity at a time: insert the step between
+        int ds = severity(k) - severity(prev);
+        if (!segs.empty() && std::abs(ds) > 2) {
+            static const Kind bySeverity[6] = {Kind::Clear, Kind::Fair, Kind::Cloudy, Kind::Overcast, Kind::Rain, Kind::Storm};
+            Kind mid = bySeverity[std::clamp(severity(prev) + (ds > 0 ? 2 : -2), 0, 5)];
+            segs.push_back({t, mid});
+            t += 300 + R() * 300;
+            prev = mid;
+            continue;
+        }
+        segs.push_back({t, k});
+        prev = k;
+        double unsettled = std::clamp(-pressure(t), 0.0, 1.0);
+        t += (360 + R() * 720) * (1.0 - 0.35 * unsettled);
+    }
+    // merge repeats
+    std::vector<Segment> out;
+    for (auto& sg : segs) if (out.empty() || out.back().kind != sg.kind) out.push_back(sg);
+    return out;
+}
+
+// temperature of the air for a spell: the seasonal mean, a day/night swing that clouds damp,
+// cooler in rain, colder with height (6.5 C / km)
+double temperature(double seasonalMeanC, double sunElevationDeg, Kind k, double elevationM) {
+    int sv = severity(k);
+    double swing = sv <= 1 ? 5.0 : sv <= 2 ? 3.5 : 2.0;
+    double day = std::clamp(sunElevationDeg / 40.0, -0.6, 1.0);
+    double t = seasonalMeanC + swing * day - swing * 0.15;
+    if (k == Kind::Rain || k == Kind::Drizzle || k == Kind::Sleet) t -= 1.5;
+    if (k == Kind::Storm || k == Kind::Hail) t -= 3.0;
+    t -= 6.5 * std::max(0.0, elevationM) / 1000.0;
+    if (k == Kind::Snow || k == Kind::Blizzard) t = std::min(t, 0.5);
+    if (k == Kind::Sleet) t = std::clamp(t, 0.0, 3.0);
+    return t;
+}
+
+double seasonalMean(double latDeg, int dayOfYear) {
+    double al = std::fabs(latDeg);
+    double annual = 30.0 - 0.38 * al, swing = 1.0 + 0.13 * al;
+    double coldest = latDeg >= 0 ? 15 : 197;   // mid January / mid July
+    return annual - swing * std::cos(2 * M_PI * (dayOfYear - coldest) / 365.25);
+}
+
+Kind Sim::kindIn(double elapsed, double aheadS) const {
+    if (mode == Mode::Live && live) {
+        for (const auto& h : live->hourly)
+            if (h.inHours * 3600 >= aheadS - 1800) return h.kind;
+        return live->kind;
+    }
+    return currentKind(elapsed + aheadS);
 }
 
 Kind kindAt(const std::vector<Segment>& segs, double t) {
@@ -144,7 +240,8 @@ std::string forecastUrl(double lat, double lon) {
     char b[300];
     std::snprintf(b, sizeof b,
                   "https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f&current=temperature_2m,weather_code,cloud_cover,"
-                  "precipitation,wind_speed_10m,is_day&wind_speed_unit=kmh",
+                  "precipitation,wind_speed_10m,is_day&hourly=temperature_2m,weather_code,cloud_cover,wind_speed_10m,precipitation_probability"
+                  "&forecast_hours=4&wind_speed_unit=kmh",
                   lat, lon);
     return b;
 }
@@ -176,6 +273,24 @@ std::optional<Live> parseCurrent(const std::string& text, const std::string& pla
     l.isDay = c->numOr("is_day", 1) == 1;
     l.kind = kindFromId(kindFromWmo(l.code, l.windKmh, l.cloudCover)).value_or(Kind::Cloudy);
     l.place = place;
+    // the next hours (Open-Meteo's hourly arrays start at the current hour)
+    if (auto h = v.get("hourly")) {
+        const auto& codes = h->arr("weather_code");
+        const auto& temps = h->arr("temperature_2m");
+        const auto& clouds = h->arr("cloud_cover");
+        const auto& winds = h->arr("wind_speed_10m");
+        const auto& probs = h->arr("precipitation_probability");
+        for (size_t i = 1; i < codes.size() && l.hourly.size() < 3; ++i) {
+            Live::Hour hr;
+            hr.inHours = double(i);
+            double w = i < winds.size() ? winds[i].n : l.windKmh, cc = i < clouds.size() ? clouds[i].n : l.cloudCover;
+            hr.kind = kindFromId(kindFromWmo(int(codes[i].n), w, cc)).value_or(Kind::Cloudy);
+            hr.tempC = i < temps.size() ? temps[i].n : l.temperatureC;
+            hr.windKmh = w;
+            hr.precipProb = i < probs.size() ? probs[i].n : 0;
+            l.hourly.push_back(hr);
+        }
+    }
     return l;
 }
 

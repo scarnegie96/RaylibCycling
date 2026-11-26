@@ -33,7 +33,13 @@ struct Live {
     bool isDay = true;
     std::string place;
     int code = 0;
+    struct Hour { double inHours = 1; Kind kind = Kind::Fair; double tempC = 0, windKmh = 0, precipProb = 0; };
+    std::vector<Hour> hourly;   // the next three hours
 };
+// air temperature for a spell (seasonal mean, day/night swing damped by cloud, rain, height)
+double temperature(double seasonalMeanC, double sunElevationDeg, Kind k, double elevationM);
+// mean temperature for the time of year at a latitude (a rough climatology: London ~5 C in late Nov)
+double seasonalMean(double latDeg, int dayOfYear);
 const char* kindFromWmo(int code, double windKmh, double cloudCover);
 State stateFromLive(const Live& l);
 std::string forecastUrl(double lat, double lon);
@@ -56,6 +62,7 @@ public:
 
     explicit Sim(uint32_t seed = 1, bool alpine = false);
     Kind currentKind(double elapsed) const;
+    Kind kindIn(double elapsed, double aheadS) const;   // forecast: the spell aheadS from now
     State targetFor(double elapsed) const;
     struct Events { bool lightning = false; double thunderIn = 0, strength = 0; std::optional<Kind> changed; };
     Events update(double dt, double elapsed, double snowiness, bool sunUp, bool instant = false);

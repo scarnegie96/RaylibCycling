@@ -9,8 +9,6 @@
 
 using namespace ui;
 
-static const Color CARD{255, 255, 255, 255};
-static const Color CARD2{246, 248, 251, 255};
 static const char* COLORS[] = {"#1DB870", "#FF5C38", "#3BA3FF", "#F5B83D", "#B36BFF", "#FF4F8B"};
 
 static Color hexColor(const std::string& h) {
@@ -46,7 +44,7 @@ static std::string targetLabel(const App* app, const Event& e, const std::vector
 void App::drawEventsPage(Rectangle r) {
     float lw = std::min(560.f, r.width * 0.42f);
     Rectangle L{r.x, r.y, lw, r.height};
-    panel(L, CARD);
+    panel(L, ui::PANEL);
     float x = L.x + 18, y = L.y + 14, w = L.width - 36;
     text("Events", x, y, F::Title, TEXT);
     if (button({L.x + L.width - 150, y + 2, 132, 34}, "+ New event")) {
@@ -69,7 +67,7 @@ void App::drawEventsPage(Rectangle r) {
     Rectangle lr{x, y, w, L.y + L.height - y - 12};
     float rowH = 92;
     scrollUpdate(lr, evScroll_, events_.size() * (rowH + 8));
-    BeginScissorMode(int(lr.x), int(lr.y), int(lr.width), int(lr.height));
+    ui::beginScissor({lr.x, lr.y, lr.width, lr.height});
     char b[200];
     if (events_.empty()) textWrapped("Schedule rides that repeat - a weekly threshold session, a Saturday long ride, a monthly FTP test. "
                                      "They show up on Home on the day, ready to start, and CoreRay keeps your streak.", {x, y, w, 100}, F::Body, DIM, 16);
@@ -77,9 +75,9 @@ void App::drawEventsPage(Rectangle r) {
         const Event& e = events_[i];
         Rectangle row{lr.x, lr.y + i * (rowH + 8) - evScroll_, lr.width - 8, rowH};
         if (row.y + rowH < lr.y || row.y > lr.y + lr.height) continue;
-        bool h = hovered(row) && CheckCollisionPointRec(GetMousePosition(), lr);
+        bool h = hovered(row) && CheckCollisionPointRec(ui::mouseLogical(), lr);
         bool sel = eventEditor_ && evDraft_.id == e.id;
-        DrawRectangleRounded(row, 0.15f, 6, sel ? Color{15, 157, 88, 45} : h ? Color{238, 241, 245, 255} : CARD2);
+        DrawRectangleRounded(row, 0.15f, 6, sel ? ui::accentA(45) : h ? ui::HOVER : ui::PANEL2);
         DrawRectangleRounded({row.x + 8, row.y + 12, 5, rowH - 24}, 1, 4, e.active ? hexColor(e.color) : FAINT);
         text(e.name, row.x + 24, row.y + 8, F::Body, e.active ? TEXT : DIM, 18);
         text(targetLabel(this, e, routes_, wks), row.x + 24, row.y + 34, F::Small, DIM, 14);
@@ -122,7 +120,7 @@ void App::drawEventsPage(Rectangle r) {
     if (eventEditor_) { drawEventEditor(R); return; }
 
     // ---- calendar
-    panel(R, CARD);
+    panel(R, ui::PANEL);
     x = R.x + 22; y = R.y + 18; w = R.width - 44;
     Date first{today.y, today.m, 1};
     int mm = first.m - 1 + calMonthOffset_;
@@ -148,7 +146,7 @@ void App::drawEventsPage(Rectangle r) {
         Rectangle c{x + (k % 7) * cw + 2, y + (k / 7) * ch + 2, cw - 4, ch - 4};
         bool inMonth = d.m == first.m;
         bool isToday = d == today;
-        DrawRectangleRounded(c, 0.12f, 6, isToday ? Color{15, 157, 88, 40} : inMonth ? CARD2 : Color{243, 245, 248, 255});
+        DrawRectangleRounded(c, 0.12f, 6, isToday ? ui::accentA(40) : inMonth ? ui::PANEL2 : ui::BG);
         text(std::to_string(d.d), c.x + 8, c.y + 5, F::Small, inMonth ? (isToday ? ACCENT : TEXT) : FAINT, 13);
         auto rc = rideCount.find(d.days());
         if (rc != rideCount.end()) {
@@ -170,7 +168,7 @@ void App::drawEventsPage(Rectangle r) {
 }
 
 void App::drawEventEditor(Rectangle R) {
-    panel(R, CARD);
+    panel(R, ui::PANEL);
     float x = R.x + 22, y = R.y + 18, w = R.width - 44;
     bool isNew = evDraft_.id.empty();
     text(isNew ? "New event" : "Edit event", x, y, F::Title, TEXT);

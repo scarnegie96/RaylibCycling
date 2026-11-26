@@ -1,0 +1,15 @@
+42f513cff33cffb88186b00838b248b8  src/App.cpp
+aaa9b9d06608ece450245cdd358dd4a1  src/Ble.cpp
+85e4762e5d093595a4b1a6b16f9fe9c6  src/Ble.h
+669a9448b71495523fa46d13de5db010  src/Protocol.cpp
+f386c0d33d84a54967b9a4e0e16c5bcc  src/Protocol.h
+bf5a86e514be921500d2d5c4fc2dabc2  src/RideUi.cpp
+f851a35aee9ad22a691c2f320f1dbf54  src/SettingsUi.cpp
+49eedc5a3d6461b83a6e26801c14aed2  src/Store.cpp
+ba9c42d6afbb33df652f9f8cafdd43cc  src/Store.h
+be6be0fb702d95e07c91add1fc6a8b2f  src/core/Engine.cpp
+5354f0f24e23ed66381ee44039261523  src/core/Engine.h
+d53be904be75b09e9662d4e15a6f23df  src/core/Physics.cpp
+2d137fe98f5722365d01ada321fd1c4e  src/core/Physics.h
+7d163f509964510db3ac3e962c93ec58  tests/core_tests.cpp
+cde660b4c93142436f141b6f425fd59a  tests/protocol_tests.cpp

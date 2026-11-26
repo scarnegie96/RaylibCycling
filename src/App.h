@@ -10,7 +10,10 @@
 
 #include "Ble.h"
 #include "Course.h"
+#include "world/WorldMap.h"
+#include <future>
 #include "Db.h"
+#include "MapPreview.h"
 #include "Renderer.h"
 #include "Store.h"
 #include "Ui.h"
@@ -26,7 +29,7 @@ public:
     int run(int argc, char** argv);
 
 private:
-    enum class Screen { Home, Ride, Summary };
+    enum class Screen { Home, Ride, Summary, Explore };
     enum Page { PHome, PRide, PRoutes, PWorkouts, PEvents, PActivities, PStats, PDevices, PProfile, PAGE_COUNT };
 
     // ---- lifecycle / flow (App.cpp)
@@ -86,6 +89,13 @@ private:
 
     // ---- settings (SettingsUi.cpp)
     void drawDevicesPage(Rectangle r);
+    void drawShifterTest(Rectangle r);
+    void drawDeviceList(Rectangle L);          // trainer / HRM / shifter links, scan, found devices
+    void drawDevicesModal();                   // the same, over the ride (cog button)
+    bool devicesModal_ = false;
+    double devicesOpenedAt_ = 0;
+    int lastGear_ = -1;                        // to tick on every gear change
+    Texture2D cogTex_{};
     void drawSimPanel(Rectangle r, bool compact);
     void drawProfilePage(Rectangle r);
 
@@ -101,6 +111,7 @@ private:
     void drawRoadAhead(float x, float& y, float w);
     void drawPauseMenu();
     void drawHelp();
+    void drawPerf();   // FPS counter / frame-time breakdown (mid-right)
 
     // ---- summary (SummaryUi.cpp)
     void drawSummary();
@@ -139,6 +150,66 @@ private:
     Hilliness hillNext_ = Hilliness::Rolling;  // for kilometres not yet built
     int netNext_ = 0;                          // metres up (+) or down (-) per kilometre
     uint32_t worldSeed_ = 0;                   // 0 = random every ride
+    // generated map scenery (prefs_.scenery == 1): built off-thread, cached on disk
+    std::shared_future<std::shared_ptr<const wmap::Map>> mapFuture_;
+    std::string mapFor_;                       // seed / size / climate the future is for
+    std::shared_ptr<const wmap::Map> map_;
+    std::vector<wmap::RoadPt> mapPath_;        // the loop being ridden
+    void requestMap();                         // start generating / loading prefs_.mapSeed
+    bool mapRoute(double km, Route& out);      // a loop on the map as a Route (waits for the map)
+    wmap::Params mapParams() const;
+    // ---- free roaming on a generated map (RoamUi.cpp): the way on is chosen at junctions
+    struct RoamChoice { int road = -1; bool fwd = true, deadEnd = false; float turn = 0; std::string label, dest; };
+    struct Roam { bool on = false; int node = -1, fromRoad = -1; std::vector<RoamChoice> opts; int sel = 0; std::vector<int> recent; } roam_;
+    bool roamStart(Route& out);
+    // ---- free ride on a generated world (FreeWorldUi.cpp): a 3D miniature to pick the start on
+    MapPreview mapPreview_;
+    MapPreview::Spawn spawn_;
+    std::string spawnKey_;                     // the map (mapFor_) the spawn belongs to
+    double mapReqAt_ = 0;                      // when the current map was requested (for the progress text)
+    std::shared_ptr<const wmap::Map> mapIfReady();   // non-blocking: the requested map once it's built, else null
+    void drawWorldPicker(Rectangle r);
+    void drawWorldOptions(float x, float& y, float w);
+    void defaultSpawn();
+    // saved generated worlds (store::SavedWorld, ~/.coreray/saved_worlds.json)
+    struct MapStart { bool set = false; int road = -1, idx = 0; bool fwd = true; float x = 0, z = 0, hx = 0, hz = 1; };
+    MapStart rideMapStart_;
+    double wxTempC_ = 10, wxWindKmh_ = 0, wxSeasonC_ = 10, wxEleForTemp_ = 0, wxSunEle_ = 30;   // the weather card's readings
+    void drawWeatherCard(Rectangle r);
+    float weatherCardH() const;                    // where the current ride on a generated map began
+    std::vector<store::SavedWorld> savedWorlds_;
+    bool savedWorldsLoaded_ = false;
+    std::optional<store::SavedWorld> pendingStart_;   // apply this start once its map is ready
+    std::vector<store::SavedWorld>& savedWorlds();
+    store::SavedWorld* savedWorldFor(uint32_t seed, int km, int climate);
+    bool saveWorld(const wmap::Map& M, const MapStart& st);   // add (or update the start of) this world
+    MapStart pickedStart(const wmap::Map& M) const;           // the Ride page's pin as a MapStart
+    void selectSavedWorld(const store::SavedWorld& w);
+    bool resolveStart(const wmap::Map& M, const store::SavedWorld& w);   // -> spawn_
+    void drawSavedWorlds(float x, float& y, float w, float bottom);
+    void drawSaveWorldButton(Rectangle r);
+    std::string spawnLabel(const MapPreview::Spawn& s, std::string* detail = nullptr) const;
+    void roamAppend(int road, int fromNode);
+    void roamUpdate();
+    void drawRoamChoices();
+    int roamDefault(const std::vector<RoamChoice>& o) const;
+    std::vector<RoamChoice> roamOptions(int node, int fromRoad, float inHeading) const;
+    // ---- explore mode (ExploreUi.cpp): fly over a generated map without riding it
+    void startExplore();
+    void exploreFrame(float dt);
+    void drawExplore();
+    void exploreLoad();                        // the map is ready: lay a road, place the camera
+    Vector3 exPos_{0, 300, 0};
+    float exYaw_ = 0, exPitch_ = -0.3f, exSpeed_ = 80.f;
+    bool exGround_ = false, exMini_ = true, exPending_ = false;
+    float exViewScale_ = 3.f;   // explore draws three times as far
+    Rectangle exPanelRect() const;
+    void exStepWeather(int dir);
+    void exStepHour(double dh);
+    void drawExplorePanel();
+    double exDist_ = 0;
+    Texture2D exMiniTex_{};
+    const wmap::Map* exMiniFor_ = nullptr;
     std::string selWorkout_ = "builtin-sweet-spot-2x20";
     bool workoutResistance_ = false;
     wk::TestKind selTest_ = wk::TestKind::Ramp;
@@ -209,6 +280,7 @@ private:
     std::string insertErr_;
     SectorSpec sector_;
     CamMode cam_ = CamMode::Chase;
+    double wheelAngle_ = 0, wheelDist_ = -1;  // rider wheel spin (rad) and the distance it was last advanced at
     double crank_ = 0, animTime_ = 0, lean_ = 0, stand_ = 0, tuck_ = 0, standTimer_ = 0;
     double lastAlertT_ = -1e9;
     int lastHrState_ = 0;

@@ -62,4 +62,10 @@ double gearTargetPower(double cad, int gi, double circ, double grade, double ele
     return std::clamp(powerForSpeed(v, grade, ele, p), 0.0, 2000.0);
 }
 
+double gearSimGrade(double grade, double k, double v, const Params& p) {
+    k = std::clamp(k, 0.2, 4.0);
+    double mg = p.massKg * G, cw = p.cw();
+    return k * (grade + p.crr) - p.crr + cw * v * v * (k * k * k - 1.0) / mg;
+}
+
 }  // namespace phys

@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <random>
 #include <thread>
 
@@ -83,9 +84,17 @@ Response send(const Request& r) {
     fs::path cfg = fs::temp_directory_path() / ("coreray-curl-" + dates::newId() + ".cfg");
     {
         std::ofstream f(cfg);
+        // curl config quoted strings: escape \\ and \" and encode control characters, or a
+        // newline (e.g. in the Strava description) ends the line and corrupts the request
         auto q = [](const std::string& s) {
             std::string o = "\"";
-            for (char c : s) { if (c == '"' || c == '\\') o += '\\'; o += c; }
+            for (char c : s) {
+                if (c == '"' || c == '\\') { o += '\\'; o += c; }
+                else if (c == '\n') o += "\\n";
+                else if (c == '\r') o += "\\r";
+                else if (c == '\t') o += "\\t";
+                else o += c;
+            }
             return o + "\"";
         };
         f << "url = " << q(r.url) << "\n";
@@ -103,7 +112,10 @@ Response send(const Request& r) {
         f << "silent\nshow-error\n";
         f << "user-agent = \"CoreRay/0.2\"\n";
     }
-    std::string cmd = "curl -K " + shq(cfg.string()) + " -w '\\n%{http_code}' 2>&1";
+    // stderr goes to its own file: mixing curl's warnings into the body breaks JSON parsing
+    fs::path errf = cfg;
+    errf.replace_extension(".err");
+    std::string cmd = "curl -K " + shq(cfg.string()) + " -w '\\n%{http_code}' 2>" + shq(errf.string());
     FILE* p = popen(cmd.c_str(), "r");
     if (!p) { resp.error = "Could not run curl"; fs::remove(cfg); return resp; }
     std::array<char, 8192> buf;
@@ -113,12 +125,19 @@ Response send(const Request& r) {
     int rc = pclose(p);
     std::error_code ec;
     fs::remove(cfg, ec);
+    std::string errText;
+    {
+        std::ifstream ef(errf);
+        errText.assign(std::istreambuf_iterator<char>(ef), std::istreambuf_iterator<char>());
+        while (!errText.empty() && std::isspace((unsigned char)errText.back())) errText.pop_back();
+    }
+    fs::remove(errf, ec);
     size_t nl = out.find_last_of('\n');
     if (nl != std::string::npos) {
         resp.status = std::atoi(out.c_str() + nl + 1);
         resp.body = out.substr(0, nl);
     } else resp.body = out;
-    if (resp.status == 0) resp.error = rc != 0 ? "Network error: " + resp.body : "No response";
+    if (resp.status == 0) resp.error = rc != 0 ? "Network error: " + (errText.empty() ? resp.body : errText) : "No response";
     return resp;
 #endif
 }
@@ -308,10 +327,11 @@ bool connect(Db& db, std::string& err) {
     return true;
 }
 
-static std::optional<std::string> freshToken(Db& db, std::string& err) {
+static std::optional<std::string> freshToken(Db& db, std::string& err, bool force = false) {
     auto t = tokens(db);
     if (!t) { err = "Not connected to Strava"; return std::nullopt; }
-    if (t->expiresAt - (long long)std::time(nullptr) > 120) return t->access;
+    if (!force && t->expiresAt - (long long)std::time(nullptr) > 120) return t->access;
+    if (t->refresh.empty()) { err = "Strava session expired - reconnect in Profile"; return std::nullopt; }
     auto id = db.meta("strava_client_id"), secret = db.meta("strava_client_secret");
     if (!id || !secret) { err = "Strava app credentials missing"; return std::nullopt; }
     net::Request r;
@@ -322,16 +342,21 @@ static std::optional<std::string> freshToken(Db& db, std::string& err) {
     if (!tokenFromResponse(net::send(r), n, err, false)) { err = "Strava token refresh failed - reconnect in Profile"; return std::nullopt; }
     n.athleteId = t->athleteId;
     n.athleteName = t->athleteName;
+    if (n.refresh.empty()) n.refresh = t->refresh;  // Strava may omit an unchanged refresh token
     saveTokens(db, n);
     return n.access;
 }
 
 void disconnect(Db& db) {
-    if (auto t = tokens(db)) {
+    // Strava revokes the app's access (all tokens) via POST /oauth/deauthorize
+    // (there is no /oauth/revoke endpoint). The access token must be current.
+    std::string err;
+    if (auto tok = freshToken(db, err)) {
         net::Request r;
         r.method = "POST";
-        r.url = std::string(OAUTH_BASE) + "/revoke";
-        r.form = {{"token", t->access}};
+        r.url = std::string(OAUTH_BASE) + "/deauthorize";
+        r.form = {{"access_token", *tok}};
+        r.timeoutS = 15;
         net::send(r);
     }
     db.setMeta("strava_tokens", "");
@@ -347,70 +372,123 @@ std::optional<unsigned long long> duplicateId(const std::string& e) {
     return std::stoull(digits);
 }
 
+// Polls an upload until Strava has made (or refused) the activity. Returns the activity id;
+// sets `err` and returns nullopt on a definite failure; `stillProcessing` on timeout.
+static std::optional<unsigned long long> pollUpload(const std::string& base, const std::string& token, unsigned long long uploadId,
+                                                    json::Value st, std::string& err, bool& stillProcessing) {
+    stillProcessing = false;
+    for (int i = 0; i < 90; ++i) {
+        if (auto a = st.num("activity_id"); a && *a > 0) return (unsigned long long)*a;
+        std::string e = st.type == json::Value::Object ? st.strOr("error") : "";
+        if (!e.empty()) {
+            if (auto dup = duplicateId(e)) return dup;  // "... duplicate of <a href='/activities/123'>"
+            err = "Strava couldn't process the file: " + e;
+            return std::nullopt;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(i < 10 ? 1500 : 3000));
+        net::Request g;
+        g.url = base + "/uploads/" + std::to_string(uploadId);  // keep the id: error bodies don't carry it
+        g.headers = {{"Authorization", "Bearer " + token}};
+        auto gr = net::send(g);
+        if (gr.status == 404) { err = "Strava lost the upload - try again"; return std::nullopt; }
+        json::Value nv;
+        if (gr.ok() && json::parse(gr.body, nv) && nv.type == json::Value::Object) st = nv;
+        // 429 / 5xx / network hiccup: keep waiting with the last known state
+    }
+    stillProcessing = true;
+    return std::nullopt;
+}
+
 std::optional<unsigned long long> upload(Db& db, const RideRecord& rec, std::string& err, const std::function<void(const std::string&)>& progress) {
     if (rec.summary.stravaActivityId) return rec.summary.stravaActivityId;
     auto token = freshToken(db, err);
     if (!token) return std::nullopt;
-    if (progress) progress("uploading");
     const RideSummary& s = rec.summary;
-    auto start = dates::parseRfc3339(s.startedAt).value_or(std::time(nullptr));
-    auto fit = exporter::toFit(s, rec.samples, start, dates::utcOffsetSeconds(start));
-    fs::path tmp = fs::temp_directory_path() / ("coreray-" + s.id + ".fit");
-    {
-        std::ofstream f(tmp, std::ios::binary);
-        f.write(reinterpret_cast<const char*>(fit.data()), std::streamsize(fit.size()));
-    }
-    char desc[300];
-    std::snprintf(desc, sizeof desc, "%s \xC2\xB7 %.0f W avg / %.0f W NP \xC2\xB7 %.0f kJ \xC2\xB7 TSS %.0f", rideKindName(s.kind), s.avgPower, s.np, s.workKj, s.tss);
-    std::string d = desc;
-    if (s.testResult) { char b[64]; std::snprintf(b, sizeof b, " \xC2\xB7 FTP estimate %.0f W", s.testResult->ftp); d += b; }
-    if (!s.notes.empty()) d = s.notes + "\n\n" + d;
-    d += "\nRecorded with CoreRay";
     std::string base = apiBase(db);
-    net::Request r;
-    r.method = "POST";
-    r.url = base + "/uploads";
-    r.headers = {{"Authorization", "Bearer " + *token}};
-    r.multipart = {{"data_type", "fit"}, {"name", s.name}, {"description", d}, {"trainer", "1"}, {"external_id", "coreray-" + s.id + ".fit"}};
-    r.multipartFileField = "file";
-    r.multipartFilePath = tmp.string();
-    r.multipartFileName = "coreray-" + s.id + ".fit";
-    auto resp = net::send(r);
-    std::error_code ec;
-    fs::remove(tmp, ec);
-    if (!resp.ok()) {
-        if (resp.status == 429) err = "Strava rate limit reached - try again in 15 minutes";
-        else if (resp.status == 401 || resp.status == 403) err = "Strava refused the upload (" + std::to_string(resp.status) + "). Your API app may need a Strava subscription, or reconnect.";
-        else err = "Strava upload failed (" + std::to_string(resp.status) + "): " + resp.body + resp.error;
-        return std::nullopt;
-    }
-    json::Value st;
-    if (!json::parse(resp.body, st)) { err = "Unexpected Strava response: " + resp.body; return std::nullopt; }
-    if (progress) progress("processing");
+    const std::string pendingKey = "strava_upload_" + s.id;
+    bool still = false;
     std::optional<unsigned long long> activity;
-    for (int i = 0; i < 90 && !activity; ++i) {
-        if (auto a = st.num("activity_id")) { activity = (unsigned long long)*a; break; }
-        std::string e = st.strOr("error");
-        if (!e.empty()) {
-            if (auto dup = duplicateId(e)) { activity = dup; break; }
-            err = "Strava couldn't process the file: " + e;
+
+    // An earlier attempt that timed out while Strava was processing: resume polling
+    // that upload instead of sending the file again.
+    if (auto pend = db.meta(pendingKey); pend && !pend->empty()) {
+        unsigned long long uid = std::strtoull(pend->c_str(), nullptr, 10);
+        if (uid) {
+            if (progress) progress("processing");
+            json::Value none = json::Value::object();
+            std::string perr;
+            activity = pollUpload(base, *token, uid, none, perr, still);
+            if (!activity && still) { err = "Strava is still processing - check your Strava feed shortly"; return std::nullopt; }
+            if (!activity) db.setMeta(pendingKey, "");  // that upload failed: fall through and upload afresh
+        }
+    }
+
+    if (!activity) {
+        if (progress) progress("uploading");
+        auto start = dates::parseRfc3339(s.startedAt).value_or(std::time(nullptr));
+        auto fit = exporter::toFit(s, rec.samples, start, dates::utcOffsetSeconds(start));
+        std::string verr;
+        if (!exporter::validateFit(fit, verr)) { err = "Couldn't build the FIT file: " + verr; return std::nullopt; }
+        fs::path tmp = fs::temp_directory_path() / ("coreray-" + s.id + ".fit");
+        {
+            std::ofstream f(tmp, std::ios::binary);
+            f.write(reinterpret_cast<const char*>(fit.data()), std::streamsize(fit.size()));
+            if (!f) { err = "Couldn't write a temporary FIT file"; return std::nullopt; }
+        }
+        char desc[300];
+        std::snprintf(desc, sizeof desc, "%s \xC2\xB7 %.0f W avg / %.0f W NP \xC2\xB7 %.0f kJ \xC2\xB7 TSS %.0f", rideKindName(s.kind), s.avgPower, s.np, s.workKj, s.tss);
+        std::string d = desc;
+        if (s.testResult) { char b[64]; std::snprintf(b, sizeof b, " \xC2\xB7 FTP estimate %.0f W", s.testResult->ftp); d += b; }
+        if (!s.notes.empty()) d = s.notes + "\n\n" + d;
+        d += "\nRecorded with CoreRay";
+        auto post = [&](const std::string& tok) {
+            net::Request r;
+            r.method = "POST";
+            r.url = base + "/uploads";
+            r.headers = {{"Authorization", "Bearer " + tok}};
+            r.multipart = {{"data_type", "fit"}, {"description", d}, {"trainer", "1"}, {"external_id", "coreray-" + s.id + ".fit"}};
+            if (!s.name.empty()) r.multipart.push_back({"name", s.name});  // empty -> Strava's own default name
+            r.multipartFileField = "file";
+            r.multipartFilePath = tmp.string();
+            r.multipartFileName = "coreray-" + s.id + ".fit";
+            r.timeoutS = 120;
+            return net::send(r);
+        };
+        auto resp = post(*token);
+        if (resp.status == 401) {  // token revoked/expired early: refresh once and retry
+            std::string rerr;
+            if (auto t2 = freshToken(db, rerr, true)) { token = t2; resp = post(*token); }
+        }
+        std::error_code ec;
+        fs::remove(tmp, ec);
+        if (!resp.ok()) {
+            if (resp.status == 429) err = "Strava rate limit reached - try again in 15 minutes";
+            else if (resp.status == 401 || resp.status == 403) err = "Strava refused the upload (" + std::to_string(resp.status) + "). Reconnect Strava in Profile (the \xE2\x80\x9CUpload your activities\xE2\x80\x9D permission is needed).";
+            else err = "Strava upload failed (" + std::to_string(resp.status) + "): " + resp.body + resp.error;
             return std::nullopt;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-        net::Request g;
-        g.url = base + "/uploads/" + std::to_string((unsigned long long)st.numOr("id", 0));
-        g.headers = {{"Authorization", "Bearer " + *token}};
-        auto gr = net::send(g);
-        if (!json::parse(gr.body, st)) break;
+        json::Value st;
+        if (!json::parse(resp.body, st) || st.type != json::Value::Object) { err = "Unexpected Strava response: " + resp.body; return std::nullopt; }
+        unsigned long long uid = (unsigned long long)st.numOr("id", 0);
+        if (uid) db.setMeta(pendingKey, std::to_string(uid));
+        if (progress) progress("processing");
+        activity = pollUpload(base, *token, uid, st, err, still);
+        if (!activity) {
+            if (still) err = "Strava is still processing - check your Strava feed shortly (CoreRay will pick it up next time)";
+            else db.setMeta(pendingKey, "");
+            return std::nullopt;
+        }
     }
-    if (!activity) { err = "Strava is still processing - check your Strava feed shortly"; return std::nullopt; }
-    // make sure it's filed as a Virtual Ride on the trainer
+    db.setMeta(pendingKey, "");
+    // make sure it's filed as a Virtual Ride on the trainer (the FIT sub_sport already says so)
     net::Request put;
     put.method = "PUT";
     put.url = base + "/activities/" + std::to_string(*activity);
     put.headers = {{"Authorization", "Bearer " + *token}};
     put.jsonBody = R"({"sport_type":"VirtualRide","trainer":true})";
-    net::send(put);
+    put.timeoutS = 20;
+    auto pr = net::send(put);
+    if (!pr.ok() && pr.status != 404) std::fprintf(stderr, "[strava] could not set VirtualRide on %llu (%d)\n", *activity, pr.status);
     return activity;
 }
 

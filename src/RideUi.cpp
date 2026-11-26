@@ -5,6 +5,7 @@
 
 #include "App.h"
 #include "Audio.h"
+#include "Profiler.h"
 #include "Renderer.h"
 #include "Store.h"
 #include "raylib.h"
@@ -85,13 +86,12 @@ void App::drawStepPanel(Rectangle br) {
 
 // ------------------------------------------------------------------ 3D HUD (CoreKick's "Valley" HUD: light, glassy, quiet)
 namespace {
-const Color HUD_INK{31, 36, 48, 255}, HUD_MUTED{91, 100, 117, 255};
 void glass(Rectangle r, float alpha = 1.f) {
     float rr = std::min(1.f, 36.f / std::max(1.f, std::min(r.width, r.height)));
     DrawRectangleRounded({r.x, r.y + 6, r.width, r.height + 2}, rr, 10, Color{31, 36, 48, (unsigned char)(14 * alpha)});
     DrawRectangleRounded({r.x - 2, r.y + 2, r.width + 4, r.height + 6}, rr, 10, Color{31, 36, 48, (unsigned char)(7 * alpha)});
-    DrawRectangleRounded(r, rr, 10, Color{255, 255, 255, (unsigned char)(190 * alpha)});
-    DrawRectangleRoundedLinesEx(r, rr, 10, 1.f, Color{255, 255, 255, (unsigned char)(200 * alpha)});
+    DrawRectangleRounded(r, rr, 10, withAlpha(HUD_GLASS, (unsigned char)((hudIsDark() ? 178 : 190) * alpha)));
+    DrawRectangleRoundedLinesEx(r, rr, 10, 1.f, hudIsDark() ? Color{255, 255, 255, (unsigned char)(26 * alpha)} : Color{255, 255, 255, (unsigned char)(200 * alpha)});
 }
 // a value with a small unit after it, baseline-aligned; returns the width used
 float valUnit(const std::string& v, const char* unit, float x, float y, float size, Color c = HUD_INK) {
@@ -112,14 +112,77 @@ bool hudButton(Rectangle r, const std::string& label, int kind = 0) {  // 0 plai
     bool h = hovered(r);
     float rr = std::min(1.f, 24.f / r.height);
     DrawRectangleRounded({r.x, r.y + 3, r.width, r.height}, rr, 8, Color{31, 36, 48, 12});
-    Color bg = kind == 1 ? HUD_INK : Color{255, 255, 255, (unsigned char)(h ? 225 : 175)};
+    Color bg = kind == 1 ? HUD_INK : withAlpha(HUD_GLASS, (unsigned char)(h ? 225 : 175));
     DrawRectangleRounded(r, rr, 8, bg);
-    DrawRectangleRoundedLinesEx(r, rr, 8, 1.f, kind == 1 ? HUD_INK : Color{255, 255, 255, 200});
-    textCentered(label, r, F::Small, kind == 1 ? WHITE : kind == 2 ? Color{220, 61, 67, 255} : HUD_INK, 12);
+    DrawRectangleRoundedLinesEx(r, rr, 8, 1.f, kind == 1 ? HUD_INK : hudIsDark() ? Color{255, 255, 255, 30} : Color{255, 255, 255, 200});
+    textCentered(label, r, F::Small, kind == 1 ? HUD_INV : kind == 2 ? hudPick(Color{220, 61, 67, 255}, Color{255, 110, 110, 255}) : HUD_INK, 12);
     if (h) SetMouseCursor(MOUSE_CURSOR_POINTING_HAND);
     return h && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
 }
 float hudButtonW(const std::string& label) { return measure(label, F::Small, 12).x + 26; }
+
+// a small weather glyph drawn from shapes (sun / moon, cloud, rain, snow, bolt, fog, wind), size s px
+void weatherIcon(weather::Kind k, Vector2 c, float s, bool night) {
+    using weather::Kind;
+    const Color sun{255, 190, 50, 255}, moon{214, 220, 236, 255}, lightCloud{206, 212, 222, 255}, darkCloud{128, 137, 152, 255};
+    const Color rain{66, 140, 222, 255}, snow{150, 170, 200, 255}, bolt{255, 196, 40, 255};
+    auto orb = [&](Vector2 p, float r) {
+        if (night) { DrawCircleV(p, r, moon); DrawCircleV({p.x + r * 0.45f, p.y - r * 0.3f}, r * 0.8f, Color{255, 255, 255, 200}); return; }
+        for (int i = 0; i < 8; ++i) {
+            float a = i * PI / 4;
+            DrawLineEx({p.x + std::cos(a) * r * 1.3f, p.y + std::sin(a) * r * 1.3f}, {p.x + std::cos(a) * r * 1.65f, p.y + std::sin(a) * r * 1.65f}, std::max(1.5f, s * 0.05f), sun);
+        }
+        DrawCircleV(p, r, sun);
+    };
+    auto cloud = [&](Vector2 p, float w, Color col) {
+        DrawCircleV({p.x - w * 0.28f, p.y + w * 0.05f}, w * 0.22f, col);
+        DrawCircleV({p.x + w * 0.02f, p.y - w * 0.1f}, w * 0.3f, col);
+        DrawCircleV({p.x + w * 0.3f, p.y + w * 0.06f}, w * 0.2f, col);
+        DrawRectangleRounded({p.x - w * 0.5f, p.y + w * 0.02f, w, w * 0.25f}, 1, 8, col);
+    };
+    auto drops = [&](Vector2 p, int n, bool dots, Color col) {
+        for (int i = 0; i < n; ++i) {
+            float x = p.x - s * 0.22f + i * s * 0.22f;
+            if (dots) DrawCircleV({x, p.y + s * 0.08f}, s * 0.05f, col);
+            else DrawLineEx({x + s * 0.04f, p.y}, {x - s * 0.04f, p.y + s * 0.16f}, std::max(1.5f, s * 0.06f), col);
+        }
+    };
+    auto lines = [&](Vector2 p, int n, Color col) {
+        for (int i = 0; i < n; ++i) DrawLineEx({p.x - s * 0.36f + (i % 2) * s * 0.08f, p.y + i * s * 0.14f}, {p.x + s * 0.3f + (i % 2) * s * 0.08f, p.y + i * s * 0.14f}, std::max(1.5f, s * 0.06f), col);
+    };
+    const Vector2 cc{c.x + s * 0.02f, c.y + s * 0.0f}, below{c.x, c.y + s * 0.22f};
+    switch (k) {
+        case Kind::Clear: orb(c, s * 0.26f); break;
+        case Kind::Fair: orb({c.x - s * 0.14f, c.y - s * 0.12f}, s * 0.2f); cloud({c.x + s * 0.08f, c.y + s * 0.08f}, s * 0.62f, lightCloud); break;
+        case Kind::Windy: orb({c.x - s * 0.18f, c.y - s * 0.2f}, s * 0.15f); lines({c.x + s * 0.04f, c.y + s * 0.02f}, 3, darkCloud); break;
+        case Kind::Cloudy: orb({c.x - s * 0.18f, c.y - s * 0.16f}, s * 0.17f); cloud(cc, s * 0.8f, lightCloud); break;
+        case Kind::Overcast: cloud({c.x - s * 0.1f, c.y - s * 0.1f}, s * 0.6f, darkCloud); cloud({c.x + s * 0.06f, c.y + s * 0.04f}, s * 0.75f, lightCloud); break;
+        case Kind::Mist: case Kind::Fog: if (k == Kind::Fog) cloud({c.x, c.y - s * 0.12f}, s * 0.7f, lightCloud); lines({c.x, c.y + (k == Kind::Fog ? s * 0.12f : -s * 0.12f)}, 3, darkCloud); break;
+        case Kind::Drizzle: cloud({c.x, c.y - s * 0.1f}, s * 0.8f, lightCloud); drops(below, 3, true, rain); break;
+        case Kind::Sunshower: orb({c.x - s * 0.18f, c.y - s * 0.2f}, s * 0.16f); cloud({c.x + s * 0.06f, c.y - s * 0.04f}, s * 0.7f, lightCloud); drops({below.x + s * 0.06f, below.y + s * 0.04f}, 2, false, rain); break;
+        case Kind::Rain: cloud({c.x, c.y - s * 0.1f}, s * 0.82f, darkCloud); drops(below, 3, false, rain); break;
+        case Kind::Storm:
+            cloud({c.x, c.y - s * 0.12f}, s * 0.82f, darkCloud);
+            DrawTriangle({c.x + s * 0.02f, c.y + s * 0.08f}, {c.x - s * 0.12f, c.y + s * 0.26f}, {c.x - s * 0.01f, c.y + s * 0.24f}, bolt);
+            DrawTriangle({c.x - s * 0.01f, c.y + s * 0.2f}, {c.x - s * 0.06f, c.y + s * 0.42f}, {c.x + s * 0.1f, c.y + s * 0.2f}, bolt);
+            break;
+        case Kind::Hail: cloud({c.x, c.y - s * 0.1f}, s * 0.82f, darkCloud); for (int i = 0; i < 3; ++i) { DrawCircleV({c.x - s * 0.2f + i * s * 0.2f, below.y + s * 0.08f}, s * 0.07f, WHITE); DrawCircleLines(int(c.x - s * 0.2f + i * s * 0.2f), int(below.y + s * 0.08f), s * 0.07f, snow); } break;
+        case Kind::Sleet: cloud({c.x, c.y - s * 0.1f}, s * 0.8f, darkCloud); drops(below, 2, false, rain); DrawCircleV({c.x + s * 0.24f, below.y + s * 0.1f}, s * 0.05f, snow); break;
+        case Kind::Snow: case Kind::Blizzard:
+            cloud({c.x, c.y - s * 0.1f}, s * 0.8f, lightCloud);
+            for (int i = 0; i < 3; ++i) {
+                Vector2 f{c.x - s * 0.22f + i * s * 0.22f, below.y + s * 0.1f};
+                for (int q = 0; q < 3; ++q) { float a = q * PI / 3; DrawLineEx({f.x - std::cos(a) * s * 0.07f, f.y - std::sin(a) * s * 0.07f}, {f.x + std::cos(a) * s * 0.07f, f.y + std::sin(a) * s * 0.07f}, 1.5f, snow); }
+            }
+            if (k == Kind::Blizzard) lines({c.x, c.y + s * 0.38f}, 1, darkCloud);
+            break;
+        default: cloud(cc, s * 0.8f, lightCloud);
+    }
+}
+const char* compass8(double rad) {
+    static const char* n[8] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
+    return n[int(std::lround(rad / (PI / 4))) & 7];
+}
 }  // namespace
 
 void App::updateFlow(float dt) {
@@ -140,11 +203,12 @@ void App::updateFlow(float dt) {
 
 void App::drawRideHud() {
     const RideEngine& e = *eng_;
-    const float W = float(GetScreenWidth()), H = float(GetScreenHeight());
+    const float W = ui::screenW(), H = ui::screenH();
     const float pad = 22;
     const bool metric = prof_.metric;
 
     // ---- top-left: effort
+    float effortRight = pad, effortBottom = pad;
     {
         double p3 = e.power3s();
         std::string pw = std::to_string(int(std::lround(p3)));
@@ -167,6 +231,8 @@ void App::drawRideHud() {
         if (e.goal().type != Goal::None) step += (step.empty() ? "" : "   ") + std::string("Goal: ") + (e.goalDone() ? "done!" : e.goalRemaining());
         float cw = std::max({220.f, pwW + 60 + (tgt.empty() ? 0 : measure(tgt, F::Small, 15).x + 30), rw + 32, measure(step, F::Small, 12).x + 32});
         Rectangle r{pad, pad, cw, step.empty() ? 104.f : 126.f};
+        effortRight = r.x + r.width;
+        effortBottom = r.y + r.height;
         glass(r);
         text(pw, r.x + 16, r.y + 10, F::Big, HUD_INK, 54);
         text("W", r.x + 16 + pwW + 6, r.y + 36, F::Small, HUD_MUTED, 16);
@@ -175,53 +241,93 @@ void App::drawRideHud() {
             bool on = std::fabs(p3 - t) / std::max(1.0, t) < 0.08;
             Vector2 m = measure(tgt, F::Small, 14);
             Rectangle pill{r.x + 16 + pwW + 32, r.y + 32, m.x + 16, 24};
-            DrawRectangleRounded(pill, 1, 8, on ? Color{255, 190, 90, 90} : Color{31, 36, 48, 20});
-            textCentered(tgt, pill, F::Small, on ? Color{138, 75, 0, 255} : HUD_MUTED, 14);
+            DrawRectangleRounded(pill, 1, 8, on ? Color{255, 190, 90, 90} : hudInk(20));
+            textCentered(tgt, pill, F::Small, on ? hudPick(Color{138, 75, 0, 255}, Color{255, 200, 120, 255}) : HUD_MUTED, 14);
         }
         float x = r.x + 16, y = r.y + 72;
         if (e.heartRate()) DrawCircle(int(x + 4), int(y + 10), 4, hrZoneColor(e.hrZone(), int(prof_.hrZones().size())));
-        else DrawCircle(int(x + 4), int(y + 10), 4, Color{31, 36, 48, 40});
+        else DrawCircle(int(x + 4), int(y + 10), 4, hudInk(40));
         x += 13;
         for (auto& [v, u] : row) x += valUnit(v, u, x, y, 17) + 16;
         if (!step.empty()) text(step, r.x + 16, r.y + 100, F::Small, HUD_MUTED, 12);
     }
 
-    // ---- top-right: ride
-    float rideBottom;
+    // ---- virtual gear (under the effort card): gear number, a tick per gear, shift buttons
+    if (e.virtualShifting()) {
+        const bool live = e.shiftingActive();
+        Rectangle r{pad, effortBottom + 12, 236, 74};
+        glass(r);
+        text("GEAR", r.x + 16, r.y + 10, F::Small, HUD_MUTED, 10);
+        std::string g = std::to_string(e.gear());
+        text(g, r.x + 16, r.y + 22, F::Big, live ? HUD_INK : HUD_MUTED, 34);
+        float gw = measure(g, F::Big, 34).x;
+        text("/ 24", r.x + 20 + gw, r.y + 38, F::Small, HUD_MUTED, 12);
+        // 24 ticks, rising like a cassette seen side-on; the current gear lit
+        float tx = r.x + 80, ty = r.y + 58;
+        for (int i = 0; i < phys::GEAR_COUNT; ++i) {
+            float hgt = 6 + 16.f * i / (phys::GEAR_COUNT - 1);
+            Color c = i == e.gear() - 1 ? ui::ACCENT : i < e.gear() - 1 ? hudInk(90) : hudInk(35);
+            DrawRectangleRounded({tx + i * 3.4f, ty - hgt, 2.2f, hgt}, 1, 4, c);
+        }
+        Link sl = ble_.shifter();
+        std::string sub = !live ? "gears rest in ERG" : sl.state == LinkState::Connected ? sl.name : "[ ] or Zwift shifter";
+        text(sub, r.x + 80, r.y + 12, F::Small, HUD_MUTED, 11);
+        if (sl.state == LinkState::Connected) DrawCircle(int(r.x + 76 + measure(sub, F::Small, 11).x + 10), int(r.y + 18), 3, ui::ACCENT);
+        if (hudButton({r.x + r.width - 72, r.y + 32, 28, 28}, "-")) eng_->shift(-1);
+        if (hudButton({r.x + r.width - 40, r.y + 32, 28, 28}, "+")) eng_->shift(1);
+    }
+
+    // ---- top-right: the ride. Live speed and grade beside the time, then the ride's totals
+    // grouped in one row (distance, climbed, average power, average W/kg), then where you are.
+    float rideBottom, rideLeft;
     {
         std::string tm = fmtTime(e.elapsedS());
         double g = e.gradePct();
-        std::vector<std::pair<std::string, const char*>> row = {{fmt("%.1f", e.distance() / (metric ? 1000.0 : 1609.344)), metric ? "km" : "mi"},
-                                                                  {fmt("%.1f", e.speedMps() * (metric ? 3.6 : 2.23694)), metric ? "km/h" : "mph"},
-                                                                  {fmt("%.1f", g), "%"}};
-        std::string sub;
-        if (endlessRide_) {
-            double ele = e.ele();
-            sub = fmt(metric ? "Elevation %.0f m" : "Elevation %.0f ft", metric ? ele : ele * 3.28084);
-            sub += fmt(metric ? "  \xC2\xB7  %.0f m climbed" : "  \xC2\xB7  %.0f ft climbed", metric ? e.gain() : e.gain() * 3.28084);
-        } else if (!e.endless()) {
-            sub = fmtDist(std::max(0.0, e.profileData().length * e.laps() - e.distance()), metric) + " to go";
+        Color gc = gradeColor(g / 100);
+        Color gradeInk{(unsigned char)(gc.r * 0.8f), (unsigned char)(gc.g * 0.75f), (unsigned char)(gc.b * 0.8f), 255};
+        std::vector<std::pair<std::string, const char*>> live = {{fmt("%.1f", e.speedMps() * (metric ? 3.6 : 2.23694)), metric ? "km/h" : "mph"}, {fmt("%.1f", g), "%"}};
+        struct Cell { const char* label; std::string v; const char* unit; };
+        double avgP = e.avgPower();
+        std::vector<Cell> tot = {{"DISTANCE", fmt("%.1f", e.distance() / (metric ? 1000.0 : 1609.344)), metric ? "km" : "mi"},
+                                 {"CLIMBED", fmt("%.0f", metric ? e.gain() : e.gain() * 3.28084), metric ? "m" : "ft"},
+                                 {"AVG POWER", fmt("%.0f", avgP), "W"},
+                                 {"AVG W/KG", fmt("%.1f", avgP / std::max(30.0, prof_.weightKg)), ""},
+                                 {"CALORIES", fmt("%.0f", e.calories()), "kcal"}};   // work / gross efficiency (Profile)
+        std::string sub = fmt(metric ? "Elevation %.0f m" : "Elevation %.0f ft", metric ? e.ele() : e.ele() * 3.28084);
+        if (!endlessRide_ && !e.endless()) {
+            sub += "  \xC2\xB7  " + fmtDist(std::max(0.0, e.profileData().length * e.laps() - e.distance()), metric) + " to go";
             if (auto gap = e.ghostGapS()) sub += std::string("  \xC2\xB7  ghost ") + (*gap >= 0 ? "-" : "+") + fmtTime(std::fabs(*gap));
         }
-        std::string wl = weather::kindLabel(wx_.currentKind(wxElapsed_));
-        if (wx_.wet > 0.4 && wx_.snowCover < 0.3) wl += "  \xC2\xB7  wet road";
-        if (e.paused()) wl = "Paused  \xC2\xB7  " + wl;
-        float rw = rowWidth(row, 17);
-        float cw = std::max({210.f, rw + 32, measure(sub, F::Small, 12).x + 32, measure(wl, F::Small, 12).x + 52});
-        float ch = 102 + (sub.empty() ? 0 : 20);
-        Rectangle r{W - pad - cw, pad, cw, ch};
+        if (e.paused()) sub = "Paused  \xC2\xB7  " + sub;
+        // column widths: each total gets the room its label or value needs
+        std::vector<float> colW;
+        float totW = 0;
+        for (auto& c : tot) {
+            float vw = measure(c.v, F::Title, 18).x + (*c.unit ? 3 + measure(c.unit, F::Small, 11).x : 0);
+            colW.push_back(std::max(vw, measure(c.label, F::Small, 10).x) + 4);
+            totW += colW.back();
+        }
+        const float gapX = 18;
+        totW += gapX * (tot.size() - 1);
+        float topW = measure(tm, F::Big, 34).x + 24 + rowWidth(live, 18);
+        float cw = std::max({totW, topW, measure(sub, F::Small, 12).x}) + 32;
+        Rectangle r{W - pad - cw, pad, cw, 128};
         glass(r);
-        textRight(tm, r.x + r.width - 16, r.y + 10, F::Big, HUD_INK, 34);
-        float x = r.x + r.width - 16 - rw, y = r.y + 54;
-        Color gc = gradeColor(g / 100);
-        for (size_t i = 0; i < row.size(); ++i) x += valUnit(row[i].first, row[i].second, x, y, 17, i == 2 ? Color{(unsigned char)(gc.r * 0.8f), (unsigned char)(gc.g * 0.75f), (unsigned char)(gc.b * 0.8f), 255} : HUD_INK) + 16;
-        float sy = r.y + 80;
-        if (!sub.empty()) { textRight(sub, r.x + r.width - 16, sy, F::Small, HUD_MUTED, 12); sy += 20; }
-        bool sunny = sky_.tod < 0.8f && wx_.state.cloud < 0.5;
-        Vector2 m = measure(wl, F::Small, 12);
-        textRight(wl, r.x + r.width - 16, sy, F::Small, HUD_MUTED, 12);
-        DrawCircle(int(r.x + r.width - 16 - m.x - 11), int(sy + 7), 5, sunny ? Color{255, 196, 60, 255} : Color{160, 170, 186, 255});
+        // time (left) and live speed / grade (right)
+        text(tm, r.x + 16, r.y + 8, F::Big, HUD_INK, 34);
+        float x = r.x + r.width - 16 - rowWidth(live, 18);
+        for (size_t i = 0; i < live.size(); ++i) x += valUnit(live[i].first, live[i].second, x, r.y + 16, 18, i == 1 ? gradeInk : HUD_INK) + 16;
+        DrawLineEx({r.x + 16, r.y + 54}, {r.x + r.width - 16, r.y + 54}, 1, hudInk(22));
+        // the ride's totals
+        x = r.x + 16;
+        for (size_t i = 0; i < tot.size(); ++i) {
+            text(tot[i].label, x, r.y + 62, F::Small, HUD_MUTED, 10);
+            valUnit(tot[i].v, tot[i].unit, x, r.y + 76, 18);
+            x += colW[i] + gapX;
+        }
+        text(sub, r.x + 16, r.y + 104, F::Small, HUD_MUTED, 12);
         rideBottom = r.y + r.height;
+        rideLeft = r.x;
     }
 
     // ---- climb (under the ride card)
@@ -254,6 +360,14 @@ void App::drawRideHud() {
         }
     }
 
+    // ---- weather: its own card, left of the ride card (or under the right-hand stack if there's no room)
+    {
+        const float ww = 292, wh = weatherCardH();
+        Rectangle wr{rideLeft - 14 - ww, pad, ww, wh};
+        if (wr.x < effortRight + 16) wr = {W - pad - ww, rideBottom + 12, ww, wh};
+        drawWeatherCard(wr);
+    }
+
     // ---- top centre: workout step, road-change banner
     {
         float bw = std::min(560.f, W - 2 * 330);
@@ -284,11 +398,13 @@ void App::drawRideHud() {
     btns.push_back({prefs_.sound ? "Sound on" : "Sound off", 0, 9});
     btns.push_back({"?", 0, 10});
     btns.push_back({"2D", 1, 11});
+    btns.push_back({"", 0, 12});   // devices (cog icon)
     const float maxCW = std::min(440.f, W * 0.34f), bh = 32, gap = 6;
     std::vector<std::vector<int>> rows(1);
     float rwAcc = 0;
+    auto bw = [&](const Btn& b) { return b.id == 12 ? bh : hudButtonW(b.label); };
     for (int i = 0; i < int(btns.size()); ++i) {
-        float w = hudButtonW(btns[i].label);
+        float w = bw(btns[i]);
         if (rwAcc > 0 && rwAcc + gap + w > maxCW) { rows.emplace_back(); rwAcc = 0; }
         rows.back().push_back(i);
         rwAcc += (rwAcc > 0 ? gap : 0) + w;
@@ -297,12 +413,27 @@ void App::drawRideHud() {
     float ctrlLeft = W - pad;
     for (size_t ri = 0; ri < rows.size(); ++ri) {
         float total = 0;
-        for (int i : rows[ri]) total += hudButtonW(btns[i].label) + gap;
+        for (int i : rows[ri]) total += bw(btns[i]) + gap;
         float x = W - pad - (total - gap), y = ctrlTop + ri * (bh + gap);
         ctrlLeft = std::min(ctrlLeft, x);
         for (int i : rows[ri]) {
-            float w = hudButtonW(btns[i].label);
-            if (hudButton({x, y, w, bh}, btns[i].label, btns[i].kind)) {
+            float w = bw(btns[i]);
+            bool hit = hudButton({x, y, w, bh}, btns[i].label, btns[i].kind);
+            if (btns[i].id == 12) {   // the cog, drawn from the SVG (rasterised to assets/ui/settings-cog-64.png)
+                Link tl = ble_.trainer();
+                bool trouble = tl.state == LinkState::Reconnecting || (!simActive() && tl.state != LinkState::Connected);
+                if (cogTex_.id) DrawTexturePro(cogTex_, {0, 0, float(cogTex_.width), float(cogTex_.height)}, {x + 7, y + 7, w - 14, bh - 14}, {0, 0}, 0, HUD_INK);
+                else DrawCircleLines(int(x + w / 2), int(y + bh / 2), 7, HUD_INK);
+                if (trouble) DrawCircle(int(x + w - 6), int(y + 6), 4, Color{220, 61, 67, 255});   // a device needs attention
+                if (hovered({x, y, w, bh})) {
+                    const char* tip = "Devices";
+                    Vector2 m = measure(tip, F::Small, 12);
+                    Rectangle tp{x + w - m.x - 16, y - 30, m.x + 16, 24};
+                    DrawRectangleRounded(tp, 1, 8, Color{17, 24, 39, 225});
+                    text(tip, tp.x + 8, tp.y + 5, F::Small, WHITE, 12);
+                }
+            }
+            if (hit) {
                 switch (btns[i].id) {
                     case 1: drawerOpen_ = !drawerOpen_; break;
                     case 2: eng_->lap(); break;
@@ -315,6 +446,7 @@ void App::drawRideHud() {
                     case 9: prefs_.sound = !prefs_.sound; sfx::setMuted(!prefs_.sound); store::save(prof_, prefs_); break;
                     case 10: helpOpen_ = !helpOpen_; break;
                     case 11: view3d_ = false; break;
+                    case 12: devicesModal_ = true; devicesOpenedAt_ = GetTime(); break;
                 }
             }
             x += w + gap;
@@ -326,11 +458,11 @@ void App::drawRideHud() {
         Rectangle r{pad, by - 72, 168, 72};
         glass(r);
         Vector2 c{r.x + 36, r.y + 36};
-        DrawRing(c, 14.5f, 19.5f, 0, 360, 48, Color{31, 36, 48, 22});
+        DrawRing(c, 14.5f, 19.5f, 0, 360, 48, hudInk(22));
         float v = float(std::clamp(flow_, 0.0, 1.0));
         if (v > 0.01f) DrawRing(c, 14.5f, 19.5f, -90, -90 + 360 * v, 48, Color{255, 170, 70, 255});
         DrawCircleV(c, 4 + v * 5, Color{255, 211, 107, (unsigned char)(90 + 150 * v)});
-        text("FLOW", r.x + 66, r.y + 13, F::Small, Color{138, 90, 0, 255}, 11);
+        text("FLOW", r.x + 66, r.y + 13, F::Small, hudPick(Color{138, 90, 0, 255}, Color{255, 205, 120, 255}), 11);
         text(flowStreak_ >= 5 ? fmtTime(flowStreak_) : "\xE2\x80\x94", r.x + 66, r.y + 27, F::Title, HUD_INK, 22);
         text("best " + fmtTime(flowBest_), r.x + 66, r.y + 52, F::Small, HUD_MUTED, 11);
         flowRight = r.x + r.width;
@@ -339,7 +471,7 @@ void App::drawRideHud() {
     if (endlessRide_) {
         Rectangle r{pad, by - 72 - 12 - 112, 330, 112};
         glass(r);
-        text("ROAD AHEAD", r.x + 16, r.y + 12, F::Small, Color{15, 128, 72, 255}, 11);
+        text("ROAD AHEAD", r.x + 16, r.y + 12, F::Small, hudPick(Color{15, 128, 72, 255}, Color{100, 225, 160, 255}), 11);
         textRight("from km " + std::to_string(endless_.nextKm + 1), r.x + r.width - 16, r.y + 12, F::Small, HUD_MUTED, 11);
         std::vector<std::string> hs;
         for (int i = 0; i < 5; ++i) hs.push_back(hillinessName(Hilliness(i)));
@@ -353,7 +485,7 @@ void App::drawRideHud() {
         std::string nu = netNext_ == 0 ? "  per km" : fmt(" per km  \xC2\xB7  avg %+.1f%%", netNext_ / 10.0);
         float tw = measure(nv, F::Title, 18).x + measure(nu, F::Small, 12).x;
         float tx = r.x + (r.width - tw) / 2;
-        text(nv, tx, y + 3, F::Title, netNext_ > 0 ? Color{194, 94, 11, 255} : netNext_ < 0 ? Color{47, 127, 216, 255} : HUD_INK, 18);
+        text(nv, tx, y + 3, F::Title, netNext_ > 0 ? hudPick(Color{194, 94, 11, 255}, Color{255, 160, 80, 255}) : netNext_ < 0 ? hudPick(Color{47, 127, 216, 255}, Color{120, 180, 255, 255}) : HUD_INK, 18);
         text(nu, tx + measure(nv, F::Title, 18).x, y + 8, F::Small, HUD_MUTED, 12);
     }
     // the road (centre strip): the ridden part warm, you a dark line, climbs underlined
@@ -365,31 +497,46 @@ void App::drawRideHud() {
             Rectangle in{r.x + 12, r.y + 9, r.width - 24, r.height - 18};
             const RouteProfile& rp = e.profileData();
             double d = e.lapDistance();
-            double a0 = 0, a1 = rp.length;
-            if (endlessRide_) { a0 = std::max(0.0, d - 1500); a1 = rp.length; }
+            // A moving window: you start at the left, ride to the middle, then the road scrolls
+            // under you so there is always as much ahead as behind. A fixed route shorter than
+            // the window is shown whole; at the end of the last lap you ride on to the right edge.
+            constexpr double SPAN = 6000;
+            const bool grows = e.endless();                                  // endless road / roaming: built as you go
+            const bool wraps = !grows && e.lapNumber() < e.laps();           // more laps: ahead continues from the start
+            double a0 = std::max(0.0, d - SPAN / 2), a1 = a0 + SPAN;
+            if (!grows && !wraps && rp.length > 0) { a0 = std::max(0.0, std::min(a0, rp.length - SPAN)); a1 = std::min(a0 + SPAN, rp.length); }
+            const double built = grows ? rp.length : 1e18;                   // nothing drawn past what's laid out
+            auto eleAt = [&](double dd) {
+                if (wraps && rp.length > 0 && dd > rp.length) dd = std::fmod(dd, rp.length);
+                return rp.elevationAt(std::min(dd, grows ? rp.length : dd));
+            };
             if (a1 - a0 > 1) {
                 double mn = 1e9, mx = -1e9;
                 const int N = int(in.width / 2);
                 std::vector<float> ev(N + 1);
                 for (int i = 0; i <= N; ++i) {
                     double dd = a0 + (a1 - a0) * i / N;
-                    ev[i] = float(rp.elevationAt(dd));
+                    ev[i] = float(eleAt(dd));
+                    if (dd > built) continue;
                     mn = std::min(mn, double(ev[i])); mx = std::max(mx, double(ev[i]));
                 }
                 if (mx - mn < 20) mx = mn + 20;
                 float xr = in.x + float((d - a0) / (a1 - a0)) * in.width;
                 for (int i = 0; i < N; ++i) {
+                    if (a0 + (a1 - a0) * i / N > built) break;
                     float x0 = in.x + in.width * i / N, x1 = in.x + in.width * (i + 1) / N;
                     float y0 = in.y + in.height - 4 - float((ev[i] - mn) / (mx - mn)) * (in.height - 10);
                     float y1 = in.y + in.height - 4 - float((ev[i + 1] - mn) / (mx - mn)) * (in.height - 10);
-                    Color c = x1 <= xr ? Color{255, 190, 100, 200} : Color{31, 36, 48, 36};
+                    Color c = x1 <= xr ? Color{255, 190, 100, 200} : hudInk(36);
                     DrawTriangle({x0, y0}, {x0, in.y + in.height}, {x1, y1}, c);
                     DrawTriangle({x1, y1}, {x0, in.y + in.height}, {x1, in.y + in.height}, c);
                 }
+                for (int lapOff = 0; lapOff <= (wraps ? 1 : 0); ++lapOff)
                 for (const auto& c : rp.climbs) {
-                    if (c.endD < a0 || c.startD > a1) continue;
-                    float x0 = in.x + float((std::max(c.startD, a0) - a0) / (a1 - a0)) * in.width;
-                    float x1 = in.x + float((std::min(c.endD, a1) - a0) / (a1 - a0)) * in.width;
+                    double cs = c.startD + lapOff * rp.length, ce = c.endD + lapOff * rp.length;
+                    if (ce < a0 || cs > a1) continue;
+                    float x0 = in.x + float((std::max(cs, a0) - a0) / (a1 - a0)) * in.width;
+                    float x1 = in.x + float((std::min(ce, a1) - a0) / (a1 - a0)) * in.width;
                     DrawRectangleRec({x0, in.y + in.height - 2, x1 - x0, 2}, Color{240, 122, 26, 255});
                 }
                 if (auto gd = e.ghostDistance()) {
@@ -426,7 +573,7 @@ void App::drawRideHud() {
 // ------------------------------------------------------------------ 2D dashboard (CoreKick style)
 void App::drawDashboard2d() {
     const RideEngine& e = *eng_;
-    const float W = float(GetScreenWidth()), H = float(GetScreenHeight());
+    const float W = ui::screenW(), H = ui::screenH();
     const bool metric = prof_.metric;
     char b[200];
     DrawRectangle(0, 0, int(W), int(H), BG);
@@ -441,7 +588,7 @@ void App::drawDashboard2d() {
     std::vector<M> ms = {
         {"POWER 3s", std::to_string(int(std::lround(p3))), "W", powerZoneColor(p3, prof_.ftp)},
         {"HEART RATE", e.heartRate() ? std::to_string(int(*e.heartRate())) : "--", "bpm", hrZoneColor(e.hrZone(), int(prof_.hrZones().size()))},
-        {"CADENCE", std::to_string(int(std::lround(e.cadence()))), "rpm", Color{91, 100, 117, 255}},
+        {"CADENCE", std::to_string(int(std::lround(e.cadence()))), "rpm", DIM},
         {"SPEED", fmtSpeed(e.speedMps(), metric), metric ? "km/h" : "mph", SKY},
         {"TIME", fmtTime(e.elapsedS()), "", TEXT},
         {"DISTANCE", fmtDist(e.distance(), metric), "", TEXT},
@@ -504,7 +651,7 @@ void App::drawDashboard2d() {
 // ------------------------------------------------------------------ edit drawer
 void App::drawEditDrawer() {
     RideEngine& e = *eng_;
-    const float W = float(GetScreenWidth()), H = float(GetScreenHeight());
+    const float W = ui::screenW(), H = ui::screenH();
     Rectangle r{W - 460, 0, 460, H};
     DrawRectangleRec(r, PANEL);
     DrawLineEx({r.x, 0}, {r.x, H}, 1, LINE);
@@ -635,13 +782,16 @@ void App::drawEditDrawer() {
         }
     }
     // block clicks to the HUD beneath
-    if (CheckCollisionPointRec(GetMousePosition(), r)) ui::setInputBlocked(true);
+    if (CheckCollisionPointRec(ui::mouseLogical(), r)) ui::setInputBlocked(true);
 }
 
 void App::drawPauseMenu() {
-    const float W = float(GetScreenWidth()), H = float(GetScreenHeight());
-    DrawRectangle(0, 0, int(W), int(H), Color{15, 23, 42, 70});
-    Rectangle r{W / 2 - 220, H / 2 - 190, 440, 380};
+    const float W = ui::screenW(), H = ui::screenH();
+    DrawRectangle(0, 0, int(W), int(H), Color{8, 12, 20, 70});
+    // on a generated map the world can be kept: seed, size, climate (everything that makes it) and where this ride began
+    const bool genWorld = map_ && eng_->route().id.rfind("map-", 0) == 0;
+    const float extra = genWorld ? 62.f : 0.f;
+    Rectangle r{W / 2 - 220, H / 2 - 190 - extra / 2, 440, 380 + extra};
     panel(r, PANEL);
     textCentered("Paused", {r.x, r.y + 12, r.width, 50}, F::Title, TEXT);
     textCentered(fmtTime(eng_->elapsedS()) + "  \xC2\xB7  " + fmtDist(eng_->distance(), prof_.metric), {r.x, r.y + 58, r.width, 24}, F::Body, DIM);
@@ -650,29 +800,82 @@ void App::drawPauseMenu() {
     y += 62;
     if (button({r.x + 40, y, r.width - 80, 50}, view3d_ ? "Switch to 2D dashboard" : "Switch to 3D world")) view3d_ = !view3d_;
     y += 62;
+    if (genWorld) {
+        const int km = int(std::lround(map_->params.size / 1024.f));
+        const store::SavedWorld* sw = savedWorldFor(map_->params.seed, km, map_->params.climate);
+        if (sw) button({r.x + 40, y, r.width - 80, 50}, "Seed " + std::to_string(map_->params.seed) + " is in your saved list", false, false, 16);
+        else if (button({r.x + 40, y, r.width - 80, 50}, "Add seed to saved list") && saveWorld(*map_, rideMapStart_))
+            toast("Saved: Free ride > Saved worlds starts you right here", GOOD);
+        y += 62;
+    }
     if (button({r.x + 40, y, r.width - 80, 50}, "End ride & save")) { pauseMenu_ = false; endRide(true); }
     y += 62;
     if (button({r.x + 40, y, r.width - 80, 50}, "Discard ride")) { pauseMenu_ = false; endRide(false); }
 }
 
 void App::drawHelp() {
-    const float W = float(GetScreenWidth()), H = float(GetScreenHeight());
-    Rectangle r{W / 2 - 340, H / 2 - 290, 680, 580};
+    const float W = ui::screenW(), H = ui::screenH();
+    Rectangle r{W / 2 - 340, H / 2 - 304, 680, 608};
     panel(r, PANEL);
     text("Keys", r.x + 24, r.y + 16, F::Title, TEXT);
     const char* rows[][2] = {{"Space", "Pause / resume"}, {"L", "Record a lap"}, {"E", "Edit drawer (intervals, goal, laps, insert sets)"},
                              {"Up / Down", "Nudge the target; endless road: climb per km ahead"}, {"G", "Endless road: hilliness ahead"}, {"Right", "Skip to the next workout step"},
-                             {"[ ]  PgUp / PgDn", "Virtual gears (Zwift Cog)"}, {"H", "Heart-rate alerts on / off"}, {"V", "2D dashboard / 3D world"},
+                             {"[ ]  PgUp / PgDn", "Virtual gears (Zwift Cog)"}, {"H", "Heart-rate alerts on / off"}, {"V", "2D dashboard / 3D world"}, {"B", "Greybox body / kitted rider"},
                              {"R", "Change the road ahead: add a climb, descent, sprint..."}, {"Backspace", "Undo the last road change"},
                              {"C", "Camera: chase, cinematic, side, rider, drone, close, eyes"}, {"T / W / M", "Time of day / weather / sound"}, {"D", "Simulator test data"},
                              {"Shift+Up/Down", "Simulator power +-10 W"}, {"Alt+Up/Down", "Simulator heart rate +-2 bpm"}, {"Tab", "Hide the HUD"},
-                             {"Esc", "Menu"}};
+                             {"F / P", "FPS counter / frame-time breakdown"}, {"Esc", "Menu"}};
     float y = r.y + 70;
     for (auto& rw : rows) {
         text(rw[0], r.x + 30, y, F::Body, ACCENT, 17);
         text(rw[1], r.x + 220, y, F::Body, TEXT, 17);
         y += 27;
     }
+}
+
+// ------------------------------------------------------------------ performance (F / P)
+void App::drawPerf() {
+    const float W = ui::screenW(), H = ui::screenH();
+    static float fpsS = 60, msS = 16.7f;
+    float dt = GetFrameTime();
+    if (dt > 0) { msS += (dt * 1000.f - msS) * 0.08f; fpsS = 1000.f / std::max(msS, 0.01f); }
+    const prof::Stats& st = prof::stats();
+    const bool detail = prefs_.showPerf;
+    const float w = detail ? 250.f : 120.f;
+    const float rowH = 20.f;
+    const float h = detail ? 64.f + rowH * prof::COUNT + 30.f : 46.f;
+    float right = W - 16.f;
+    if (testPanel_ && simActive()) right = W - 400 - 12.f;   // stay clear of the test-data panel
+    Rectangle r{right - w, std::round(H * 0.5f - h * 0.5f), w, h};
+    panel(r, withAlpha(PANEL, 236), 0.08f);
+    char b[64];
+    Color fc = fpsS >= 55 ? GOOD : fpsS >= 30 ? WARN : BAD;
+    std::snprintf(b, sizeof b, "%.0f", fpsS);
+    text(b, r.x + 14, r.y + 8, F::Title, fc, 24);
+    float fw = measure(b, F::Title, 24).x;
+    std::snprintf(b, sizeof b, "fps  %.1f ms", msS);
+    text(b, r.x + 20 + fw, r.y + 16, F::Small, DIM, 13);
+    if (!detail) return;
+    // per category: GPU time (timestamp queries) where available
+    std::snprintf(b, sizeof b, "Total  %.1f ms   3D %dx%d (%.0f%%)", st.gpuMs, renderer_.renderWidth(), renderer_.renderHeight(), 100.f * renderer_.renderWidth() / std::max(1, GetRenderWidth()));
+    text(b, r.x + 14, r.y + 42, F::Small, DIM, 13);
+    const float scale = std::max(msS, 4.f);   // bars relative to the frame
+    static const Color cols[prof::COUNT] = {
+        {148, 163, 184, 255}, {100, 116, 139, 255}, {56, 189, 248, 255}, {132, 204, 22, 255}, {71, 85, 105, 255},
+        {22, 163, 74, 255}, {163, 230, 53, 255}, {234, 179, 8, 255}, {14, 165, 233, 255}, {167, 139, 250, 255},
+        {244, 114, 182, 255}, {251, 146, 60, 255}, {239, 68, 68, 255}};
+    float y = r.y + 64;
+    for (int i = 0; i < prof::COUNT; ++i) {
+        float ms = st.ms[i];
+        text(prof::name(prof::Section(i)), r.x + 14, y + 2, F::Small, TEXT, 13);
+        std::snprintf(b, sizeof b, "%.2f", ms);
+        textRight(b, r.x + w - 14, y + 2, F::Small, ms > 4.f ? BAD : ms > 2.f ? WARN : DIM, 13);
+        float bw = std::clamp(ms / scale, 0.f, 1.f) * (w - 28);
+        DrawRectangleRec({r.x + 14, y + 16, w - 28, 2}, ink(14));
+        if (bw > 0.5f) DrawRectangleRec({r.x + 14, y + 16, bw, 2}, cols[i]);
+        y += rowH;
+    }
+    text(std::string("Timing: ") + st.method, r.x + 14, y + 8, F::Small, FAINT, 11);
 }
 
 // ------------------------------------------------------------------ sectors (road ahead)
@@ -768,8 +971,56 @@ void App::drawRoadAhead(float x, float& y, float w) {
         y += 40;
     }
     // upcoming profile with the change
-    if (y + 90 < GetScreenHeight()) {
+    if (y + 90 < ui::screenH()) {
         text("NEXT 3 KM", x, y + 6, F::Small, DIM, 12);
         upcomingProfile({x, y + 24, w, 70}, e.profileData(), e.lapDistance(), 3000, prof_.metric);
+    }
+}
+
+// ------------------------------------------------------------------ weather card: now + forecast
+float App::weatherCardH() const { return prefs_.weatherMode == 2 ? 84.f : 128.f; }   // as tall as the ride card
+
+void App::drawWeatherCard(Rectangle r) {
+    using weather::Kind;
+    const bool metric = prof_.metric;
+    const bool night = sky_.tod > 0.8f;
+    glass(r);
+    Kind now = wx_.currentKind(wxElapsed_);
+    auto tempStr = [&](double c) { return fmt("%.0f\xC2\xB0", metric ? c : c * 9 / 5 + 32); };
+    auto tempFor = [&](Kind k) { return weather::temperature(wxSeasonC_, wxSunEle_, k, wxEleForTemp_); };
+    // now: icon, temperature, condition; wind and the road underneath
+    weatherIcon(now, {r.x + 34, r.y + 34}, 44, night);
+    std::string t = tempStr(wxTempC_);
+    text(t, r.x + 66, r.y + 10, F::Big, HUD_INK, 30);
+    float tx = r.x + 66 + measure(t, F::Big, 30).x + 10;
+    text(weather::kindLabel(now), tx, r.y + 12, F::Body, HUD_INK, 16);
+    const char* modeTag = prefs_.weatherMode == 0 ? "Changing" : prefs_.weatherMode == 1 ? "Live" : "Fixed";
+    textRight(modeTag, r.x + r.width - 14, r.y + 14, F::Small, HUD_MUTED, 11);
+    std::string road = wx_.snowCover > 0.3 ? "snow on the road" : wx_.wet > 0.4 ? "wet road" : wx_.wet > 0.15 ? "damp road" : "dry road";
+    std::string wind = fmt(metric ? "Wind %.0f km/h " : "Wind %.0f mph ", metric ? wxWindKmh_ : wxWindKmh_ * 0.621371) + compass8(wx_.windDir);
+    text(wind + "  \xC2\xB7  " + road, tx, r.y + 34, F::Small, HUD_MUTED, 12);
+    if (prefs_.weatherMode == 1 && live_) textRight(live_->place, r.x + r.width - 14, r.y + 30, F::Small, HUD_MUTED, 11);
+    if (prefs_.weatherMode == 2) return;   // fixed: nothing will change
+    // forecast: the next spells (changing weather) or the next hours (live)
+    DrawLineEx({r.x + 14, r.y + 62}, {r.x + r.width - 14, r.y + 62}, 1, hudInk(22));
+    struct Slot { std::string when; Kind k; double temp; };
+    std::vector<Slot> slots;
+    if (prefs_.weatherMode == 1 && live_ && !live_->hourly.empty()) {
+        for (const auto& h : live_->hourly) slots.push_back({fmt("+%.0f h", h.inHours), h.kind, h.tempC});
+    } else {
+        const double ahead[3] = {15 * 60, 30 * 60, 60 * 60};
+        const char* lbl[3] = {"in 15 min", "in 30 min", "in 1 h"};
+        for (int i = 0; i < 3; ++i) { Kind k = wx_.kindIn(wxElapsed_, ahead[i]); slots.push_back({lbl[i], k, tempFor(k)}); }
+    }
+    float colW = (r.width - 28) / float(slots.size());
+    for (size_t i = 0; i < slots.size(); ++i) {
+        float cx = r.x + 14 + colW * (i + 0.5f);
+        // two lines per slot: when, then icon + temperature
+        textCentered(slots[i].when, {cx - colW / 2, r.y + 68, colW, 14}, F::Small, HUD_MUTED, 11);
+        std::string ts = tempStr(slots[i].temp);
+        float tw = measure(ts, F::Small, 15).x, gw = 26 + 6 + tw;
+        weatherIcon(slots[i].k, {cx - gw / 2 + 13, r.y + 101}, 26, night);
+        text(ts, cx - gw / 2 + 32, r.y + 92, F::Small, HUD_INK, 15);
+        if (i + 1 < slots.size()) DrawLineEx({r.x + 14 + colW * (i + 1), r.y + 70}, {r.x + 14 + colW * (i + 1), r.y + 116}, 1, hudInk(16));
     }
 }

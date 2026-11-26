@@ -5,6 +5,7 @@
 
 #include "Terrain.h"
 #include "core/Route.h"
+#include "world/WorldMap.h"
 
 static constexpr float PI = 3.14159265358979f;
 
@@ -80,7 +81,94 @@ void Course::build(const Route& route, uint32_t seed) {
     baseY_ = minEle_ - 25.f;   // the valley floor sits a little below the route's lowest point
 }
 
+int Course::kindAt(double dist) const {
+    if (pts_.empty()) return 0;
+    double d = dist;
+    if (loop_) { d = std::fmod(d, double(length_)); if (d < 0) d += length_; }
+    long i = long(std::lround(d / step_));
+    if (i < 0 || i >= long(pts_.size())) return 0;
+    return pts_[size_t(i)].kind;
+}
+
+Course::Box Course::extendWorld(const Course& prev, const Route& route, const std::vector<wmap::RoadPt>& path) {
+    float oldLen = prev.length_;
+    buildWorld(route, prev.world_, path, false);
+    version_ = prev.version_ + 1;
+    Box b{1e9f, 1e9f, -1e9f, -1e9f};
+    for (const auto& p : pts_) {
+        if (p.dist < oldLen - 40.f) continue;
+        b.x0 = std::min(b.x0, p.pos.x); b.x1 = std::max(b.x1, p.pos.x);
+        b.z0 = std::min(b.z0, p.pos.z); b.z1 = std::max(b.z1, p.pos.z);
+    }
+    b.x0 -= 600.f; b.z0 -= 600.f; b.x1 += 600.f; b.z1 += 600.f;
+    // the land doesn't depend on which road is ridden: keep the terrain field
+    {
+        std::lock_guard<std::mutex> lk(prev.field_.m);
+        if (prev.field_.own) {
+            terrain::Field* f = prev.field_.own.get();
+            std::lock_guard<std::mutex> lk2(field_.m);
+            field_.own = std::move(prev.field_.own);
+            field_.ptr.store(f);
+            prev.field_.ptr.store(nullptr);
+            f->rebind(*this, 0, 0, 0, 0);
+        }
+    }
+    return b;
+}
+
+void Course::buildWorld(const Route& route, std::shared_ptr<const wmap::Map> world, const std::vector<wmap::RoadPt>& path, bool loop) {
+    world_ = std::move(world);
+    seed_ = world_->params.seed * 2654435761u + 12345u;
+    name_ = route.name;
+    loop_ = loop;
+    bumps_.clear();
+    theta_.clear();
+    version_ = 0;
+    offset_ = 0;   // world heights are real elevations
+    const size_t M = path.size();
+    const size_t segs = loop ? M : M - 1;   // a loop closes back to its first point
+    std::vector<double> acc(segs + 1, 0.0);
+    for (size_t j = 1; j <= segs; ++j) {
+        const auto& a = path[j - 1];
+        const auto& b = path[j % M];
+        acc[j] = acc[j - 1] + std::hypot(double(b.x - a.x), double(b.z - a.z));
+    }
+    const double L = std::max(50.0, acc[segs]);
+    // fixed 2 m spacing (not stretched to fit), so a growing road keeps every point it had
+    const int N = std::max(20, int(std::floor(L / 2.0)));
+    const float step = loop ? float(L / N) : 2.f;
+    pts_.assign(size_t(loop ? N : N + 1), {});
+    size_t j = 0;
+    for (size_t i = 0; i < pts_.size(); ++i) {
+        double t = i * double(step);
+        while (j + 1 < segs && acc[j + 1] < t) ++j;
+        const auto& a = path[j];
+        const auto& b = path[(j + 1) % M];
+        float f = std::clamp(float((t - acc[j]) / std::max(1e-9, acc[j + 1] - acc[j])), 0.f, 1.f);
+        pts_[i].pos = {a.x + (b.x - a.x) * f, a.y + (b.y - a.y) * f, a.z + (b.z - a.z) * f};
+        pts_[i].dist = float(t);
+        pts_[i].kind = f < 0.5f ? a.kind : b.kind;
+    }
+    const size_t n = pts_.size();
+    auto idx = [&](long i) { return loop ? size_t(((i % long(n)) + long(n)) % long(n)) : size_t(std::clamp<long>(i, 0, long(n) - 1)); };
+    for (size_t i = 0; i < n; ++i) {
+        long ia = long(idx(long(i) - 5)), ib = long(idx(long(i) + 5));
+        const auto& a = pts_[size_t(ia)].pos;
+        const auto& b = pts_[size_t(ib)].pos;
+        float span = loop ? 10.f : float(ib - ia);
+        pts_[i].grade = span > 0 ? (b.y - a.y) / (span * step) : 0.f;
+        const auto& c = pts_[i].pos;
+        size_t in = idx(long(i) + 1), ip = idx(long(i) - 1);
+        pts_[i].heading = in != i ? std::atan2(pts_[in].pos.x - c.x, pts_[in].pos.z - c.z) : std::atan2(c.x - pts_[ip].pos.x, c.z - pts_[ip].pos.z);
+    }
+    step_ = step;
+    length_ = loop ? float(L) : float((pts_.size() - 1) * double(step));
+    finishBuild(route);
+    baseY_ = minEle_ - 25.f;
+}
+
 void Course::relay(const Route& route, double fromDist) {
+    if (world_) { ++version_; return; }   // a generated world's road is fixed
     if (pts_.empty()) { build(route, seed_); return; }
     double from = fromDist;
     if (loop_) { from = std::fmod(from, double(length_)); if (from < 0) from += length_; }
@@ -359,11 +447,17 @@ float Course::roadNearest(float x, float z, float& px, float& pz, float& py) con
 }
 
 float Course::baseHeight(float x, float z) const {
+    if (world_) return world_->height(x, z);
     // broad, gentle swells in the valley floor (±60 m over ~6 km)
     return baseY_ + (fbm(x / 6000.f, z / 6000.f, 3, seed_ + 61) - 0.5f) * 120.f;
 }
 
 float Course::regional(float x, float z, float* coarseDist, float* rugged) const {
+    if (world_) {
+        if (coarseDist) *coarseDist = roadDistance(x, z);
+        if (rugged) *rugged = 0.5f;
+        return world_->height(x, z);
+    }
     // every road sample (80 m apart) within REACH: inverse-distance weights, so near the road
     // its own (tilted) height dominates and the closest stretch always wins
     const float R = REACH;

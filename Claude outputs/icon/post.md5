@@ -1,0 +1,8 @@
+72fd549c932c12c0f7978dacad6ee919  macos/Info.plist
+5be7e2e08f95483c094f431998b4cd4c  CMakeLists.txt
+f9d01849a3ec5916fc630e990539200b  src/App.cpp
+c64e1ce53726c86cedd00bae88c6b9ab  assets/icon/coreray-1024.png
+1cb84d7742fd64e8a91516d8ca4366cd  assets/icon/coreray-256.png
+d761859fd1f119758a04aaae760cdf1d  macos/CoreRay.icns
+b9da5d83c7c58c509db2fb95edea72a3  macos/coreray-icon.svg
+8553c3eaa0dc62d3d286f3f24700816c  macos/DockIcon.mm

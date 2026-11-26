@@ -6,7 +6,9 @@
 #include <cmath>
 #include <cstdio>
 #include <deque>
+#include <functional>
 #include <map>
+#include <tuple>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -34,18 +36,37 @@ struct BleManager::Impl {
     std::atomic<bool> scanning{false};
     double scanUntil = 0;
     std::map<std::string, DeviceInfo> found;
-    Link trainer, hrm;
-    std::string autoTrainer, autoHr;
+    Link trainer, hrm, shifter;
+    std::string autoTrainer, autoHr, autoShifter;
+    int shifts = 0;   // queued gear presses
+    BleManager::ShifterDiag shDiag;
+    void shLine(const std::string& l) {
+        std::lock_guard<std::mutex> lk(m);
+        char ts[16];
+        std::snprintf(ts, sizeof ts, "%7.1f ", appClock());
+        shDiag.lines.push_back(ts + l);
+        if (shDiag.lines.size() > 14) shDiag.lines.erase(shDiag.lines.begin());
+        std::fprintf(stderr, "[shifter] %s\n", l.c_str());
+    }
     std::deque<std::string> logLines;
 
     // telemetry
     double power = 0, cadence = 0, lastTrainer = -1, hr = 0, lastHr = -1;
+    // per-field freshness: some trainers stop sending a field (e.g. cadence when you
+    // stop pedalling) rather than sending 0, so each value expires on its own
+    double lastPowerT = -1, lastCadT = -1;
+    double ibdPowerT = -1, ibdCadT = -1;  // when FTMS last supplied each field (CPS defers to it)
     std::optional<double> speed, trainerHr;
+    void clearTelemetry() {
+        lastTrainer = -1; power = 0; cadence = 0;
+        lastPowerT = lastCadT = ibdPowerT = ibdCadT = -1;
+        speed.reset(); trainerHr.reset();
+    }
 
     // trainer command channel (coalesced: only the newest target matters)
     std::optional<TrainerCommand> pendingCmd;
-    std::atomic<bool> trainerCancel{true}, hrCancel{true};
-    std::thread trainerThread, hrThread, scanThread;
+    std::atomic<bool> trainerCancel{true}, hrCancel{true}, shifterCancel{true};
+    std::thread trainerThread, hrThread, scanThread, shifterThread;
     std::atomic<bool> quit{false};
     std::mutex ctl;  // serialises start/stop of the supervisors
 
@@ -60,6 +81,12 @@ struct BleManager::Impl {
     void setLink(bool isTrainer, LinkState st, const std::string& detail) {
         std::lock_guard<std::mutex> lk(m);
         Link& l = isTrainer ? trainer : hrm;
+        l.state = st;
+        l.detail = detail;
+    }
+    void setShifterLink(LinkState st, const std::string& detail) {
+        std::lock_guard<std::mutex> lk(m);
+        Link& l = shifter;
         l.state = st;
         l.detail = detail;
     }
@@ -95,14 +122,20 @@ struct BleManager::Impl {
 
     void onScan(SimpleBLE::Peripheral p) {
         try {
-            bool ftms = false, hrs = false, cps = false;
+            bool ftms = false, hrs = false, cps = false, zw = false;
             for (auto& s : p.services()) {
-                auto u = s.uuid();
+                auto u = lowerStr(s.uuid());
                 if (u == proto::uuid16(proto::SVC_FTMS)) ftms = true;
                 else if (u == proto::uuid16(proto::SVC_HRS)) hrs = true;
                 else if (u == proto::uuid16(proto::SVC_CPS)) cps = true;
+                else if (u == proto::zwift::SERVICE || u == proto::zwift::SERVICE_FC82) zw = true;
             }
+            try { for (auto& [mid, data] : p.manufacturer_data()) if (mid == proto::zwift::MANUFACTURER_ID) zw = true; } catch (...) {}
             std::string name = p.identifier();
+            {
+                std::string ln0 = lowerStr(name);
+                if (ln0.find("zwift") != std::string::npos && (ln0.find("click") != std::string::npos || ln0.find("play") != std::string::npos || ln0.find("ride") != std::string::npos)) zw = true;
+            }
             std::string id = idOf(p);
             std::lock_guard<std::mutex> lk(m);
             auto it = found.find(id);
@@ -112,7 +145,8 @@ struct BleManager::Impl {
             }
             std::string ln = lowerStr(name);
             DeviceInfo d;
-            if (ftms || ln.find("kickr") != std::string::npos) d.kind = DevKind::Trainer;
+            if (zw && !ftms) d.kind = DevKind::Shifter;
+            else if (ftms || ln.find("kickr") != std::string::npos) d.kind = DevKind::Trainer;
             else if (hrs) d.kind = DevKind::HeartRate;
             else if (cps) d.kind = DevKind::Power;
             else if (it != found.end()) d.kind = it->second.kind;
@@ -120,19 +154,22 @@ struct BleManager::Impl {
             d.id = id;
             d.ftms = ftms;
             d.rssi = p.rssi();
-            d.name = !name.empty() ? name : d.kind == DevKind::Trainer ? "Smart trainer" : d.kind == DevKind::HeartRate ? "Heart rate monitor" : "Power meter";
+            d.name = !name.empty() ? name : d.kind == DevKind::Trainer ? "Smart trainer" : d.kind == DevKind::HeartRate ? "Heart rate monitor" : d.kind == DevKind::Shifter ? "Zwift controller" : "Power meter";
             found[id] = d;
             peripherals[id] = p;
             bool autoT = !autoTrainer.empty() && id == autoTrainer && trainer.state == LinkState::Disconnected && trainerCancel;
             bool autoH = !autoHr.empty() && id == autoHr && hrm.state == LinkState::Disconnected && hrCancel;
+            bool autoS = !autoShifter.empty() && id == autoShifter && shifter.state == LinkState::Disconnected && shifterCancel;
             if (autoT) { trainer.state = LinkState::Connecting; trainer.id = id; trainer.name = d.name; }
             if (autoH) { hrm.state = LinkState::Connecting; hrm.id = id; hrm.name = d.name; }
-            if (autoT || autoH) {
-                std::thread([this, id, autoT, autoH] {
+            if (autoS) { shifter.state = LinkState::Connecting; shifter.id = id; shifter.name = d.name; }
+            if (autoT || autoH || autoS) {
+                std::thread([this, id, autoT, autoH, autoS] {
                     std::lock_guard<std::mutex> g(ctl);
                     if (quit) return;
                     if (autoT) startTrainer(id);
                     if (autoH) startHrm(id);
+                    if (autoS) startShifter(id);
                 }).detach();
             }
         } catch (...) {
@@ -151,6 +188,14 @@ struct BleManager::Impl {
         for (auto& s : p.services())
             for (auto& ch : s.characteristics())
                 if (ch.uuid() == c) return s.uuid();
+        return std::nullopt;
+    }
+
+    static std::optional<std::string> findServiceFull(SimpleBLE::Peripheral& p, const std::string& chrUuid) {
+        std::string c = lowerStr(chrUuid);
+        for (auto& s : p.services())
+            for (auto& ch : s.characteristics())
+                if (lowerStr(ch.uuid()) == c) return s.uuid();
         return std::nullopt;
     }
 
@@ -188,14 +233,14 @@ struct BleManager::Impl {
             setLink(true, LinkState::Reconnecting, detail + " - retrying...");
             {
                 std::lock_guard<std::mutex> lk(m);
-                lastTrainer = -1; power = 0; cadence = 0;
+                clearTelemetry();
             }
             double until = appClock() + std::max(1, std::min(attempt, 5));
             while (appClock() < until && !trainerCancel && !quit) sleepMs(100);
         }
         if (auto p = peripheral(id)) try { if (p->is_connected()) p->disconnect(); } catch (...) {}
         std::lock_guard<std::mutex> lk(m);
-        lastTrainer = -1; power = 0; cadence = 0;
+        clearTelemetry();
         trainer = Link{};
     }
 
@@ -207,9 +252,14 @@ struct BleManager::Impl {
         if (!p.is_connected()) p.connect();
         p.set_callback_on_disconnected([dropped] { *dropped = true; });
         auto svcIbd = findService(p, proto::CHR_INDOOR_BIKE_DATA);
-        if (!svcIbd) throw std::runtime_error("No FTMS Indoor Bike Data. Update your KICKR firmware in the Wahoo app to enable FTMS.");
         auto svcCp = findService(p, proto::CHR_FTMS_CONTROL_POINT);
-        if (!svcCp) throw std::runtime_error("Trainer has no FTMS Control Point");
+        auto svcCps = findService(p, proto::CHR_CP_MEASUREMENT);
+        if (!svcIbd || !svcCp) {
+            // No FTMS (older KICKR firmware, many power-meter style trainers): fall back to
+            // the Cycling Power Service, with Wahoo's legacy control characteristic if present.
+            if (svcCps) { cpsSession(p, dropped, lastCmd); return; }
+            throw std::runtime_error("Trainer has neither FTMS nor Cycling Power. Update the trainer's firmware (Wahoo app) to enable FTMS.");
+        }
         auto svcStatus = findService(p, proto::CHR_FTMS_STATUS);
         std::optional<proto::Range> powerRange, resRange;
         if (auto s = findService(p, proto::CHR_POWER_RANGE))
@@ -229,13 +279,18 @@ struct BleManager::Impl {
         p.notify(*svcIbd, proto::uuid16(proto::CHR_INDOOR_BIKE_DATA), [this](SimpleBLE::ByteArray b) {
             auto d = proto::parseIndoorBikeData(b.data(), b.size());
             if (!d) return;
+            double now = appClock();
             std::lock_guard<std::mutex> lk(m);
-            if (d->power_w) power = std::max(0, *d->power_w);
-            if (d->cadence_rpm) cadence = *d->cadence_rpm;
+            if (d->power_w) { power = std::max(0, *d->power_w); lastPowerT = ibdPowerT = now; }
+            if (d->cadence_rpm) { cadence = *d->cadence_rpm; lastCadT = ibdCadT = now; }
             if (d->speed_kmh) speed = *d->speed_kmh;
             if (d->heart_rate) trainerHr = *d->heart_rate > 0 ? std::optional<double>(*d->heart_rate) : std::nullopt;
-            lastTrainer = appClock();
+            lastTrainer = now;
         });
+        // Also listen to CPS when the trainer has it: FTMS stays the source of truth, but
+        // trainers whose Indoor Bike Data carries no cadence get it from CPS crank events.
+        auto crank = std::make_shared<proto::CrankCadence>();
+        if (svcCps) try { p.notify(*svcCps, proto::uuid16(proto::CHR_CP_MEASUREMENT), cpsHandler(crank, false)); } catch (...) {}
         p.indicate(*svcCp, proto::uuid16(proto::CHR_FTMS_CONTROL_POINT), onNote(proto::CHR_FTMS_CONTROL_POINT));
         if (svcStatus) try { p.notify(*svcStatus, proto::uuid16(proto::CHR_FTMS_STATUS), onNote(proto::CHR_FTMS_STATUS)); } catch (...) {}
 
@@ -337,6 +392,78 @@ struct BleManager::Impl {
             sleepMs(25);
         }
         try { p.unsubscribe(*svcIbd, proto::uuid16(proto::CHR_INDOOR_BIKE_DATA)); } catch (...) {}
+        if (svcCps) try { p.unsubscribe(*svcCps, proto::uuid16(proto::CHR_CP_MEASUREMENT)); } catch (...) {}
+    }
+
+    // CPS notification handler. `primary`: CPS is the only data source (no FTMS), so its
+    // power is used directly; otherwise it only fills in what FTMS has not sent for 3 s.
+    std::function<void(SimpleBLE::ByteArray)> cpsHandler(std::shared_ptr<proto::CrankCadence> crank, bool primary) {
+        return [this, crank, primary](SimpleBLE::ByteArray b) {
+            auto c = proto::parseCyclingPower(b.data(), b.size());
+            if (!c) return;
+            double now = appClock();
+            std::optional<double> cad;
+            if (c->crank_revs && c->crank_event_1024) cad = crank->update(*c->crank_revs, *c->crank_event_1024, now);
+            std::lock_guard<std::mutex> lk(m);
+            if (primary || ibdPowerT < 0 || now - ibdPowerT > 3) { power = std::max(0, c->power_w); lastPowerT = now; }
+            if (cad && (primary || ibdCadT < 0 || now - ibdCadT > 3)) { cadence = *cad; lastCadT = now; }
+            if (primary) lastTrainer = now;
+        };
+    }
+
+    // Trainer without FTMS: power/cadence from CPS; control (if any) through Wahoo's
+    // legacy characteristic: unlock, then ERG (0x42), sim (0x43 init + 0x46 grade) or
+    // resistance (0x40). Writes are coalesced so only the newest target is sent.
+    void cpsSession(SimpleBLE::Peripheral& p, std::shared_ptr<std::atomic<bool>> dropped, std::optional<TrainerCommand>& lastCmd) {
+        auto svcCps = findService(p, proto::CHR_CP_MEASUREMENT);
+        auto crank = std::make_shared<proto::CrankCadence>();
+        p.notify(*svcCps, proto::uuid16(proto::CHR_CP_MEASUREMENT), cpsHandler(crank, true));
+        auto svcW = findServiceFull(p, proto::WAHOO_TRAINER_CHR);
+        bool control = false;
+        auto write = [&](const proto::Bytes& b) {
+            p.write_request(*svcW, proto::WAHOO_TRAINER_CHR, SimpleBLE::ByteArray(b));
+        };
+        if (svcW) {
+            try { p.indicate(*svcW, proto::WAHOO_TRAINER_CHR, [](SimpleBLE::ByteArray) {}); } catch (...) {}
+            try { write(proto::wahooUnlock()); control = true; }
+            catch (std::exception& e) { addLog(std::string("Wahoo unlock failed: ") + e.what()); }
+        }
+        {
+            std::lock_guard<std::mutex> lk(m);
+            trainer.state = LinkState::Connected;
+            trainer.detail = control ? "Cycling Power + Wahoo control (no FTMS)" : "Power only - this trainer can't be controlled (no FTMS)";
+        }
+        addLog(trainer.name + (control ? ": connected (CPS + Wahoo legacy control)" : ": connected (CPS, read-only)"));
+        std::optional<TrainerCommand> want = lastCmd;
+        std::optional<std::tuple<double, double, double>> simInit;  // mass, crr, cw last sent
+        double lastWrite = 0;
+        while (!trainerCancel && !quit) {
+            if (*dropped) throw std::runtime_error("Trainer disconnected");
+            {
+                std::lock_guard<std::mutex> lk(m);
+                if (pendingCmd) { want = pendingCmd; pendingCmd.reset(); }
+            }
+            if (control && want && appClock() - lastWrite > 0.25) {
+                TrainerCommand c = *want;
+                want.reset();
+                lastCmd = c;
+                try {
+                    if (c.type == TrainerCommand::TargetPower) { write(proto::wahooSetErg(int(std::lround(c.watts)))); simInit.reset(); }
+                    else if (c.type == TrainerCommand::Resistance) { write(proto::wahooSetResistance(c.levelPct / 100.0)); simInit.reset(); }
+                    else {
+                        double mass = c.massKg > 20 ? c.massKg : 83.0;
+                        auto key = std::make_tuple(std::round(mass), c.crr, c.cw);
+                        if (simInit != key) { write(proto::wahooInitSim(mass, c.crr, c.cw)); simInit = key; sleepMs(60); }
+                        write(proto::wahooSetGrade(c.gradePct));
+                    }
+                } catch (std::exception& e) {
+                    addLog(std::string("Wahoo control write failed: ") + e.what());
+                }
+                lastWrite = appClock();
+            }
+            sleepMs(25);
+        }
+        try { p.unsubscribe(*svcCps, proto::uuid16(proto::CHR_CP_MEASUREMENT)); } catch (...) {}
     }
 
     // ---------------------------------------------------------------- heart rate
@@ -398,7 +525,117 @@ struct BleManager::Impl {
         }
         try { p.unsubscribe(*svc, proto::uuid16(proto::CHR_HR_MEASUREMENT)); } catch (...) {}
     }
+    // ---------------------------------------------------------------- Zwift shifter
+    void startShifter(const std::string& id) {
+        stopShifter();
+        shifterCancel = false;
+        {
+            std::lock_guard<std::mutex> lk(m);
+            shifter.state = LinkState::Connecting;
+            shifter.id = id;
+            auto it = found.find(id);
+            shifter.name = it != found.end() ? it->second.name : "Zwift controller";
+            shifter.detail.clear();
+        }
+        shifterThread = std::thread([this, id] { shifterSupervisor(id); });
+    }
+    void stopShifter() {
+        shifterCancel = true;
+        if (shifterThread.joinable()) shifterThread.join();
+    }
+    void shifterSupervisor(std::string id) {
+        int attempt = 0;
+        while (!shifterCancel && !quit) {
+            std::string detail = "Connection closed";
+            try { shifterSession(id); }
+            catch (std::exception& e) { detail = e.what(); }
+            if (shifterCancel || quit) break;
+            ++attempt;
+            addLog("shifter session ended: " + detail);
+            setShifterLink(LinkState::Reconnecting, detail + " - retrying...");
+            double until = appClock() + std::min(attempt, 5);
+            while (appClock() < until && !shifterCancel && !quit) sleepMs(100);
+        }
+        if (auto p = peripheral(id)) try { if (p->is_connected()) p->disconnect(); } catch (...) {}
+        std::lock_guard<std::mutex> lk(m);
+        shifter = Link{};
+    }
+    void shifterSession(const std::string& id) {
+        auto po = peripheral(id);
+        if (!po) throw std::runtime_error("Unknown device - scan again");
+        SimpleBLE::Peripheral p = *po;
+        auto dropped = std::make_shared<std::atomic<bool>>(false);
+        if (!p.is_connected()) p.connect();
+        p.set_callback_on_disconnected([dropped] { *dropped = true; });
+        auto svc = findServiceFull(p, proto::zwift::ASYNC);
+        if (!svc) throw std::runtime_error("Not a Zwift controller (no Zwift button service)");
+        {
+            std::lock_guard<std::mutex> lk(m);
+            shDiag = BleManager::ShifterDiag{};
+        }
+        std::string nm;
+        { std::lock_guard<std::mutex> lk(m); nm = lowerStr(shifter.name); }
+        const bool clickStyle = nm.find("click") != std::string::npos;
+        {
+            std::string svcs;
+            for (auto& sv : p.services()) {
+                svcs += "\n  service " + sv.uuid() + ":";
+                for (auto& ch : sv.characteristics()) svcs += " " + ch.uuid().substr(0, 8);
+            }
+            shLine("connected to " + nm + (clickStyle ? " (Click layout)" : "") + svcs);
+        }
+        auto edges = std::make_shared<proto::zwift::ShiftEdges>();
+        p.notify(*svc, proto::zwift::ASYNC, [this, edges, clickStyle](SimpleBLE::ByteArray b) {
+            auto btn = proto::zwift::parseButtons(b.data(), b.size(), clickStyle);
+            int d = btn ? edges->update(*btn) : 0;
+            bool idle = b.size() >= 1 && (uint8_t(b[0]) == 0x15 || uint8_t(b[0]) == 0x19);
+            {
+                std::lock_guard<std::mutex> lk(m);
+                shDiag.messages++;
+                if (idle) shDiag.idle++;
+                if (d > 0) shDiag.harder += d;
+                if (d < 0) shDiag.easier -= d;
+                if (d) shifts += d;
+            }
+            if (!idle) shLine("async " + proto::zwift::hex(b.data(), b.size()) + (btn ? (btn->up ? "  [harder held]" : btn->down ? "  [easier held]" : "  [released]") : "  [not a button message]") +
+                              (d > 0 ? "  -> SHIFT UP" : d < 0 ? "  -> SHIFT DOWN" : ""));
+        });
+        auto tx = findServiceFull(p, proto::zwift::SYNC_TX);
+        if (tx) try {
+            p.indicate(*tx, proto::zwift::SYNC_TX, [this](SimpleBLE::ByteArray b) {
+                bool ack = b.size() >= 6 && std::string(b.data(), b.data() + 6) == "RideOn";
+                { std::lock_guard<std::mutex> lk(m); if (ack) shDiag.handshakeAck = true; }
+                shLine("sync-tx " + proto::zwift::hex(b.data(), b.size()) + (ack ? "  (handshake accepted)" : ""));
+            });
+        } catch (std::exception& e) { shLine(std::string("sync-tx subscribe failed: ") + e.what()); }
+        // the handshake: "RideOn" (no key) asks for plain, unencrypted button messages.
+        // Written without response, as the open-source apps do; once more with response if unanswered.
+        auto rx = findServiceFull(p, proto::zwift::SYNC_RX);
+        auto hello = [&](bool withResponse) {
+            if (!rx) { shLine("no sync-rx characteristic: cannot send the handshake"); return; }
+            SimpleBLE::ByteArray h(proto::zwift::rideOn());
+            try {
+                if (withResponse) p.write_request(*rx, proto::zwift::SYNC_RX, h); else p.write_command(*rx, proto::zwift::SYNC_RX, h);
+                shLine(std::string("sent RideOn handshake") + (withResponse ? " (with response)" : ""));
+            } catch (std::exception& e) { shLine(std::string("handshake write failed: ") + e.what()); }
+        };
+        hello(false);
+        setShifterLink(LinkState::Connected, "");
+        addLog(shifter.name + ": shifter connected");
+        double t0 = appClock();
+        bool retried = false;
+        while (!shifterCancel && !quit) {
+            if (*dropped) throw std::runtime_error("Shifter disconnected");
+            bool ack;
+            { std::lock_guard<std::mutex> lk(m); ack = shDiag.handshakeAck; }
+            if (!ack && !retried && appClock() - t0 > 3) { retried = true; hello(true); }
+            sleepMs(100);
+        }
+        try { p.unsubscribe(*svc, proto::zwift::ASYNC); } catch (...) {}
+    }
 #else
+    void startShifter(const std::string&) {}
+    void stopShifter() {}
     void startTrainer(const std::string&) {}
     void stopTrainer() {}
     void startHrm(const std::string&) {}
@@ -423,9 +660,11 @@ BleManager::~BleManager() {
     impl_->quit = true;
     impl_->trainerCancel = true;
     impl_->hrCancel = true;
+    impl_->shifterCancel = true;
     std::lock_guard<std::mutex> g(impl_->ctl);
     impl_->stopTrainer();
     impl_->stopHrm();
+    impl_->stopShifter();
 #ifdef CORERAY_BLE
     try { if (impl_->adapter && impl_->adapter->scan_is_active()) impl_->adapter->scan_stop(); } catch (...) {}
 #endif
@@ -489,13 +728,31 @@ void BleManager::disconnectHrm() {
     std::thread([this] { std::lock_guard<std::mutex> g(impl_->ctl); impl_->stopHrm(); }).detach();
 }
 
+void BleManager::connectShifter(const std::string& id) {
+    { std::lock_guard<std::mutex> lk(impl_->m); impl_->shifter.state = LinkState::Connecting; impl_->shifter.id = id; }
+    std::thread([this, id] { std::lock_guard<std::mutex> g(impl_->ctl); if (!impl_->quit) impl_->startShifter(id); }).detach();
+}
+void BleManager::disconnectShifter() {
+    impl_->shifterCancel = true;
+    std::thread([this] { std::lock_guard<std::mutex> g(impl_->ctl); impl_->stopShifter(); }).detach();
+}
+Link BleManager::shifter() const { std::lock_guard<std::mutex> lk(impl_->m); return impl_->shifter; }
+BleManager::ShifterDiag BleManager::shifterDiag() const { std::lock_guard<std::mutex> lk(impl_->m); return impl_->shDiag; }
+int BleManager::takeShifts() {
+    std::lock_guard<std::mutex> lk(impl_->m);
+    int n = impl_->shifts;
+    impl_->shifts = 0;
+    return n;
+}
+
 Link BleManager::trainer() const { std::lock_guard<std::mutex> lk(impl_->m); return impl_->trainer; }
 Link BleManager::hrm() const { std::lock_guard<std::mutex> lk(impl_->m); return impl_->hrm; }
 
-void BleManager::setAutoConnect(const std::string& t, const std::string& h) {
+void BleManager::setAutoConnect(const std::string& t, const std::string& h, const std::string& sh) {
     std::lock_guard<std::mutex> lk(impl_->m);
     impl_->autoTrainer = t;
     impl_->autoHr = h;
+    impl_->autoShifter = sh;
 }
 
 void BleManager::send(const TrainerCommand& c) {
@@ -509,10 +766,11 @@ TrainerInput BleManager::input() const {
     bool fresh = impl_->lastTrainer >= 0 && now - impl_->lastTrainer < 3;
     bool hrFresh = impl_->lastHr >= 0 && now - impl_->lastHr < 5;
     TrainerInput in;
-    in.powerW = fresh ? impl_->power : 0;
-    in.cadenceRpm = fresh ? impl_->cadence : 0;
+    in.powerW = fresh && impl_->lastPowerT >= 0 && now - impl_->lastPowerT < 3 ? impl_->power : 0;
+    in.cadenceRpm = fresh && impl_->lastCadT >= 0 && now - impl_->lastCadT < 3 ? impl_->cadence : 0;
     in.heartRate = hrFresh ? std::optional<double>(impl_->hr) : fresh ? impl_->trainerHr : std::nullopt;
     in.connected = fresh;
+    if (fresh && impl_->speed) in.trainerSpeedKmh = impl_->speed;
     return in;
 }
 

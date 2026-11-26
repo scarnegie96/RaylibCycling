@@ -13,8 +13,6 @@
 using namespace ui;
 
 static std::string fmt(const char* f, double v) { char b[96]; std::snprintf(b, sizeof b, f, v); return b; }
-static const Color CARD{255, 255, 255, 255};
-static const Color CARD2{246, 248, 251, 255};
 
 static const char* sourceName(RouteSource s) {
     switch (s) {
@@ -65,7 +63,7 @@ void App::drawRoutesPage(Rectangle r) {
     if (routeView_ == 2) { drawRouteBuilder(r); return; }
     float lw = std::min(560.f, r.width * 0.42f);
     Rectangle L{r.x, r.y, lw, r.height};
-    panel(L, CARD);
+    panel(L, ui::PANEL);
     float x = L.x + 18, y = L.y + 14, w = L.width - 36;
     text("Routes", x, y, F::Title, TEXT);
     if (button({L.x + L.width - 236, y + 2, 108, 34}, "+ Generate", false, true, 15)) { routeView_ = 1; genPreview_.reset(); }
@@ -84,14 +82,14 @@ void App::drawRoutesPage(Rectangle r) {
     Rectangle lr{x, y, w, L.y + L.height - y - 52};
     float rowH = 74;
     scrollUpdate(lr, routeScroll_, list.size() * (rowH + 6));
-    BeginScissorMode(int(lr.x), int(lr.y), int(lr.width), int(lr.height));
+    ui::beginScissor({lr.x, lr.y, lr.width, lr.height});
     char b[200];
     for (size_t i = 0; i < list.size(); ++i) {
         const Route& ro = *list[i];
         Rectangle row{lr.x, lr.y + i * (rowH + 6) - routeScroll_, lr.width - 8, rowH};
         if (row.y + rowH < lr.y || row.y > lr.y + lr.height) continue;
-        bool sel = ro.id == selRoute_, h = hovered(row) && CheckCollisionPointRec(GetMousePosition(), lr);
-        DrawRectangleRounded(row, 0.2f, 6, sel ? Color{15, 157, 88, 55} : h ? Color{238, 241, 245, 255} : CARD2);
+        bool sel = ro.id == selRoute_, h = hovered(row) && CheckCollisionPointRec(ui::mouseLogical(), lr);
+        DrawRectangleRounded(row, 0.2f, 6, sel ? ui::accentA(55) : h ? ui::HOVER : ui::PANEL2);
         if (sel) DrawRectangleRoundedLinesEx(row, 0.2f, 6, 1.4f, ACCENT);
         text((ro.favourite ? "\xE2\x98\x85 " : "") + ro.name, row.x + 12, row.y + 8, F::Body, TEXT, 18);
         const RouteProfile& rp = profileFor(ro);
@@ -103,7 +101,7 @@ void App::drawRoutesPage(Rectangle r) {
         std::vector<float> ev;
         for (size_t j = 0; j < rp.ele.size(); j += std::max<size_t>(1, rp.ele.size() / 80)) ev.push_back(float(rp.ele[j]));
         float lo = *std::min_element(ev.begin(), ev.end()), hi = *std::max_element(ev.begin(), ev.end());
-        seriesChart({row.x + row.width - 160, row.y + 10, 148, rowH - 20}, ev, Color{15, 157, 88, 255}, lo - 5, std::max(hi, lo + 60), true);
+        seriesChart({row.x + row.width - 160, row.y + 10, 148, rowH - 20}, ev, ui::ACCENT, lo - 5, std::max(hi, lo + 60), true);
         if (h && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) { selRoute_ = prefs_.selRoute = ro.id; showRoute(ro); routeDeleteArm_.clear(); }
     }
     EndScissorMode();
@@ -117,7 +115,7 @@ void App::drawRoutesPage(Rectangle r) {
 }
 
 void App::drawRouteDetail(Rectangle R, const Route& rt) {
-    panel(R, CARD);
+    panel(R, ui::PANEL);
     char b[220];
     float x = R.x + 22, y = R.y + 18, w = R.width - 44;
     text(rt.name, x, y, F::Title, TEXT, 30);
@@ -141,7 +139,7 @@ void App::drawRouteDetail(Rectangle R, const Route& rt) {
     float tw = (w - 5 * 10) / 6;
     for (size_t i = 0; i < kv.size(); ++i) {
         Rectangle c{x + i * (tw + 10), y, tw, 60};
-        panel(c, CARD2);
+        panel(c, ui::PANEL2);
         text(kv[i].k, c.x + 10, c.y + 6, F::Small, DIM, 11);
         text(kv[i].v, c.x + 10, c.y + 26, F::Title, TEXT, std::min(24.f, tw / std::max(5.f, float(kv[i].v.size())) * 1.6f));
     }
@@ -201,7 +199,7 @@ void App::drawRouteDetail(Rectangle R, const Route& rt) {
 }
 
 void App::drawRouteGenerator(Rectangle r) {
-    panel(r, CARD);
+    panel(r, ui::PANEL);
     float x = r.x + 22, y = r.y + 18, w = std::min(520.f, r.width * 0.4f);
     text("Generate a route", x, y, F::Title, TEXT);
     if (button({r.x + r.width - 140, y, 120, 36}, "Back")) routeView_ = 0;
@@ -267,7 +265,7 @@ void App::drawRouteGenerator(Rectangle r) {
 }
 
 void App::drawRouteBuilder(Rectangle r) {
-    panel(r, CARD);
+    panel(r, ui::PANEL);
     float x = r.x + 22, y = r.y + 18, w = std::min(460.f, r.width * 0.36f);
     text("Build a route from segments", x, y, F::Title, TEXT);
     if (button({r.x + r.width - 140, y, 120, 36}, "Back")) routeView_ = 0;
@@ -317,7 +315,7 @@ void App::drawWorkoutsPage(Rectangle r) {
     if (editorOpen_) { drawWorkoutEditor(r); return; }
     float lw = std::min(640.f, r.width * 0.5f);
     Rectangle L{r.x, r.y, lw, r.height};
-    panel(L, CARD);
+    panel(L, ui::PANEL);
     float x = L.x + 18, y = L.y + 14, w = L.width - 36;
     text("Workouts", x, y, F::Title, TEXT);
     if (button({L.x + L.width - 150, y + 2, 132, 34}, "+ New")) {
@@ -354,15 +352,15 @@ void App::drawWorkoutsPage(Rectangle r) {
     Rectangle listR{x, y, w, L.y + L.height - y - 12};
     float rowH = 62;
     scrollUpdate(listR, wkScroll_, list.size() * (rowH + 6));
-    BeginScissorMode(int(listR.x), int(listR.y), int(listR.width), int(listR.height));
+    ui::beginScissor({listR.x, listR.y, listR.width, listR.height});
     char b[160];
     for (size_t i = 0; i < list.size(); ++i) {
         const auto* wp = list[i];
         Rectangle c{listR.x, listR.y + i * (rowH + 6) - wkScroll_, listR.width - 8, rowH};
         if (c.y + c.height < listR.y || c.y > listR.y + listR.height) continue;
         bool sel = wp->id == wkSelected_;
-        bool h = hovered(c) && CheckCollisionPointRec(GetMousePosition(), listR);
-        DrawRectangleRounded(c, 0.2f, 8, sel ? Color{15, 157, 88, 55} : h ? Color{238, 241, 245, 255} : CARD2);
+        bool h = hovered(c) && CheckCollisionPointRec(ui::mouseLogical(), listR);
+        DrawRectangleRounded(c, 0.2f, 8, sel ? ui::accentA(55) : h ? ui::HOVER : ui::PANEL2);
         if (sel) DrawRectangleRoundedLinesEx(c, 0.2f, 8, 1.4f, ACCENT);
         text(wp->name, c.x + 14, c.y + 8, F::Body, TEXT, 19);
         auto e = wp->estimate(prof_.ftp);
@@ -376,7 +374,7 @@ void App::drawWorkoutsPage(Rectangle r) {
 
     const wk::Workout* sel = findWorkout(wkSelected_);
     Rectangle R{L.x + L.width + 20, r.y, r.width - L.width - 20, r.height};
-    panel(R, CARD);
+    panel(R, ui::PANEL);
     if (!sel) return;
     x = R.x + 22; y = R.y + 18; w = R.width - 44;
     text(sel->name, x, y, F::Title, TEXT);
@@ -391,7 +389,7 @@ void App::drawWorkoutsPage(Rectangle r) {
     float tw = (w - 5 * 10) / 6;
     for (size_t i = 0; i < kv.size(); ++i) {
         Rectangle c{x + i * (tw + 10), y, tw, 62};
-        panel(c, CARD2);
+        panel(c, ui::PANEL2);
         text(kv[i].k, c.x + 10, c.y + 6, F::Small, DIM, 12);
         text(kv[i].v, c.x + 10, c.y + 24, F::Title, TEXT, 26);
     }
@@ -434,7 +432,7 @@ void App::drawWorkoutsPage(Rectangle r) {
 }
 
 void App::drawWorkoutEditor(Rectangle r) {
-    panel(r, CARD);
+    panel(r, ui::PANEL);
     float x = r.x + 22, y = r.y + 16, w = r.width - 44;
     text(editingId_.empty() ? "New workout" : "Edit workout", x, y, F::Title, TEXT);
     y += 50;

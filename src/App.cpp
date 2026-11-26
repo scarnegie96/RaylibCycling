@@ -4,6 +4,7 @@
 #include "Terrain.h"
 
 #include <algorithm>
+#include <filesystem>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -14,6 +15,7 @@
 #include <thread>
 
 #include "Audio.h"
+#include "Profiler.h"
 #include "Net.h"
 #include "core/Export.h"
 #include "core/Metrics.h"
@@ -82,6 +84,28 @@ void App::loadData() {
     refreshHistory();
 }
 
+#ifdef CORERAY_DOCK_ICON
+extern "C" bool coreray_set_dock_icon(const char* pngPath);
+#endif
+// the app icon: the Dock on macOS, the window / taskbar icon elsewhere
+static void setAppIcon() {
+    const std::string dir = GetApplicationDirectory();
+    for (const std::string& base : {dir + "assets/icon/", std::string("assets/icon/"), dir + "../Resources/assets/icon/"}) {
+#ifdef CORERAY_DOCK_ICON
+        if (FileExists((base + "coreray-1024.png").c_str()) && coreray_set_dock_icon((base + "coreray-1024.png").c_str())) return;
+#else
+        if (!FileExists((base + "coreray-256.png").c_str())) continue;
+        Image icon = LoadImage((base + "coreray-256.png").c_str());
+        if (icon.data) {
+            ImageFormat(&icon, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+            SetWindowIcon(icon);
+            UnloadImage(icon);
+            return;
+        }
+#endif
+    }
+}
+
 void App::refreshHistory() {
     rides_ = db_.rideSummaries();
     stats_ = computeStats(rides_, prof_.weightKg, db_.ftpHistory(), Date::today());
@@ -89,14 +113,17 @@ void App::refreshHistory() {
 
 void App::showRoute(const Route& r, bool force) {
     worldRoute_ = r;
-    if (screen_ != Screen::Ride) return;  // the 3D world only exists while riding
+    if (screen_ != Screen::Ride && screen_ != Screen::Explore) return;  // the 3D world only exists while riding (or exploring)
     std::string key = r.id + ":" + std::to_string(r.points.size()) + ":" + std::to_string(int(r.distance())) + ":" + (r.isLoop ? "L" : "P");
     if (!force && key == worldRouteKey_ && course_) return;
     worldRouteKey_ = key;
     auto c = std::make_shared<Course>();
-    // a new world every ride (the road is the route's; the land around it is fresh)
-    uint32_t seed = worldSeed_ ? worldSeed_ : uint32_t(std::random_device{}());
-    c->build(r, seed);
+    if (map_ && r.id.rfind("map-", 0) == 0 && !mapPath_.empty()) c->buildWorld(r, map_, mapPath_, !roam_.on);   // a loop (or a roam) on the generated map
+    else {
+        // a new world every ride (the road is the route's; the land around it is fresh)
+        uint32_t seed = worldSeed_ ? worldSeed_ : uint32_t(std::random_device{}());
+        c->build(r, seed);
+    }
     course_ = c;
     renderer_.setCourse(c);
     renderer_.preload(screen_ == Screen::Ride ? 0.0 : homeDist_);
@@ -139,8 +166,8 @@ void App::reassessFtp(const std::optional<std::string>& trigger, bool allowAuto)
 // ------------------------------------------------------------------ run
 int App::run(int argc, char** argv) {
     std::string shotPath, dbPath = Db::defaultPath();
-    int shotFrames = 90, forceCam = -1, forcePage = -1, sectorAt = -1;
-    bool autoRide = false, force2d = false, autoSummary = false, demoHistory = false, openDetail = false, openDrawer = false;
+    int shotFrames = 90, forceCam = -1, forcePage = -1, sectorAt = -1, strikeAt = -1;
+    bool autoRide = false, autoExplore = false, force2d = false, autoSummary = false, demoHistory = false, openDetail = false, openDrawer = false;
     double forceHour = -1, skipAhead = 0;
     std::string forceKind, forceWeather, forceRoute;
     store::load(prof_, prefs_);
@@ -166,9 +193,16 @@ int App::run(int argc, char** argv) {
         else if (a == "--detail") openDetail = true;
         else if (a == "--drawer") openDrawer = true;
         else if (a == "--sector-at") sectorAt = std::atoi(next().c_str());
+        else if (a == "--strike-at") strikeAt = std::atoi(next().c_str());   // dev: lightning on that frame
         else if (a == "--ahead") skipAhead = std::atof(next().c_str());
         else if (a == "--nohud") hudHidden_ = true;
+        else if (a == "--perf") { prefs_.showFps = prefs_.showPerf = true; }
         else if (a == "--ptab") profileTab_ = std::atoi(next().c_str());
+        else if (a == "--world") { prefs_.scenery = 1; prefs_.mapSeed = std::max(1, std::atoi(next().c_str())); }   // ride a generated map
+        else if (a == "--explore") { autoExplore = true; prefs_.mapSeed = std::max(1, std::atoi(next().c_str())); }   // fly over a generated map
+        else if (a == "--map-km") prefs_.mapSizeKm = std::atoi(next().c_str());
+        else if (a == "--map-climate") prefs_.mapClimate = std::atoi(next().c_str());
+        else if (a == "--free-world") prefs_.freeWorld = 1;   // free rides on the generated map (pick the start on the Ride page)
     }
     if (forceKind == "route") setupKind_ = RideKind::Route;
     else if (forceKind == "workout") setupKind_ = RideKind::Workout;
@@ -182,6 +216,22 @@ int App::run(int argc, char** argv) {
 
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_HIGHDPI | FLAG_VSYNC_HINT | FLAG_MSAA_4X_HINT);
     InitWindow(1600, 900, "CoreRay");
+    setAppIcon();
+    for (const std::string& base : {std::string(GetApplicationDirectory()) + "assets/ui/", std::string("assets/ui/"), std::string(GetApplicationDirectory()) + "../Resources/assets/ui/"})
+        if (FileExists((base + "settings-cog-64.png").c_str())) {
+            {   // white glyph + alpha, so the HUD can tint it any ink (light or dark glass)
+                Image im = LoadImage((base + "settings-cog-64.png").c_str());
+                ImageFormat(&im, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+                ImageColorReplace(&im, Color{0, 0, 0, 0}, Color{255, 255, 255, 0});
+                auto* px = static_cast<Color*>(im.data);
+                for (int i = 0; i < im.width * im.height; ++i) px[i] = Color{255, 255, 255, px[i].a};
+                cogTex_ = LoadTextureFromImage(im);
+                UnloadImage(im);
+            }
+            GenTextureMipmaps(&cogTex_);
+            SetTextureFilter(cogTex_, TEXTURE_FILTER_TRILINEAR);
+            break;
+        }
     SetWindowMinSize(1180, 700);
     SetExitKey(KEY_NULL);
     ui::loadFonts();
@@ -245,6 +295,7 @@ int App::run(int argc, char** argv) {
     stravaId_.text = db_.meta("strava_client_id").value_or("");
     placeBox_.text = prefs_.place;
 
+    renderer_.setRenderScale(renderScaleOf(prefs_.renderScale));
     renderer_.init(prefs_.quality);
     wx_ = weather::Sim(uint32_t(std::time(nullptr) / 3600), false);
     if (prefs_.weatherMode == 1) fetchLiveWeather();
@@ -258,9 +309,11 @@ int App::run(int argc, char** argv) {
     if (wx_.state.rain > 0.3) wx_.wet = 0.9;
     if (wx_.state.snow > 0.3) wx_.snowCover = 0.9;
 
-    ble_.setAutoConnect(prefs_.trainerId, prefs_.hrId);
+    ble_.setAutoConnect(prefs_.trainerId, prefs_.hrId, prefs_.shifterId);
     ble_.startScan(45);
+    if (prefs_.scenery == 1 || prefs_.freeWorld >= 1) requestMap();
     if (autoRide) startRide();
+    if (autoExplore) startExplore();
     if (eng_ && skipAhead < 0 && course_) {
         // dev: "--ahead -N" = just before the N-th river bridge on the route
         int want = int(-skipAhead), seen = 0;
@@ -277,9 +330,24 @@ int App::run(int argc, char** argv) {
     if (eng_ && skipAhead > 0) {
         // fast-forward the ride (screenshots of later parts of a route)
         TrainerInput in{300, 90, 140.0, true};
-        while (eng_->distance() < skipAhead) { eng_->tick(0.5, in); extendEndless(); }
+        while (eng_->distance() < skipAhead) { eng_->tick(0.5, in); extendEndless(); roamUpdate(); }
         if (endlessRide_) showRoute(eng_->route(), true);
         renderer_.preload(eng_->distance());
+    }
+    if (eng_ && course_ && roam_.on && std::getenv("CORERAY_JUNCTION")) {
+        // dev: ride on to N m before the next junction (with a choice) and pick option K: "N[,K]"
+        double before = 700, after = 0; int pick = -1;
+        std::sscanf(std::getenv("CORERAY_JUNCTION"), "%lf,%d,%lf", &before, &pick, &after);
+        TrainerInput in{300, 90, 140.0, true};
+        for (int guard = 0; guard < 200000; ++guard) {
+            roamUpdate();
+            if (roam_.opts.size() > 1 && course_->length() - eng_->distance() < before) break;
+            eng_->tick(0.5, in);
+        }
+        if (pick >= 0 && pick < int(roam_.opts.size())) roam_.sel = pick;
+        for (double end = eng_->distance() + after; eng_->distance() < end;) { eng_->tick(0.5, in); roamUpdate(); }
+        renderer_.preload(eng_->distance());
+        std::printf("[dev] junction %.0f m ahead, %zu ways\n", course_->length() - eng_->distance(), roam_.opts.size());
     }
     if (eng_ && course_ && std::getenv("CORERAY_RELIEF")) {
         auto p = course_->at(eng_->distance());
@@ -324,27 +392,51 @@ int App::run(int argc, char** argv) {
             eng_->addSector(sp);
         }
         if (autoSummary && screen_ == Screen::Ride && frame == shotFrames - 3) endRide(true);
+        if (strikeAt >= 0 && frame == strikeAt && course_) {
+            auto st = renderer_.lightning(-1000.f);
+            if (!std::getenv("CORERAY_NOFLASH")) wx_.flash = 0.9;
+            sfx::thunder(st.dist / 343.f, std::clamp(1.25f - st.dist / 6500.f, 0.3f, 1.f), st.pan);
+        }
 
         BeginDrawing();
         ClearBackground(BG);
-        bool draw3d = screen_ == Screen::Ride && view3d_;
+        bool draw3d = (screen_ == Screen::Ride && view3d_) || screen_ == Screen::Explore;
+        const bool profiling = draw3d && course_ && prefs_.showPerf;
+        prof::setEnabled(profiling);
+        if (profiling) prof::beginFrame();
         if (draw3d && course_) renderer_.render(scene(), dt);
+        // appearance: the theme (the HUD glass can follow the sun) and the UI zoom for this screen
+        {
+            bool hudDark = prefs_.hudStyle == 2 || (prefs_.hudStyle == 0 && ui::themeIsDark(prefs_.theme)) ||
+                           (prefs_.hudStyle == 3 && sky_.sunElevation < -1.f);
+            ui::applyTheme(prefs_.theme, prefs_.accent, hudDark);
+        }
+        const bool hudScreen = screen_ == Screen::Ride || screen_ == Screen::Explore;
+        ui::pushScale(hudScreen ? ui::autoScale(1000, 640, prefs_.hudSize / 100.f) : ui::autoScale(1180, 740, prefs_.uiSize / 100.f));
         if (screen_ == Screen::Home) drawShell();
+        else if (screen_ == Screen::Explore) { drawExplore(); if (prefs_.showFps || prefs_.showPerf) drawPerf(); }
         else if (screen_ == Screen::Ride) {
+            // a window on top: the HUD beneath must not take its clicks
+            if (devicesModal_ || pauseMenu_) ui::setInputBlocked(true);
             if (!view3d_) drawDashboard2d();
-            else if (!hudHidden_) drawRideHud();
+            else if (!hudHidden_) { drawRideHud(); drawRoamChoices(); }
             if (drawerOpen_) drawEditDrawer();
             if (testPanel_ && simActive()) {
-                float W = float(GetScreenWidth());
+                float W = ui::screenW();
                 Rectangle r{W - 400, 140, 380, 470};
                 panel(r, PANEL);
                 drawSimPanel({r.x + 16, r.y + 12, r.width - 32, r.height - 24}, true);
-                if (CheckCollisionPointRec(GetMousePosition(), r)) ui::setInputBlocked(false);
+                if (CheckCollisionPointRec(ui::mouseLogical(), r)) ui::setInputBlocked(false);
             }
+            if (devicesModal_ || pauseMenu_) ui::setInputBlocked(false);
             if (pauseMenu_) drawPauseMenu();
+            else if (devicesModal_) drawDevicesModal();
             if (helpOpen_) drawHelp();
+            if (draw3d && (prefs_.showFps || prefs_.showPerf)) drawPerf();
         } else drawSummary();
         drawToasts();
+        ui::popScale();
+        if (profiling) { prof::mark(prof::Hud); prof::endFrame(); }
         EndDrawing();
 
         ++frame;
@@ -360,6 +452,8 @@ int App::run(int argc, char** argv) {
     prefs_.selRoute = selRoute_;
     store::save(prof_, prefs_);
     for (int i = 0; i < 50 && g_async.load() > 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    mapPreview_.release();
+    if (cogTex_.id) UnloadTexture(cogTex_);
     renderer_.shutdown();
     sfx::shutdown();
     ui::unloadFonts();
@@ -450,7 +544,15 @@ void App::startRide() {
     su.eventId = pendingEvent_;
     pendingEvent_.reset();
     endlessRide_ = false;
+    roam_ = Roam{};
+    rideMapStart_ = MapStart{};
     auto scenery = [&]() {
+        // free rides choose their own world on the Ride page; workouts / tests follow Settings
+        bool generated = setupKind_ == RideKind::Free ? prefs_.freeWorld >= 1 : prefs_.scenery == 1;
+        if (generated) {   // free roaming on the generated map: choose the way at junctions
+            Route mr;
+            if (roamStart(mr)) { su.route = mr; su.routeIsScenery = true; return; }
+        }
         if (sceneryEndless_ || !r->isLoop || setupKind_ == RideKind::Free) {
             // the endless road: a fresh seed, a few kilometres to start, then built ahead as you ride
             std::mt19937_64 rng(worldSeed_ ? worldSeed_ : std::random_device{}());
@@ -464,6 +566,15 @@ void App::startRide() {
     };
     switch (setupKind_) {
         case RideKind::Route:
+            if (prefs_.scenery == 1) {   // the generated map: a loop about the route's length
+                Route mr;
+                if (mapRoute(std::clamp(r->distance() / 1000.0, 10.0, 60.0), mr)) {
+                    su.route = mr;
+                    su.name = mr.name;
+                    su.laps = setupLaps_;
+                    break;
+                }
+            }
             su.route = *r;
             su.name = r->name;
             su.laps = r->isLoop ? setupLaps_ : 1;
@@ -497,7 +608,7 @@ void App::startRide() {
     rideStart_ = std::time(nullptr);
     screen_ = Screen::Ride;
     drawerOpen_ = pauseMenu_ = helpOpen_ = false;
-    crank_ = 0; lean_ = 0; stand_ = 0; tuck_ = 0;
+    crank_ = 0; lean_ = 0; stand_ = 0; tuck_ = 0; wheelAngle_ = 0; wheelDist_ = -1; lastGear_ = -1; devicesModal_ = false;
     flow_ = flowMean_ = flowVar_ = flowStreak_ = flowBest_ = 0;
     lastAlertT_ = -1e9; lastHrState_ = 0;
     routeSectorsSeen_ = 0;
@@ -515,6 +626,71 @@ void App::startRide() {
     toast(su.name, TEXT);
     if (ble_.trainer().state != LinkState::Connected && !simActive())
         toast("No trainer connected - Devices, or turn on the simulator", WARN);
+}
+
+wmap::Params App::mapParams() const {
+    wmap::Params p;
+    p.seed = uint32_t(std::max(1, prefs_.mapSeed));
+    p.size = 1024.f * std::clamp(prefs_.mapSizeKm, 5, 60);   // 20 -> 20.48 km: whole 20 m cells
+    p.climate = std::clamp(prefs_.mapClimate, 0, 3);
+    return p;
+}
+
+void App::requestMap() {
+    const wmap::Params P = mapParams();
+    std::string key = std::to_string(P.seed) + "_" + std::to_string(int(P.size / 1024)) + "km_c" + std::to_string(P.climate);
+    if (mapFuture_.valid() && mapFor_ == key) return;
+    mapFor_ = key;
+    mapReqAt_ = GetTime();
+    const uint32_t seed = P.seed;
+    std::filesystem::path dir = std::filesystem::path(Db::defaultPath()).parent_path() / "worlds";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    std::string path = (dir / ("map_" + key + "_v" + std::to_string(wmap::VERSION) + ".bin")).string();
+    mapFuture_ = std::async(std::launch::async, [P, path]() -> std::shared_ptr<const wmap::Map> {
+        auto m = std::make_shared<wmap::Map>();
+        if (m->load(path) && m->params.seed == P.seed && m->params.size == P.size && m->params.climate == P.climate) return m;
+        auto g = wmap::generate(P);
+        g->save(path);
+        std::fprintf(stderr, "[map] generated map %u (%.0f km): %d towns, %.0f km of road (%d tunnels, %d bridges), %d rivers, %d lakes\n", P.seed, P.size / 1024, g->stats.towns, g->stats.roadKm, g->stats.tunnels, g->stats.bridges, g->stats.rivers, g->stats.lakes);
+        return g;
+    }).share();
+}
+
+bool App::mapRoute(double km, Route& out) {
+    requestMap();
+    map_ = mapFuture_.get();
+    if (!map_ || map_->roads.empty()) return false;
+    std::mt19937 rng(worldSeed_ ? worldSeed_ : uint32_t(std::random_device{}()));
+    std::uniform_real_distribution<float> U(-0.3f, 0.3f);
+    std::string name;
+    float sx = U(rng) * map_->params.size, sz = U(rng) * map_->params.size;
+    if (const char* at = std::getenv("CORERAY_MAPSTART")) std::sscanf(at, "%f,%f", &sx, &sz);   // dev: start near here
+    mapPath_ = map_->loop(float(km), rng(), sx, sz, &name);
+    if (mapPath_.size() < 10) return false;
+    std::fprintf(stderr, "[map] %s: %.1f km from (%.0f, %.0f)\n", name.c_str(), km, mapPath_[0].x, mapPath_[0].z);
+    {   // where this ride begins (no single road: the loop is found again by position and heading)
+        rideMapStart_ = MapStart{};
+        rideMapStart_.set = true;
+        rideMapStart_.x = mapPath_[0].x;
+        rideMapStart_.z = mapPath_[0].z;
+        float hx = mapPath_[4].x - mapPath_[0].x, hz = mapPath_[4].z - mapPath_[0].z, hl = std::max(1e-3f, std::hypot(hx, hz));
+        rideMapStart_.hx = hx / hl;
+        rideMapStart_.hz = hz / hl;
+    }
+    out = Route{};
+    out.id = "map-" + std::to_string(map_->params.seed);
+    out.name = name;
+    out.isLoop = true;
+    out.source = RouteSource::Generated;
+    double d = 0;
+    for (size_t j = 0; j < mapPath_.size(); ++j) {
+        if (j) d += std::hypot(double(mapPath_[j].x - mapPath_[j - 1].x), double(mapPath_[j].z - mapPath_[j - 1].z));
+        out.points.push_back({d, double(mapPath_[j].y)});
+    }
+    d += std::hypot(double(mapPath_.front().x - mapPath_.back().x), double(mapPath_.front().z - mapPath_.back().z));
+    out.points.push_back({d, double(mapPath_.front().y)});
+    return true;
 }
 
 void App::endRide(bool save) {
@@ -571,8 +747,9 @@ void App::stravaUpload(const std::string& rideId, bool quiet) {
         auto act = strava::upload(db_, copy, err, [this, rideId](const std::string& st) { onMain([this, rideId, st] { uploadState_[rideId] = st; }); });
         onMain([this, rideId, act, err, copy]() mutable {
             if (act) {
-                copy.summary.stravaActivityId = act;
-                db_.updateSummary(copy.summary);
+                // re-read: the ride may have been renamed / annotated while the upload ran
+                if (auto cur = db_.ride(rideId)) { cur->summary.stravaActivityId = act; db_.updateSummary(cur->summary); }
+                else { copy.summary.stravaActivityId = act; db_.updateSummary(copy.summary); }
                 uploadState_[rideId] = "done";
                 if (detail_ && detail_->summary.id == rideId) detail_->summary.stravaActivityId = act;
                 if (summaryRec_ && summaryRec_->summary.id == rideId) summaryRec_->summary.stravaActivityId = act;
@@ -700,10 +877,42 @@ void App::updateWorld(float dt, double dist) {
     wxElapsed_ += dt;
     auto ev = wx_.update(dt, wxElapsed_, snowiness, sun.elevation > 0);
     if (ev.lightning) {
-        renderer_.lightning(float(GetRandomValue(0, 628)) / 100.f);
-        sfx::thunder(float(ev.thunderIn), float(ev.strength));
+        // thunder from where the strike is: sound takes ~3 s per km, and closer is louder
+        auto st = renderer_.lightning(float(GetRandomValue(0, 628)) / 100.f);
+        float loud = std::clamp(1.25f - st.dist / 6500.f, 0.3f, 1.f);
+        sfx::thunder(st.dist / 343.f, float(ev.strength) * loud, st.pan);
     }
     if (ev.changed && dt > 0) toast(std::string("Weather: ") + weather::kindLabel(*ev.changed), SKY);
+    // ---- temperature and wind for the weather card (live: as reported)
+    {
+        std::time_t now = std::time(nullptr);
+        std::tm lt{};
+#ifdef _WIN32
+        localtime_s(&lt, &now);
+#else
+        localtime_r(&now, &lt);
+#endif
+        double season = weather::seasonalMean(prefs_.lat, lt.tm_yday + 1);
+        double eleForTemp = eleReal;
+        // on a generated map its own climate decides (deserts warm, cold maps cold): the map's
+        // mean annual temperature at the rider, shifted by the season at home
+        if (map_ && course_ && course_->world() && worldRoute_.id.rfind("map-", 0) == 0) {
+            auto rp = course_->at(dist);
+            double annualHome = 30.0 - 0.38 * std::fabs(prefs_.lat);
+            season = map_->sample(rp.pos.x, rp.pos.z).temp + (season - annualHome);
+            eleForTemp = 0;   // the map's temperature is already for that height
+        }
+        wxSeasonC_ = season;
+        wxEleForTemp_ = eleForTemp;
+        wxSunEle_ = sun.elevation;
+        if (wx_.mode == weather::Mode::Live && live_) { wxTempC_ = live_->temperatureC; wxWindKmh_ = live_->windKmh; }
+        else {
+            double target = weather::temperature(season, sun.elevation, wx_.currentKind(wxElapsed_), eleForTemp);
+            wxTempC_ += (target - wxTempC_) * std::min(1.0, double(dt) / 90.0);   // the air warms and cools gradually
+            if (dt <= 0 || wxElapsed_ < 3 || std::fabs(target - wxTempC_) > 15) wxTempC_ = target;   // start of a ride: no easing in from nowhere
+            wxWindKmh_ = 4 + 46 * wx_.state.wind + 18 * wx_.gust;
+        }
+    }
     const auto& s = wx_.state;
     fx_.cloud = float(s.cloud); fx_.dark = float(s.dark); fx_.rain = float(s.rain); fx_.snow = float(s.snow);
     fx_.fog = float(s.fog); fx_.wind = float(s.wind); fx_.storm = float(s.storm); fx_.hail = float(s.hail);
@@ -713,11 +922,16 @@ void App::updateWorld(float dt, double dist) {
     // ---- ambience
     sfx::Ambience a;
     float night = std::clamp((sky_.tod - 0.7f) / 0.25f, 0.f, 1.f);
-    a.rain = fx_.rain;
-    a.hail = fx_.hail;
+    // rain and hail are heard where they fall: on you when a shower is overhead, off to one
+    // side when it's nearby (the renderer knows where the rain cells are; last frame's view)
+    auto ps = renderer_.precipSound();
+    a.rain = ps.rain;
+    a.hail = ps.hail;
+    a.rainFarL = ps.farL;
+    a.rainFarR = ps.farR;
     a.wind = 0.12f + fx_.wind * 0.7f + fx_.gust * 0.3f;
-    a.birds = prefs_.wildlife ? (1 - night) * (1 - fx_.rain) * (1 - fx_.snow) * (sky_.sunElevation > -2 ? 1.f : 0.f) : 0.f;
-    a.crickets = night * (1 - fx_.rain) * (1 - fx_.snow) * (1 - fx_.snowCover);
+    a.birds = prefs_.wildlife ? (1 - night) * (1 - ps.rain) * (1 - fx_.snow) * (sky_.sunElevation > -2 ? 1.f : 0.f) : 0.f;
+    a.crickets = night * (1 - ps.rain) * (1 - fx_.snow) * (1 - fx_.snowCover);
     sfx::ambience(a);
 }
 
@@ -728,11 +942,22 @@ SceneState App::scene() {
     s.wx = fx_;
     s.wildlife = prefs_.wildlife;
     s.lanterns = prefs_.lanterns;
+    if (screen_ == Screen::Explore) {
+        s.freeCam = true;
+        s.hideRider = true;
+        s.camPos = exPos_;
+        s.camTarget = Vector3Add(exPos_, {std::sin(exYaw_) * std::cos(exPitch_), std::sin(exPitch_), std::cos(exYaw_) * std::cos(exPitch_)});
+        s.fov = 62;
+        s.dist = exDist_;
+        s.speed = 0;
+        s.cam = CamMode::Chase;
+        return s;
+    }
     if (screen_ == Screen::Ride && eng_) {
         s.dist = eng_->distance();
         s.speed = eng_->speedMps();
         s.crankAngle = crank_;
-        s.wheelAngle = eng_->distance() / 0.335;
+        s.wheelAngle = wheelAngle_;
         s.effort = float(std::clamp(eng_->power3s() / std::max(1.0, prof_.ftp), 0.0, 1.5));
         s.cam = cam_;
         if (auto g = eng_->ghostDistance()) s.pacerDist = *g;
@@ -742,8 +967,8 @@ SceneState App::scene() {
     } else {
         s.dist = homeDist_;
         s.speed = 9;
-        s.crankAngle = animTime_ * 9.0;
-        s.wheelAngle = homeDist_ / 0.335;
+        s.crankAngle = std::fmod(animTime_ * 9.0, 2 * PI);
+        s.wheelAngle = std::fmod(homeDist_ / WHEEL_ROLL_R, 2 * PI);
         s.effort = 0.4f;
         s.cam = CamMode::Cinematic;
     }
@@ -756,17 +981,49 @@ void App::frameUpdate(float dt) {
     Link t = ble_.trainer(), h = ble_.hrm();
     if (t.state == LinkState::Connected && t.id != prefs_.trainerId) {
         prefs_.trainerId = t.id; prefs_.trainerName = t.name;
-        ble_.setAutoConnect(prefs_.trainerId, prefs_.hrId);
+        ble_.setAutoConnect(prefs_.trainerId, prefs_.hrId, prefs_.shifterId);
         store::save(prof_, prefs_);
         toast("Trainer connected: " + t.name, GOOD);
     }
     if (h.state == LinkState::Connected && h.id != prefs_.hrId) {
         prefs_.hrId = h.id; prefs_.hrName = h.name;
-        ble_.setAutoConnect(prefs_.trainerId, prefs_.hrId);
+        ble_.setAutoConnect(prefs_.trainerId, prefs_.hrId, prefs_.shifterId);
         store::save(prof_, prefs_);
         toast("Heart rate connected: " + h.name, GOOD);
     }
+    // Zwift shifter: remember it, and turn its presses into virtual gear changes
+    Link sh = ble_.shifter();
+    if (sh.state == LinkState::Connected && sh.id != prefs_.shifterId) {
+        prefs_.shifterId = sh.id; prefs_.shifterName = sh.name;
+        ble_.setAutoConnect(prefs_.trainerId, prefs_.hrId, prefs_.shifterId);
+        if (!prof_.virtualShifting) { prof_.virtualShifting = true; if (eng_) eng_->setVirtualShifting(true); }
+        store::save(prof_, prefs_);
+        toast("Shifter connected: " + sh.name + " - virtual shifting is on", GOOD);
+    }
+    if (int presses = ble_.takeShifts()) {
+        if (screen_ == Screen::Ride && eng_) {
+            if (!eng_->virtualShifting()) {   // a press is a clear wish to shift
+                prof_.virtualShifting = true;
+                eng_->setVirtualShifting(true);
+                store::save(prof_, prefs_);
+                toast("Virtual shifting on", TEXT);
+            }
+            eng_->shift(presses);
+        }
+    }
+    // a tick for every gear change, whatever made it (shifter, keys, buttons)
+    if (screen_ == Screen::Ride && eng_ && eng_->virtualShifting()) {
+        int g = eng_->gear();
+        if (lastGear_ > 0 && g != lastGear_) sfx::play(g > lastGear_ ? sfx::GearUp : sfx::GearDown);
+        lastGear_ = g;
+    } else lastGear_ = -1;
+    renderer_.setViewScale(screen_ == Screen::Explore ? exViewScale_ : 1.f);
     // world keys (everywhere except while typing)
+    if (screen_ == Screen::Explore) {   // explore mode has its own keys (W is forward there)
+        exploreFrame(dt);
+        updateWorld(dt, exDist_);
+        return;
+    }
     if (!anyTextActive() && screen_ != Screen::Summary) {
         if (IsKeyPressed(KEY_W)) cycleWeather();
         if (IsKeyPressed(KEY_T)) cycleTime();
@@ -797,6 +1054,7 @@ void App::frameUpdate(float dt) {
     updateWorld(dt, eng_->distance());
 
     extendEndless();
+    roamUpdate();
     // road edited or extended: re-lay the 3D road
     {
         const Route& r = eng_->route();
@@ -819,10 +1077,23 @@ void App::frameUpdate(float dt) {
 
     // rider animation from real effort
     double cad = eng_->cadence();
-    if (cad > 5) crank_ += cad / 60.0 * 2 * PI * dt;
+    if (cad > 5) crank_ = std::fmod(crank_ + cad / 60.0 * 2 * PI * dt, 2 * PI);
     else {
         double target = std::round((crank_ - PI / 2) / PI) * PI + PI / 2;
         crank_ += (target - crank_) * std::min(1.0, double(dt) * 3);
+    }
+    // Wheels roll exactly with the ground: the rider is drawn 1.4 m right of the course line,
+    // and that lane is longer/shorter on bends by (1 + offset * dHeading/ds) (see riderBase).
+    {
+        double d = eng_->distance();
+        double dd = wheelDist_ < 0 ? 0 : d - wheelDist_;
+        wheelDist_ = d;
+        if (std::fabs(dd) < 100 && course_) {
+            double h0 = course_->at(std::max(0.0, d - 2)).heading, h1 = course_->at(d + 2).heading;
+            double dh = std::remainder(h1 - h0, 2 * PI) / 4.0;  // rad per metre
+            double lane = std::clamp(1.0 + 1.4 * dh, 0.5, 1.5);
+            wheelAngle_ = std::fmod(wheelAngle_ + dd * lane / WHEEL_ROLL_R, 2 * PI);
+        }
     }
     double g = eng_->gradePct(), p3 = eng_->power3s(), ftp = std::max(prof_.ftp, 50.0);
     double v = eng_->speedMps();
@@ -888,7 +1159,8 @@ void App::handleRideKeys(float dt) {
     bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
     bool alt = IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT);
     if (IsKeyPressed(KEY_ESCAPE)) {
-        if (helpOpen_) helpOpen_ = false;
+        if (devicesModal_) devicesModal_ = false;
+        else if (helpOpen_) helpOpen_ = false;
         else if (drawerOpen_) drawerOpen_ = false;
         else { pauseMenu_ = !pauseMenu_; if (pauseMenu_) eng_->pause(); }
     }
@@ -904,7 +1176,10 @@ void App::handleRideKeys(float dt) {
         else toast("Test data needs the simulator (Devices)", WARN);
     }
     if (IsKeyPressed(KEY_V)) view3d_ = !view3d_;
+    if (IsKeyPressed(KEY_B)) { renderer_.setGreyboxRider(!renderer_.greyboxRider()); toast(renderer_.greyboxRider() ? "Rider: greybox body" : "Rider: kitted"); }
     if (IsKeyPressed(KEY_TAB)) hudHidden_ = !hudHidden_;
+    if (IsKeyPressed(KEY_F)) { prefs_.showFps = !prefs_.showFps; store::save(prof_, prefs_); }
+    if (IsKeyPressed(KEY_P)) { prefs_.showPerf = !prefs_.showPerf; store::save(prof_, prefs_); }
     if (IsKeyPressed(KEY_SLASH) || IsKeyPressed(KEY_F1)) helpOpen_ = !helpOpen_;
     if (IsKeyPressed(KEY_C)) { cam_ = CamMode((int(cam_) + 1) % int(CamMode::COUNT)); toast(std::string("Camera: ") + camModeName(cam_)); }
     if (IsKeyPressed(KEY_LEFT_BRACKET) || IsKeyPressed(KEY_PAGE_DOWN)) eng_->shift(-1);
@@ -940,7 +1215,7 @@ void App::handleRideKeys(float dt) {
 
 // ------------------------------------------------------------------ toasts
 void App::drawToasts() {
-    const float W = float(GetScreenWidth());
+    const float W = ui::screenW();
     double now = GetTime();
     while (!toasts_.empty() && now - toasts_.front().t > 4.0) toasts_.pop_front();
     float y = screen_ == Screen::Ride ? (eng_ && eng_->structured() ? 130.f : 26.f) : 24.f;
@@ -949,9 +1224,10 @@ void App::drawToasts() {
         Vector2 m = measure(t.text, F::Body);
         Rectangle r{(W - m.x - 52) / 2 + (screen_ == Screen::Home ? 106 : 0), y, m.x + 52, 42};
         DrawRectangleRounded({r.x, r.y + 6, r.width, r.height}, 1.f, 12, Color{31, 36, 48, (unsigned char)(22 * a)});
-        DrawRectangleRounded(r, 1.f, 12, Color{255, 255, 255, (unsigned char)(235 * a)});
+        const bool hud = screen_ == Screen::Ride || screen_ == Screen::Explore;
+        DrawRectangleRounded(r, 1.f, 12, ui::withAlpha(hud ? ui::HUD_GLASS : ui::PANEL, (unsigned char)(235 * a)));
         DrawCircle(int(r.x + 18), int(r.y + 21), 4, Color{t.c.r, t.c.g, t.c.b, (unsigned char)(255 * a)});
-        text(t.text, r.x + 32, r.y + (42 - m.y) / 2, F::Body, Color{31, 36, 48, (unsigned char)(255 * a)});
+        text(t.text, r.x + 32, r.y + (42 - m.y) / 2, F::Body, ui::withAlpha(hud ? ui::HUD_INK : ui::TEXT, (unsigned char)(255 * a)));
         y += 48;
     }
 }

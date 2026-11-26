@@ -10,7 +10,47 @@
 
 namespace ui {
 
-extern const Color BG, PANEL, PANEL2, PANEL_HI, LINE, TEXT, DIM, FAINT, ACCENT, GOOD, WARN, BAD, HR_RED, SKY, GHOST, INK;
+// The palette is set by applyTheme(); everything reads these.
+extern Color BG, PANEL, PANEL2, PANEL_HI, LINE, TEXT, DIM, FAINT, ACCENT, GOOD, WARN, BAD, HR_RED, SKY, GHOST, INK;
+extern Color HOVER, SIDEBAR;
+// the 3D ride HUD: frosted glass cards with ink on them
+extern Color HUD_INK, HUD_MUTED, HUD_GLASS, HUD_INV;
+
+// ---- themes
+enum class Theme { Light, Dark, Midnight, Sand };
+enum class HudStyle { MatchTheme, Light, Dark, DayNight };
+extern const char* const THEME_NAMES[4];
+extern const char* const ACCENT_NAMES[6];
+extern const Color ACCENTS[6];
+extern const char* const HUD_STYLE_NAMES[4];
+// theme + accent; hudDark picks the ride HUD's glass
+void applyTheme(int theme, int accent, bool hudDark);
+bool themeIsDark(int theme);
+bool themeIsDark();
+bool hudIsDark();
+// ink over the current background at alpha a (dark ink on light themes, light ink on dark)
+Color ink(unsigned char a);
+Color hudInk(unsigned char a);
+Color shadow(unsigned char a);  // always dark
+Color accentA(unsigned char a);
+Color accentDeep();             // pressed / hover accent
+Color withAlpha(Color c, unsigned char a);
+Color hudPick(Color onLight, Color onDark);  // a tint that reads on the current HUD glass
+
+// ---- scaling. The UI is laid out in logical pixels; pushScale() draws it bigger. Inside,
+// screenW()/screenH() are the logical screen and the mouse is in logical pixels too.
+void pushScale(float s);
+void popScale();
+float scale();
+// for input handled outside the scaled drawing (frameUpdate): last frame's scale, logical mouse / screen
+float lastScale();
+Vector2 mouseLogical();
+void reapplyScale();  // after EndTextureMode / EndMode3D, which reset the modelview
+float screenW();
+float screenH();
+void beginScissor(Rectangle r);  // logical rect
+// suggested scale for a window: 1 at 1440x900 points, up to 2.2 on big screens
+float autoScale(float minLogicalW, float minLogicalH, float user);
 
 void loadFonts();
 void unloadFonts();
