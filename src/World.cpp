@@ -1068,6 +1068,7 @@ void Renderer::drawGrass(const SceneState& s) {
         float d = Vector3Length(v);
         if (d - GT > R) continue;
         if (d > GT * 1.5f && Vector3DotProduct(v, camF) / d < cosLimit - GT / d) continue;
+        if (!seenThroughTunnel(t.center, GT)) continue;
         g.insert(g.end(), t.grass.begin(), t.grass.end());
         f.insert(f.end(), t.flowers.begin(), t.flowers.end());
     }
@@ -1126,17 +1127,39 @@ void Renderer::drawWorld(bool sp, int cascade, const Vector3& focus, float radiu
             pd[np * 4] = std::sin(P.heading); pd[np * 4 + 1] = 0; pd[np * 4 + 2] = std::cos(P.heading); pd[np * 4 + 3] = 6.55f;
             ++np;
         }
-        setI(terrainSh_, "numPortals", np);
-        int l1 = GetShaderLocation(terrainSh_, "portalPos"), l2 = GetShaderLocation(terrainSh_, "portalDir");
-        if (np > 0 && l1 >= 0) SetShaderValueV(terrainSh_, l1, pp, SHADER_UNIFORM_VEC4, np);
-        if (np > 0 && l2 >= 0) SetShaderValueV(terrainSh_, l2, pd, SHADER_UNIFORM_VEC4, np);
+        setI(terrainCutSh_, "numPortals", np);
+        int l1 = GetShaderLocation(terrainCutSh_, "portalPos"), l2 = GetShaderLocation(terrainCutSh_, "portalDir");
+        if (np > 0 && l1 >= 0) SetShaderValueV(terrainCutSh_, l1, pp, SHADER_UNIFORM_VEC4, np);
+        if (np > 0 && l2 >= 0) SetShaderValueV(terrainCutSh_, l2, pd, SHADER_UNIFORM_VEC4, np);
     }
-    for (auto& [k, c] : chunks_)
-        if (c.mesh.vaoId && visible(c.center, c.radius)) {
-            DrawMesh(c.mesh, sp ? depthMat_ : terrainMat_, MatrixIdentity());
+    // Terrain chunks, nearest first (so nearer hills hide farther ones before they're shaded),
+    // each with the cheapest shader that does: the portal cutter only where a tunnel mouth is in
+    // the chunk, the far variant from LOD 2 (~1.7 km) out. Inside a tunnel only what shows
+    // through its mouths is drawn.
+    {
+        static const bool oneShader = std::getenv("CORERAY_ONETERRAINSHADER") != nullptr;   // dev: A/B
+        static std::vector<std::pair<float, Chunk*>> order;
+        order.clear();
+        for (auto& [k, c] : chunks_) {
+            if (!c.mesh.vaoId || !visible(c.center, c.radius)) continue;
+            if (!sp && !seenThroughTunnel(c.center, c.radius)) continue;
+            order.push_back({Vector3Distance(c.center, cam_.position), &c});
+        }
+        if (!sp) std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (auto& [d, cp] : order) {
+            const Chunk& c = *cp;
+            Material* m = &depthMat_;
+            if (!sp) {
+                bool cut = false;
+                for (const auto& P : portals_)
+                    if (P.p.x > c.cx * CS - 30.f && P.p.x < (c.cx + 1) * CS + 30.f && P.p.z > c.cz * CS - 30.f && P.p.z < (c.cz + 1) * CS + 30.f) { cut = true; break; }
+                m = (cut || oneShader) ? &terrainCutMat_ : c.lod >= 2 ? &terrainFarMat_ : &terrainMat_;   // oneShader: the old single (cutting) shader
+            }
+            DrawMesh(c.mesh, *m, MatrixIdentity());
             tris_ += c.mesh.triangleCount;
         }
-    if (!sp && std::getenv("CORERAY_COUNT")) { static int f2 = 0; if (++f2 % 20 == 0) { int n = 0; for (auto& [k, c] : chunks_) if (c.mesh.vaoId && visible(c.center, c.radius)) ++n; std::fprintf(stderr, "[count] terrain chunks %d tris %d\n", n, tris_); } }
+    }
+    if (!sp && std::getenv("CORERAY_COUNT")) { static int f2 = 0; if (++f2 % 20 == 0) { int n = 0; for (auto& [k, c] : chunks_) if (c.mesh.vaoId && visible(c.center, c.radius) && seenThroughTunnel(c.center, c.radius)) ++n; std::fprintf(stderr, "[count] terrain chunks %d tris %d\n", n, tris_); } }
     if (!sp) prof::mark(prof::Terrain);
     if (!sp)
         for (auto& c : road_)
@@ -1175,6 +1198,7 @@ void Renderer::drawWorld(bool sp, int cascade, const Vector3& focus, float radiu
                 float dx = c.center.x - cam_.position.x, dz = c.center.z - cam_.position.z;
                 if (std::sqrt(dx * dx + dz * dz) - CS * 0.71f > maxD) continue;
                 if (!visible(c.center, c.radius + th)) continue;
+                if (!seenThroughTunnel(c.center, c.radius + th)) continue;
             }
             const auto& pos = c.vegPos[set];
             for (size_t i = 0; i < pos.size(); ++i) {

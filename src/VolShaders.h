@@ -364,7 +364,9 @@ vec3 lampScatter(vec3 p, vec3 rd) {
 
 vec4 marchFog(vec3 ro, vec3 rd, float tScene, float jitter) {
     float tEnd = min(tScene, fogRange);
-    int n = int(fogSteps);
+    // steps for the distance actually marched (the samples are spaced quadratically): a ray that
+    // hits a wall 40 m away (a tunnel, a cutting, the rider) doesn't need the full count
+    int n = int(clamp(ceil(fogSteps * sqrt(tEnd / fogRange)), 6.0, fogSteps));
     vec3 scat = vec3(0.0);
     float T = 1.0;
     float cosL = dot(rd, lightDirF);
@@ -380,7 +382,9 @@ vec4 marchFog(vec3 ro, vec3 rd, float tScene, float jitter) {
         float sig = fogDensity(p);
         if (sig < 1e-6) continue;
         vec2 tun = tunnelAirAt(p);
-        vec3 Li = (lightColF * ph * sunVis(p) * cloudShadowAt(p) + amb) * tun.x + tunnelLampCol * 0.02 * tun.y;
+        // no daylight in here (deep in a tunnel): skip the shadow-map and cloud lookups
+        vec3 day = tun.x > 0.002 ? (lightColF * ph * sunVis(p) * cloudShadowAt(p) + amb) * tun.x : vec3(0.0);
+        vec3 Li = day + tunnelLampCol * 0.02 * tun.y;
         Li += lampScatter(p, rd);
         if (boltI > 0.001) { float bd = length(p - boltPos); Li += vec3(0.78, 0.82, 1.0) * boltI * 1.2 * exp(-bd / 900.0); }
         vec3 S = Li * sig;

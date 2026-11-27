@@ -3,9 +3,15 @@
 // km posts, start / finish arches and the night-time lanterns.
 #include <algorithm>
 #include <cmath>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <map>
 
 #include "RenderUtil.h"
 #include "Renderer.h"
+#include "world/WorldMap.h"
+#include "Profiler.h"
 #include "Terrain.h"
 #include "Ui.h"
 
@@ -21,7 +27,8 @@ const float VEG_DIST[3] = {1400.f, 2200.f, 3200.f};
 const float VEG_SPACING[3] = {12.f, 9.f, 7.f};
 constexpr float LANTERN_SPACING = 100.f;  // a lamp every 100 m, alternating sides
 
-int lodFor(float d) { return d < 700 ? 0 : d < 1700 ? 1 : d < 3600 ? 2 : 3; }
+// (far views: the near levels stay where they are, the trees' level reaches further)
+int lodFor(float d, float vs = 1.f) { return d < 700 ? 0 : d < 1700 ? 1 : d < 3600 * vs ? 2 : 3; }
 float boxDist(int cx, int cz, Vector3 f) {
     float x0 = cx * CS, z0 = cz * CS;
     float dx = std::max({x0 - f.x, 0.f, f.x - (x0 + CS)}), dz = std::max({z0 - f.z, 0.f, f.z - (z0 + CS)});
@@ -31,12 +38,12 @@ float boxDist(int cx, int cz, Vector3 f) {
 
 struct Renderer::ChunkData {
     int cx = 0, cz = 0, lod = 0, version = 0, world = 0;
-    MeshBuilder mb, water;
+    MeshBuilder mb, water, roads;
     Vector3 center{};
     float radius = 0;
     bool hasVeg = false, fine = false;
-    std::vector<Matrix> veg[trees::TYPES + 1];
-    std::vector<Vector3> vegPos[trees::TYPES + 1];
+    std::vector<Matrix> veg[VEG_SETS];
+    std::vector<Vector3> vegPos[VEG_SETS];
     std::vector<float> hgrid, rgrid, wgrid;
     int gridQ = 0;
 };
@@ -103,6 +110,7 @@ Renderer::ChunkData Renderer::buildChunk(const Job& j, int quality) {
     // near chunks get the particle-eroded surface (the erosion tiles are built here, on the
     // worker, the first time any chunk needs them); far chunks the landform + rivers only
     const terrain::Field& F = C.field();
+    const wmap::Map* WM = C.world();   // a generated world, or null
     // erosion runs as its own job; until it's done near chunks use the landform + rivers
     const bool fine = j.lod <= 1 && F.tileReady(j.cx, j.cz);
     d.fine = fine;
@@ -139,6 +147,24 @@ Renderer::ChunkData Renderer::buildChunk(const Job& j, int quality) {
             float curv = std::clamp(0.5f + lap * 14.f, 0.f, 1.f);
             b.add({x0 + x * step, y, z0 + z * step}, nn, {q.scour, shore},
                   {u8(shoulder), u8(q.wet), u8(q.sediment), u8(curv)});
+            {   // low-frequency texturing fields (geology, moisture, patches, tone, strata), so the
+                // terrain shader doesn't evaluate ~20 noise octaves per pixel
+                const float X = x0 + x * step, Z = z0 + z * step;
+                float wx = fbm(X * 0.0018f + 3.1f, Z * 0.0018f, 3, 901) - 0.5f, wz = fbm(X * 0.0018f, Z * 0.0018f + 7.7f, 3, 902) - 0.5f;
+                float region = fbm(X * 0.0009f + wx * 1.6f, Z * 0.0009f + wz * 1.6f, 3, 903);
+                float moist = fbm(X * 0.0024f + wx * 1.2f + 11.f, Z * 0.0024f + wz * 1.2f, 3, 904);
+                if (q.moist >= 0) {   // a generated world: its geology and soil moisture, with a little texture
+                    region = std::clamp(q.geology + (region - 0.5f) * 0.25f, 0.f, 1.f);
+                    moist = std::clamp(q.moist + (moist - 0.5f) * 0.2f, 0.f, 1.f);
+                }
+                float patch = fbm(X * 0.011f + wx * 2.f, Z * 0.011f + wz * 2.f, 3, 905);
+                float tone = fbm(X * 0.03f + wx * 3.f, Z * 0.03f + wz * 3.f, 3, 906);
+                float band = wx * 2.5f + fbm(X * 0.004f, Z * 0.004f, 3, 907) * 0.9f;
+                // generated worlds: the broad tone channel carries the desert tint instead
+                // (the shader takes its tone from the patches), the second uv channel the sand
+                if (q.moist >= 0) tone = q.arid;
+                b.extra({region, moist, patch, tone}, {band, q.moist >= 0 ? q.sand : 0.f});
+            }
         }
     for (int z = 0; z < Q; ++z)
         for (int x = 0; x < Q; ++x) {
@@ -155,6 +181,7 @@ Renderer::ChunkData Renderer::buildChunk(const Job& j, int quality) {
             Vector3 p{b.v[i * 3], b.v[i * 3 + 1] - skirt, b.v[i * 3 + 2]};
             Vector3 nn{b.n[i * 3], b.n[i * 3 + 1], b.n[i * 3 + 2]};
             lo.push_back(b.add(p, nn, {b.t[i * 2], b.t[i * 2 + 1]}, {b.c[i * 4], 0, 0, b.c[i * 4 + 3]}));
+            b.extra({b.tg[i * 4], b.tg[i * 4 + 1], b.tg[i * 4 + 2], b.tg[i * 4 + 3]}, {b.t2[i * 2], 0});
         }
         for (size_t k = 0; k + 1 < e.size(); ++k) {
             if (flip) { b.tri(e[k], e[k + 1], lo[k]); b.tri(lo[k], e[k + 1], lo[k + 1]); }
@@ -204,6 +231,20 @@ Renderer::ChunkData Renderer::buildChunk(const Job& j, int quality) {
                 }
             }
         }
+        if (WM) {   // a generated world's lakes follow their basins: a water quad per grid cell
+            std::vector<terrain::LakeCell> lc;
+            F.lakeCellsIn(x0, z0, x0 + CS, z0 + CS, lc);
+            for (const auto& L : lc) {
+                if (wb.v.size() / 3 > 60000) break;
+                float hsz = L.size * 0.5f + 0.6f;
+                unsigned short a0 = wb.add({L.x - hsz, L.level, L.z - hsz}, {0, 1, 0}, {0, 0}, {u8(0.8f), 0, 0, 255});
+                wb.add({L.x + hsz, L.level, L.z - hsz}, {0, 1, 0}, {0, 0}, {u8(0.8f), 0, 0, 255});
+                wb.add({L.x + hsz, L.level, L.z + hsz}, {0, 1, 0}, {0, 0}, {u8(0.8f), 0, 0, 255});
+                wb.add({L.x - hsz, L.level, L.z + hsz}, {0, 1, 0}, {0, 0}, {u8(0.8f), 0, 0, 255});
+                wb.tri(a0, a0 + 2, a0 + 1);
+                wb.tri(a0, a0 + 3, a0 + 2);
+            }
+        }
         for (const auto& L : lakes) {
             if (wb.v.size() / 3 > 60000) break;
             const int N = terrain::LakeShape::N;
@@ -222,6 +263,82 @@ Renderer::ChunkData Renderer::buildChunk(const Job& j, int quality) {
                 wb.tri(c0, i1, i0);
                 wb.tri(i0, i1, i0 + 1);
                 wb.tri(i1, i1 + 1, i0 + 1);
+            }
+        }
+    }
+    // a generated world's other roads: ribbons like the ridden road's, built per chunk
+    if (WM && j.lod <= 2) {
+        MeshBuilder& rb = d.roads;
+        const float W = 2 * hw;
+        const float outerM = 3.0f, midM = 0.85f, edgeM = 0.25f;
+        const float us[6] = {-outerM / W, -midM / W, -edgeM / W, 1 + edgeM / W, 1 + midM / W, 1 + outerM / W};
+        std::map<int, std::vector<int>> segs;   // road -> segments whose midpoint is in this chunk
+        const float HC = 64.f;
+        for (int gz = int(std::floor(z0 / HC)) - 1; gz <= int(std::floor((z0 + CS) / HC)) + 1; ++gz)
+            for (int gx = int(std::floor(x0 / HC)) - 1; gx <= int(std::floor((x0 + CS) / HC)) + 1; ++gx) {
+                auto it = WM->roadCells.find((int64_t(gx) << 32) ^ int64_t(uint32_t(gz)));
+                if (it == WM->roadCells.end()) continue;
+                for (const auto& r : it->second) {
+                    const auto& a = WM->roads[r.a].pts[r.b];
+                    const auto& bb = WM->roads[r.a].pts[r.b + 1];
+                    float mx = 0.5f * (a.x + bb.x), mz = 0.5f * (a.z + bb.z);
+                    if (mx < x0 || mx >= x0 + CS || mz < z0 || mz >= z0 + CS) continue;
+                    if (C.roadDistance(mx, mz) < 1.5f) continue;   // the ridden road has its own
+                    segs[r.a].push_back(r.b);
+                }
+            }
+        const auto rbridges = F.bridgesNear(x0 + CS / 2, z0 + CS / 2, CS);
+        auto ground = [&](float wx, float wz) { return (fine ? F.sample(wx, wz) : F.macro(wx, wz)).h; };
+        for (auto& [rid, list] : segs) {
+            const auto& P = WM->roads[rid].pts;
+            std::sort(list.begin(), list.end());
+            list.erase(std::unique(list.begin(), list.end()), list.end());
+            size_t s0 = 0;
+            while (s0 < list.size()) {
+                size_t s1 = s0;
+                while (s1 + 1 < list.size() && list[s1 + 1] == list[s1] + 1) ++s1;
+                if (rb.v.size() / 3 > 58000) break;
+                int first = list[s0], last = list[s1] + 1;
+                unsigned short base = (unsigned short)(rb.v.size() / 3);
+                for (int i = first; i <= last; ++i) {
+                    const auto& p = P[i];
+                    const auto& pa = P[std::max(0, i - 1)];
+                    const auto& pb = P[std::min(int(P.size()) - 1, i + 1)];
+                    float hd = std::atan2(pb.x - pa.x, pb.z - pa.z);
+                    float gl = std::hypot(pb.x - pa.x, pb.z - pa.z);
+                    float grade = gl > 0.1f ? (pb.y - pa.y) / gl : 0.f;
+                    Vector3 r = rightOf(hd);
+                    Vector3 f = Vector3Normalize({std::sin(hd), grade, std::cos(hd)});
+                    Vector3 c{p.x, p.y + 0.015f, p.z};
+                    bool deck = p.kind != 0;
+                    Vector3 pts[6];
+                    for (int k = 0; k < 6; ++k) {
+                        float off = (us[k] - 0.5f) * W;
+                        Vector3 q = Vector3Add(c, Vector3Scale(r, off));
+                        float ao = std::fabs(off);
+                        if (deck && ao > hw + edgeM + 0.01f) q.y = c.y - 0.03f;
+                        else if (ao > hw + edgeM + 0.01f) {
+                            float ty = ground(q.x, q.z) + 0.035f;
+                            if (ao < hw + midM + 0.01f) q.y = std::min(c.y - 0.04f, std::max(ty, c.y - 0.12f));
+                            else q.y = ty;
+                        }
+                        pts[k] = q;
+                    }
+                    for (int k = 0; k < 6; ++k) {
+                        Vector3 acrossV = Vector3Subtract(pts[std::min(5, k + 1)], pts[std::max(0, k - 1)]);
+                        Vector3 nn = Vector3Normalize(Vector3CrossProduct(acrossV, f));
+                        if (nn.y < 0) nn = Vector3Negate(nn);
+                        rb.add(pts[k], nn, {us[k], i * 5.f});
+                    }
+                }
+                int rows = last - first + 1;
+                for (int i = 0; i < rows - 1; ++i)
+                    for (int k = 0; k < 5; ++k) {
+                        unsigned short a0 = base + i * 6 + k, a1 = a0 + 1, b0 = base + (i + 1) * 6 + k, b1 = b0 + 1;
+                        rb.tri(a0, a1, b0);
+                        rb.tri(b0, a1, b1);
+                    }
+                s0 = s1 + 1;
             }
         }
     }
@@ -251,7 +368,16 @@ Renderer::ChunkData Renderer::buildChunk(const Job& j, int quality) {
             return (H(ix, iz) * (1 - tx) + H(ix + 1, iz) * tx) * (1 - tz) + (H(ix, iz + 1) * (1 - tx) + H(ix + 1, iz + 1) * tx) * tz;
         };
         const float sp = VEG_SPACING[std::clamp(quality, 0, 2)];
-        const float snow = C.maxElevation() + 120.f;
+        const float snow = WM ? WM->snowLine + 150.f : C.maxElevation() + 120.f;
+        auto SMat = [&](float wx, float wz) -> const terrain::Sample& {   // nearest grid sample
+            int ix = std::clamp(int(std::lround((wx - x0) / step)), -1, Q + 1), iz = std::clamp(int(std::lround((wz - z0) / step)), -1, Q + 1);
+            return SM(ix, iz);
+        };
+        auto roadAt = [&](float wx, float wz) {   // the ridden road, or any road of a generated world
+            float d = C.roadDistance(wx, wz);
+            if (WM) { float px, pz, py; d = std::min(d, WM->roadNearest(wx, wz, px, pz, py)); }
+            return d;
+        };
         const auto bridges = F.bridgesNear(x0 + CS / 2, z0 + CS / 2, CS);
         auto wetAt = [&](float wx, float wz) {  // water depth at the nearest grid sample (+ = submerged)
             int ix = std::clamp(int(std::lround((wx - x0) / step)), -1, Q + 1), iz = std::clamp(int(std::lround((wz - z0) / step)), -1, Q + 1);
@@ -266,32 +392,92 @@ Renderer::ChunkData Renderer::buildChunk(const Job& j, int quality) {
                 if (jx < x0 || jx >= x0 + CS || jz < z0 || jz >= z0 + CS) continue;
                 float forest = fbm(jx * 0.0035f, jz * 0.0035f, 4, 77);
                 float p = smooth(0.48f, 0.62f, forest) * 0.8f + 0.015f;
+                float conifer = -1.f;
+                if (WM) {   // the biome decides how thick the woods are; the noise still clumps them
+                    const terrain::Sample& q = SMat(jx, jz);
+                    p = std::min(0.95f, q.trees * (0.3f + 1.1f * smooth(0.36f, 0.62f, forest)));
+                    conifer = q.conifer;
+                }
                 float roll = hash2(i, k, 73);
-                bool rock = roll > 0.997f;
+                const bool rock = false;   // (rocks have their own scatter below)
                 if (roll > p && !rock) continue;
                 float y = sample(jx, jz);
                 if (wetAt(jx, jz) > -1.2f || y > snow - 30.f) continue;
                 float sx = sample(jx + 3, jz) - sample(jx - 3, jz), sz = sample(jx, jz + 3) - sample(jx, jz - 3);
                 float slope = std::sqrt(sx * sx + sz * sz) / 6.f;
                 if (slope > (rock ? 1.2f : 0.75f)) continue;
-                if (C.roadDistance(jx, jz) < hw + (rock ? 5.f : 6.5f)) continue;
+                if (roadAt(jx, jz) < hw + (rock ? 5.f : 6.5f)) continue;
                 bool nearBridge = false;
                 for (const auto& br : bridges) nearBridge |= std::hypot(br.x - jx, br.z - jz) < br.span * 0.5f + 12.f;
                 if (nearBridge) continue;
                 float rot = hash2(i, k, 74) * 2 * PI_F;
                 if (rock) {
                     float sc = 0.6f + hash2(i, k, 75) * 2.2f;
-                    d.veg[trees::TYPES].push_back(MatrixMultiply(MatrixMultiply(MatrixScale(sc, sc * (0.7f + hash2(i, k, 76) * 0.5f), sc), MatrixRotateY(rot)), MatrixTranslate(jx, y - 0.25f * sc, jz)));
-                    d.vegPos[trees::TYPES].push_back({jx, y, jz});
+                    (void)sc;
                     continue;
                 }
-                float alt = smooth(C.minElevation() + 10.f, C.maxElevation() + 40.f, y);
-                int type = trees::pickType(alt, forest, hash2(i, k, 77), hash2(i, k, 78));
+                float alt = WM ? smooth(snow - 1700.f, snow - 150.f, y) : smooth(C.minElevation() + 10.f, C.maxElevation() + 40.f, y);
+                int type = conifer >= 0 ? trees::pickTypeWorld(alt, conifer, hash2(i, k, 77), hash2(i, k, 78))
+                                        : trees::pickType(alt, forest, hash2(i, k, 77), hash2(i, k, 78));
                 float sc = 0.72f + hash2(i, k, 79) * 0.5f;
                 float aspect = 0.92f + hash2(i, k, 80) * 0.16f;
                 d.veg[type].push_back(MatrixMultiply(MatrixMultiply(MatrixScale(sc, sc * aspect, sc), MatrixRotateY(rot)), MatrixTranslate(jx, y - 0.15f, jz)));
                 d.vegPos[type].push_back({jx, y, jz});
             }
+        // bushes and rocks (near chunks): a finer scatter. Bushes crowd the forest margins and
+        // sprinkle the meadows; rocks gather in boulder fields and on the steeper ground.
+        if (j.lod <= 1) {
+            const float bs = quality >= 2 ? 4.5f : quality == 1 ? 6.f : 8.f;
+            int b0 = int(std::ceil(x0 / bs)), b1 = int(std::ceil((x0 + CS) / bs));
+            int c0 = int(std::ceil(z0 / bs)), c1 = int(std::ceil((z0 + CS) / bs));
+            for (int k = c0; k < c1; ++k)
+                for (int i = b0; i < b1; ++i) {
+                    float jx = (i + hash2(i, k, 171) * 0.9f - 0.45f) * bs, jz = (k + hash2(i, k, 172) * 0.9f - 0.45f) * bs;
+                    if (jx < x0 || jx >= x0 + CS || jz < z0 || jz >= z0 + CS) continue;
+                    float forest = fbm(jx * 0.0035f, jz * 0.0035f, 4, 77);
+                    float rocky = fbm(jx * 0.006f, jz * 0.006f, 3, 501);
+                    float clump = vnoise(jx * 0.06f, jz * 0.06f, 503);
+                    float edge = 1.f - std::min(1.f, std::fabs(forest - 0.5f) * 7.f);           // the forest's margin
+                    // in clumps: along the forest's margin, under its canopy, and the odd thicket out in the open
+                    float pBush = (0.004f + 0.3f * edge + 0.08f * smooth(0.55f, 0.7f, forest)) * smooth(0.35f, 0.7f, clump) * 1.6f;
+                    float pRock = (0.002f + 0.16f * smooth(0.6f, 0.78f, rocky)) * (0.4f + 1.2f * smooth(0.45f, 0.8f, clump));
+                    static const float show = std::getenv("CORERAY_SHOWCASE") ? 10.f : 1.f;   // dev: pack them in to look at
+                    pBush *= show; pRock *= show * show * 0.4f;
+                    if (WM) {
+                        const terrain::Sample& q = SMat(jx, jz);
+                        pBush *= 0.2f + 1.9f * q.shrubs;
+                        pRock = pRock * (0.3f + 2.2f * q.rocks) + 0.04f * q.rocks * q.rocks;
+                    }
+                    float roll = hash2(i, k, 173);
+                    bool rock = roll < pRock, bush = !rock && roll < pRock + pBush;
+                    if (!rock && !bush) continue;
+                    float y = sample(jx, jz);
+                    if (wetAt(jx, jz) > -0.6f || y > snow - 30.f) continue;
+                    float sx = sample(jx + 2, jz) - sample(jx - 2, jz), sz = sample(jx, jz + 2) - sample(jx, jz - 2);
+                    float slope = std::sqrt(sx * sx + sz * sz) / 4.f;
+                    if (slope > (rock ? 1.3f : 0.7f)) continue;
+                    if (roadAt(jx, jz) < hw + (rock ? 3.5f : 3.f)) continue;
+                    bool nearBridge = false;
+                    for (const auto& br : bridges) nearBridge |= std::hypot(br.x - jx, br.z - jz) < br.span * 0.5f + 8.f;
+                    if (nearBridge) continue;
+                    float rot = hash2(i, k, 174) * 2 * PI_F;
+                    if (rock) {
+                        // mostly small stones, the odd big boulder
+                        float u = hash2(i, k, 175);
+                        float sc = 0.35f + 2.4f * u * u * u + 0.6f * smooth(0.7f, 0.85f, rocky) * u;
+                        int set = VEG_ROCK0 + int(hash2(i, k, 176) * trees::ROCKS) % trees::ROCKS;
+                        d.veg[set].push_back(MatrixMultiply(MatrixMultiply(MatrixScale(sc, sc * (0.75f + hash2(i, k, 177) * 0.5f), sc), MatrixRotateY(rot)),
+                                                            MatrixTranslate(jx, y - 0.12f * sc - slope * 0.3f * sc, jz)));
+                        d.vegPos[set].push_back({jx, y, jz});
+                    } else {
+                        float sc = 0.7f + hash2(i, k, 178) * 0.65f;
+                        int set = VEG_BUSH0 + int(hash2(i, k, 179) * trees::BUSHES) % trees::BUSHES;
+                        d.veg[set].push_back(MatrixMultiply(MatrixMultiply(MatrixScale(sc, sc * (0.85f + hash2(i, k, 180) * 0.3f), sc), MatrixRotateY(rot)),
+                                                            MatrixTranslate(jx, y - 0.1f, jz)));
+                        d.vegPos[set].push_back({jx, y, jz});
+                    }
+                }
+        }
     }
     return d;
 }
@@ -307,11 +493,14 @@ void Renderer::uploadChunk(ChunkData&& d) {
     if (c.water.vaoId) UnloadMesh(c.water);
     c.water = Mesh{};
     if (!d.water.idx.empty()) c.water = d.water.build(true);
+    if (c.roads.vaoId) UnloadMesh(c.roads);
+    c.roads = Mesh{};
+    if (!d.roads.idx.empty()) c.roads = d.roads.build();
     c.center = d.center;
     c.radius = d.radius;
     c.hasVeg = d.hasVeg;
     c.fine = d.fine;
-    for (int i = 0; i <= trees::TYPES; ++i) { c.veg[i] = std::move(d.veg[i]); c.vegPos[i] = std::move(d.vegPos[i]); }
+    for (int i = 0; i < VEG_SETS; ++i) { c.veg[i] = std::move(d.veg[i]); c.vegPos[i] = std::move(d.vegPos[i]); }
     c.hgrid = std::move(d.hgrid);
     c.rgrid = std::move(d.rgrid);
     c.wgrid = std::move(d.wgrid);
@@ -337,7 +526,7 @@ void Renderer::streamWorld(const Vector3& focus, double riderDist, int maxUpload
 
     // 2. what should exist, at what detail
     const int q = std::clamp(quality_, 0, 2);
-    const float view = VIEW[q];
+    const float view = VIEW[q] * viewScale_;
     const int R = int(std::ceil(view / CS)) + 1;
     const int fcx = int(std::floor(focus.x / CS)), fcz = int(std::floor(focus.z / CS));
     struct Need { int cx, cz, lod; float prio; };
@@ -350,7 +539,7 @@ void Renderer::streamWorld(const Vector3& focus, double riderDist, int maxUpload
             int cx = fcx + dx, cz = fcz + dz;
             float dd = boxDist(cx, cz, focus);
             if (dd > view) continue;
-            int lod = lodFor(dd);
+            int lod = lodFor(dd, viewScale_);
             auto it = chunks_.find({cx, cz});
             bool ok = it != chunks_.end() && it->second.lod == lod && it->second.version == ver;
             if (lod <= 1) {
@@ -403,6 +592,7 @@ void Renderer::streamWorld(const Vector3& focus, double riderDist, int maxUpload
         if (boxDist(it->first.first, it->first.second, focus) > view + 1200) {
             if (it->second.mesh.vaoId) UnloadMesh(it->second.mesh);
             if (it->second.water.vaoId) UnloadMesh(it->second.water);
+            if (it->second.roads.vaoId) UnloadMesh(it->second.roads);
             it = chunks_.erase(it);
         } else ++it;
     }
@@ -481,6 +671,15 @@ void Renderer::updateRoad(double riderDist) {
                     }
                 }
             }
+            if (C.world()) {   // a generated world: the other roads' bridges around the rider too
+                const auto& rp = P[std::clamp(ri, 0, N - 1) % N].pos;
+                for (const auto& b : F.bridgesNear(rp.x, rp.z, 1600.f)) {
+                    bool dup = false;
+                    for (auto& o : bridges_) dup |= std::hypot(o.c.x - b.x, o.c.z - b.z) < 4.f;
+                    if (dup || (b.hx == 0 && b.hz == 0)) continue;
+                    bridges_.push_back({{b.x, b.roadY, b.z}, std::atan2(b.hx, b.hz), b.span, b.level, b.width, 0.f});
+                }
+            }
         }
     }
     auto onBridge = [&](Vector3 c) {
@@ -512,7 +711,7 @@ void Renderer::updateRoad(double riderDist) {
             c.y += 0.03f;
             float v = (i == N) ? C.length() : p.dist;
             Vector3 pts[6];
-            const bool deck = onBridge(c);
+            const bool deck = onBridge(c) || p.kind != 0;   // bridges and tunnels: level across
             for (int k = 0; k < 6; ++k) {
                 float off = (us[k] - 0.5f) * W;  // metres from the centre line (negative = left)
                 Vector3 q = Vector3Add(c, Vector3Scale(r, off));
@@ -575,7 +774,7 @@ void Renderer::updateRoad(double riderDist) {
         double d = kk * double(LANTERN_SPACING) + 20;
         if (d < 0 || d > C.length() - 10) continue;
         auto p = C.at(d);
-        if (onBridge(toV(p.pos))) continue;  // no lamp posts standing in the river
+        if (onBridge(toV(p.pos)) || C.kindAt(d) != 0) continue;  // no lamp posts standing in the river, or in a tunnel
         float side = (kk % 2) ? 1.f : -1.f;
         Vector3 pos = Vector3Add(toV(p.pos), Vector3Scale(rightOf(p.heading), side * (hw + 1.3f)));
         pos.y = C.terrainHeight(pos.x, pos.z);
@@ -622,8 +821,9 @@ void Renderer::updateLanterns(const SceneState& s, float dt) {
         std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first < b.first; });
         for (size_t i = 0; i < cand.size() && lights_.size() < 15; ++i) lights_.push_back(cand[i].second);
     }
-    // the bike's headlight: a real spot down the road after dusk
-    if (L_.night > 0.25f) {
+    // the bike's headlight: a real spot down the road after dusk, and in tunnels
+    const bool tunnel = C.world() && (C.kindAt(s.dist) == 1 || C.kindAt(s.dist + 25) == 1);
+    if (L_.night > 0.25f || tunnel) {
         auto p = C.at(s.dist);
         auto ahead = C.at(s.dist + 12);
         Vector3 lp = Vector3Add(Vector3Add(toV(p.pos), Vector3Scale(rightOf(p.heading), 1.4f)), Vector3Add(Vector3Scale(fwdOf(p.heading), 0.7f), {0, 1.0f, 0}));
@@ -631,7 +831,7 @@ void Renderer::updateLanterns(const SceneState& s, float dt) {
         Light L;
         L.pos = lp;
         L.dir = Vector3Normalize(Vector3Subtract(aim, lp));
-        L.col = Vector3Scale({0.92f, 0.95f, 1.0f}, 55.f * L_.night);
+        L.col = Vector3Scale({0.92f, 0.95f, 1.0f}, 55.f * std::max(L_.night, tunnel ? 0.8f : 0.f));
         L.cosIn = 0.975f;
         L.cosOut = 0.90f;
         L.vol = 0.06f;   // a bike light barely shows in the air from behind
@@ -643,7 +843,7 @@ void Renderer::drawLanterns(bool sp, const Vector3& focus, float radius) {
     if (lanterns_.empty()) return;
     const Color iron{26, 28, 31, 255};
     for (auto& l : lanterns_) {
-        if (sp ? (std::fabs(l.pos.x - focus.x) > radius || std::fabs(l.pos.z - focus.z) > radius) : Vector3Distance(l.pos, cam_.position) > 1400.f) continue;
+        if (sp ? (std::fabs(l.pos.x - focus.x) > radius || std::fabs(l.pos.z - focus.z) > radius) : Vector3Distance(l.pos, cam_.position) > 1400.f * viewScale_) continue;
         auto p = course_->at(l.dist);
         Matrix base = MatrixMultiply(MatrixRotateY(p.heading), MatrixTranslate(l.pos.x, l.pos.y, l.pos.z));
         bool near = Vector3Distance(l.pos, cam_.position) < 120.f;
@@ -801,7 +1001,19 @@ void Renderer::updateGrass() {
         }
     std::sort(want.begin(), want.end(), [](const Want& a, const Want& b) { return a.d < b.d; });
     const Course& C = *course_;
-    const float hw = C.roadHalfWidth(), snowLine = C.maxElevation() + 80.f;
+    const wmap::Map* WM = C.world();
+    const float hw = C.roadHalfWidth(), snowLine = WM ? WM->snowLine + 100.f : C.maxElevation() + 80.f;
+    // generated worlds: how much grass the biome carries here (cheap: coarse biomes + grid fields)
+    auto worldGrass = [&](float x, float z) {
+        float w[wmap::BIOMES];
+        WM->biomeAt(x, z, w);
+        static const float g[wmap::BIOMES] = {1.f, 0.6f, 0.6f, 0.5f, 0.9f, 0.85f, 0.45f, 0.04f, 0.1f, 1.f};
+        float a = 0;
+        for (int b = 0; b < wmap::BIOMES; ++b) a += g[b] * w[b];
+        int i = std::clamp(int(std::lround((x - WM->x0) / WM->cell)), 0, WM->n - 1), k = std::clamp(int(std::lround((z - WM->z0) / WM->cell)), 0, WM->n - 1);
+        size_t c = size_t(k) * WM->n + i;
+        return a * (1.f - WM->sand[c]) * smooth(0.02f, 0.3f, WM->moist[c] + 0.1f);
+    };
     int built = 0;
     for (auto& w : want) {
         if (built >= 10) break;
@@ -825,6 +1037,7 @@ void Renderer::updateGrass() {
                 if (slope > 0.75f) continue;
                 float forest = fbm(x * 0.0035f, z * 0.0035f, 4, 77);
                 float r = hash2(i, k, 404);
+                if (WM && hash2(i, k, 413) > worldGrass(x, z)) continue;
                 if (forest > 0.56f && r < 0.55f) continue;                        // sparse under the trees
                 float meadow = vnoise(x * 0.012f, z * 0.012f, 409) * 0.7f + vnoise(x * 0.05f, z * 0.05f, 410) * 0.3f;
                 // grass grows in clumps and patches with bare ground between them
@@ -875,37 +1088,85 @@ void Renderer::drawGrass(const SceneState& s) {
 
 // ------------------------------------------------------------------ world draw
 void Renderer::drawWorld(bool sp, int cascade, const Vector3& focus, float radius) {
+    // the view frustum (sides, top, bottom): a sphere is visible unless it's wholly outside one
     Vector3 camF = Vector3Normalize(Vector3Subtract(cam_.target, cam_.position));
-    float cosLimit = std::cos((cam_.fovy * 0.5f * 1.9f + 8.f) * DEG2RAD);
+    Vector3 camR = Vector3Normalize(Vector3CrossProduct(camF, {0, 1, 0}));
+    Vector3 camU = Vector3CrossProduct(camR, camF);
+    const float tanV = std::tan(cam_.fovy * 0.5f * DEG2RAD) * 1.04f;
+    const float tanH = tanV * float(std::max(1, rtW_)) / float(std::max(1, rtH_));
+    const float secV = std::sqrt(1.f + tanV * tanV), secH = std::sqrt(1.f + tanH * tanH);
+    auto inFrustum = [&](Vector3 c, float r) {
+        Vector3 v = Vector3Subtract(c, cam_.position);
+        float z = Vector3DotProduct(v, camF);
+        if (z < -r) return false;
+        float x = Vector3DotProduct(v, camR), y = Vector3DotProduct(v, camU);
+        if (std::fabs(x) > z * tanH + r * secH) return false;
+        if (std::fabs(y) > z * tanV + r * secV) return false;
+        return true;
+    };
     auto visible = [&](Vector3 c, float r) {
         if (sp) return std::fabs(c.x - focus.x) < radius + r && std::fabs(c.z - focus.z) < radius + r;
         Vector3 v = Vector3Subtract(c, cam_.position);
-        float d = Vector3Length(v);
-        if (d < r) return true;
-        if (d - r > 11000.f) return false;
-        return Vector3DotProduct(v, camF) / d > cosLimit - r / d;
+        if (Vector3Length(v) - r > 11000.f) return false;
+        return inFrustum(c, r);
     };
     tris_ = 0;
+    if (!sp) {   // generated worlds: the hillside opens at tunnel portals
+        float pp[12 * 4] = {}, pd[12 * 4] = {};
+        int np = 0;
+        std::vector<std::pair<float, int>> order;
+        for (int i = 0; i < int(portals_.size()); ++i) order.push_back({Vector3Distance(portals_[i].p, cam_.position), i});
+        std::sort(order.begin(), order.end());
+        for (auto [d, i] : order) {
+            if (np >= 12) break;
+            const auto& P = portals_[i];
+            // the tube's arch (Structures.cpp: half width 5.2, walls 4.2, crown 6.6), a few cm
+            // inside it so the hillside's cut edge sits on the lining with no slit
+            pp[np * 4] = P.p.x; pp[np * 4 + 1] = P.p.y; pp[np * 4 + 2] = P.p.z; pp[np * 4 + 3] = 5.15f;
+            pd[np * 4] = std::sin(P.heading); pd[np * 4 + 1] = 0; pd[np * 4 + 2] = std::cos(P.heading); pd[np * 4 + 3] = 6.55f;
+            ++np;
+        }
+        setI(terrainSh_, "numPortals", np);
+        int l1 = GetShaderLocation(terrainSh_, "portalPos"), l2 = GetShaderLocation(terrainSh_, "portalDir");
+        if (np > 0 && l1 >= 0) SetShaderValueV(terrainSh_, l1, pp, SHADER_UNIFORM_VEC4, np);
+        if (np > 0 && l2 >= 0) SetShaderValueV(terrainSh_, l2, pd, SHADER_UNIFORM_VEC4, np);
+    }
     for (auto& [k, c] : chunks_)
         if (c.mesh.vaoId && visible(c.center, c.radius)) {
             DrawMesh(c.mesh, sp ? depthMat_ : terrainMat_, MatrixIdentity());
             tris_ += c.mesh.triangleCount;
         }
+    if (!sp && std::getenv("CORERAY_COUNT")) { static int f2 = 0; if (++f2 % 20 == 0) { int n = 0; for (auto& [k, c] : chunks_) if (c.mesh.vaoId && visible(c.center, c.radius)) ++n; std::fprintf(stderr, "[count] terrain chunks %d tris %d\n", n, tris_); } }
+    if (!sp) prof::mark(prof::Terrain);
     if (!sp)
         for (auto& c : road_)
             if (visible(c.center, c.radius)) DrawMesh(c.mesh, roadMat_, MatrixIdentity());
+    if (!sp)   // a generated world's other roads
+        for (auto& [k, c] : chunks_)
+            if (c.roads.vaoId && c.lod <= 2 && visible(c.center, c.radius)) DrawMesh(c.roads, roadMat_, MatrixIdentity());
+    if (!sp) prof::mark(prof::Road);
 
-    // vegetation (instanced), gathered from nearby chunks: full trees near, simplified far
+    // vegetation (instanced), gathered from nearby chunks, culled per tree against the view
+    // frustum. Three levels: the full tree near, the simplified tree to a few hundred metres,
+    // an impostor (one quad) beyond. Each tree's switch distances are jittered a little so the
+    // changes don't sweep along in a line.
     const int q = std::clamp(quality_, 0, 2);
-    const float vegDist = VEG_DIST[q];
-    const float lodDist = q == 2 ? 240.f : q == 1 ? 170.f : 100.f;
+    const float vegDist = VEG_DIST[q] * viewScale_;
+    const float hiDist = q == 2 ? 90.f : q == 1 ? 70.f : 50.f;
+    const float loDist = impAlb_.id ? (q == 2 ? 360.f : q == 1 ? 260.f : 170.f) : 1e9f;
+    static const float impDev = std::getenv("CORERAY_IMPDIST") ? float(std::atof(std::getenv("CORERAY_IMPDIST"))) : -1.f;   // dev: impostors from here
     rlDisableBackfaceCulling();
-    for (int set = 0; set <= trees::TYPES; ++set) {
-        const bool rocks = set == trees::TYPES;
+    const float bushHi = q == 2 ? 45.f : q == 1 ? 35.f : 25.f, bushMax = (q == 2 ? 420.f : q == 1 ? 300.f : 200.f) * viewScale_;
+    const float rockMax = (q == 2 ? 900.f : q == 1 ? 650.f : 420.f) * viewScale_;
+    for (int set = 0; set < VEG_SETS; ++set) {
+        const bool rocks = set >= VEG_ROCK0, bushes = !rocks && set >= VEG_BUSH0;
+        const trees::Built* built = rocks ? nullptr : bushes ? &bushes_[set - VEG_BUSH0] : &trees_[set];
         visHi_.clear();
         visLo_.clear();
-        float maxD = rocks ? vegDist * 0.6f : vegDist;
-        float md2 = maxD * maxD, lod2 = lodDist * lodDist;
+        visFar_.clear();
+        float maxD = rocks ? rockMax : bushes ? bushMax : vegDist;
+        float md2 = maxD * maxD;
+        const float th = rocks ? 3.5f : built->height * 1.32f;   // tallest instance of this set
         for (auto& [k, c] : chunks_) {
             if (!c.hasVeg || c.vegPos[set].empty()) continue;
             if (sp) {
@@ -913,39 +1174,51 @@ void Renderer::drawWorld(bool sp, int cascade, const Vector3& focus, float radiu
             } else {
                 float dx = c.center.x - cam_.position.x, dz = c.center.z - cam_.position.z;
                 if (std::sqrt(dx * dx + dz * dz) - CS * 0.71f > maxD) continue;
-                if (!visible(c.center, c.radius + 30)) continue;
+                if (!visible(c.center, c.radius + th)) continue;
             }
             const auto& pos = c.vegPos[set];
             for (size_t i = 0; i < pos.size(); ++i) {
                 const Vector3& p = pos[i];
-                float d2;
                 if (sp) {
                     if (std::fabs(p.x - focus.x) > radius + 14 || std::fabs(p.z - focus.z) > radius + 14) continue;
-                    d2 = cascade == 0 ? 0.f : lod2 + 1;  // near cascade: full detail, far cascade: simple
-                } else {
-                    Vector3 v = Vector3Subtract(p, cam_.position);
-                    d2 = v.x * v.x + v.z * v.z;
-                    if (d2 > md2) continue;
-                    float d = std::sqrt(d2) + 1e-3f;
-                    if (d > 30.f && Vector3DotProduct(v, camF) / d < cosLimit - 25.f / d) continue;
+                    // near cascade: full detail; far cascade: simplified
+                    (rocks || cascade == 0 ? visHi_ : visLo_).push_back(c.veg[set][i]);
+                    continue;
                 }
-                (rocks || d2 < lod2 ? visHi_ : visLo_).push_back(c.veg[set][i]);
+                Vector3 v = Vector3Subtract(p, cam_.position);
+                float d2 = v.x * v.x + v.z * v.z;
+                if (d2 > md2) continue;
+                if (!inFrustum({p.x, p.y + th * 0.5f, p.z}, th * 0.6f + (rocks ? 1.f : 0.f))) continue;
+                if (rocks) { visHi_.push_back(c.veg[set][i]); continue; }
+                float jit = 0.85f + 0.3f * hash2(int(p.x * 4.f), int(p.z * 4.f), 31);
+                float d = std::sqrt(d2);
+                if (bushes) { (d < bushHi * jit ? visHi_ : visLo_).push_back(c.veg[set][i]); continue; }
+                (impDev >= 0 ? (d < impDev ? visLo_ : visFar_) : d < hiDist * jit ? visHi_ : d < loDist * jit ? visLo_ : visFar_).push_back(c.veg[set][i]);
             }
         }
         Material& m = sp ? depthInstMat_ : foliageMat_;
         Shader sh = m.shader;
         setF(sh, "time", time_);
-        setF(sh, "windAmount", rocks ? 0.f : wind_);
-        setF(sh, "treeHeight", rocks ? 1.f : trees_[set].height);
+        setF(sh, "windAmount", rocks ? 0.f : bushes ? wind_ * 0.5f : wind_);
+        setF(sh, "treeHeight", rocks ? 1.f : built->height);
         if (!sp) setI(sh, "kind", rocks ? 3 : 0);
         if (rocks) {
-            if (!visHi_.empty()) DrawMeshInstanced(rockMesh_, m, visHi_.data(), int(visHi_.size()));
+            if (!visHi_.empty()) DrawMeshInstanced(rocks_[set - VEG_ROCK0], m, visHi_.data(), int(visHi_.size()));
+            if (!sp && std::getenv("CORERAY_COUNT")) { static int fr2 = 0; if (++fr2 % 80 == 0) std::fprintf(stderr, "[count] rocks set %d: %zu\n", set, visHi_.size()); }
             continue;
         }
-        if (!visHi_.empty()) DrawMeshInstanced(trees_[set].hi, m, visHi_.data(), int(visHi_.size()));
-        if (!visLo_.empty()) DrawMeshInstanced(trees_[set].lo, m, visLo_.data(), int(visLo_.size()));
+        if (!visHi_.empty()) DrawMeshInstanced(built->hi, m, visHi_.data(), int(visHi_.size()));
+        const Mesh& loMesh = sp && cascade == 1 && built->shadow.vaoId ? built->shadow : built->lo;
+        if (!visLo_.empty()) DrawMeshInstanced(loMesh, m, visLo_.data(), int(visLo_.size()));
+        if (!sp && !bushes) drawImpostors(set, visFar_);
+        if (!sp && std::getenv("CORERAY_COUNT")) {
+            static int fr = 0;
+            if (set == 0) ++fr;
+            if (fr % 20 == 0) std::fprintf(stderr, "[count] set %d hi %zu x %d tris  lo %zu x %d tris  imp %zu\n", set, visHi_.size(), built->hi.triangleCount, visLo_.size(), built->lo.triangleCount, visFar_.size());
+        }
     }
     rlEnableBackfaceCulling();
+    if (!sp) prof::mark(prof::Foliage);
 
     // props
     const float hw = course_->roadHalfWidth();
@@ -964,8 +1237,10 @@ void Renderer::drawWorld(bool sp, int cascade, const Vector3& focus, float radiu
         drawPart(cube_, MatrixMultiply(MatrixScale(2 * hw + 2.5f, 1.2f, 0.3f), MatrixTranslate(0, 6.0f, 0)), base, WHITE, 0.6f, 0.2f, sp, 1);
         drawPart(cube_, MatrixMultiply(MatrixScale(2 * hw + 2.6f, 0.25f, 0.35f), MatrixTranslate(0, 6.7f, 0)), base, band, 0.5f, 0.3f, sp, 0, 0.3f + L_.night * 3.f);
     };
-    // stone bridges where rivers pass under the road
+    drawStructures(sp, focus, radius);   // generated worlds: tunnels, portals, bridges
+    // stone bridges where rivers pass under the road (classic scenery)
     for (auto& b : bridges_) {
+        if (course_->world()) break;
         bool near = sp ? (std::fabs(b.c.x - focus.x) < radius + b.span && std::fabs(b.c.z - focus.z) < radius + b.span)
                        : Vector3Distance(b.c, cam_.position) < 2200.f;
         if (!near) continue;
@@ -988,4 +1263,90 @@ void Renderer::drawWorld(bool sp, int cascade, const Vector3& focus, float radiu
 
     arch(archBase_, {232, 64, 48, 255});
     if (hasFinish_) arch(finishBase_, {74, 222, 128, 255});
+}
+
+// ------------------------------------------------------------------ terrain sun shadows
+// The cascaded shadow maps reach a kilometre or two; a low sun behind a ridge further off
+// used to light the valley (and the fog) straight through the mountain. This is the classic
+// height-field horizon map: S(p) = the height a point at p must be above to see the sun, from
+// S(p) = max(H(q), S(q)) - step * tan(elevation) with q one step up-sun - one sweep over the
+// texels in up-sun-first order, so every q is already done. 512 x 20 m = 10 km, the camera
+// 2.5 km from the down-sun edge (7.7 km of ridges up-sun).
+namespace {
+Renderer::SunMap buildSunMap(std::shared_ptr<const Course> course, Vector3 L, Vector2 cam) {
+    auto t0 = std::chrono::steady_clock::now();
+    constexpr int N = 512;
+    constexpr float CELL = 20.f, SIZE = N * CELL;
+    Renderer::SunMap out;
+    out.dir = L;
+    out.at = cam;
+    out.course = course.get();
+    float lh = std::hypot(L.x, L.z);
+    Vector2 u{L.x / lh, L.z / lh};
+    float tanE = std::max(L.y, 0.01f) / lh;
+    float cx = cam.x + u.x * (SIZE * 0.5f - 2500.f), cz = cam.y + u.y * (SIZE * 0.5f - 2500.f);
+    float x0 = std::round((cx - SIZE * 0.5f) / CELL) * CELL, z0 = std::round((cz - SIZE * 0.5f) / CELL) * CELL;
+    const terrain::Field& F = course->field();
+    std::vector<float> H(size_t(N) * N);
+    for (int iz = 0; iz < N; ++iz)
+        for (int ix = 0; ix < N; ++ix) H[size_t(iz) * N + ix] = F.height(x0 + (ix + 0.5f) * CELL, z0 + (iz + 0.5f) * CELL);
+    std::vector<int> order(size_t(N) * N);
+    std::vector<float> proj(order.size());
+    for (int k = 0; k < N * N; ++k) { order[k] = k; proj[k] = (k % N) * u.x + (k / N) * u.y; }
+    std::sort(order.begin(), order.end(), [&](int a, int b) { return proj[a] > proj[b]; });
+    const float STEP = 1.5f;   // texels: q's four neighbours all lie further up-sun than p
+    const float drop = STEP * CELL * tanE;
+    std::vector<float> S(size_t(N) * N, -1e6f);
+    for (int k : order) {
+        float qx = (k % N) + u.x * STEP, qz = (k / N) + u.y * STEP;
+        if (qx < 0 || qz < 0 || qx > N - 1 || qz > N - 1) continue;   // the edge: nothing further up-sun
+        int ix = std::min(int(qx), N - 2), iz = std::min(int(qz), N - 2);
+        float fx = qx - ix, fz = qz - iz;
+        auto bl = [&](const std::vector<float>& g) {
+            size_t a = size_t(iz) * N + ix;
+            return (g[a] * (1 - fx) + g[a + 1] * fx) * (1 - fz) + (g[a + N] * (1 - fx) + g[a + N + 1] * fx) * fz;
+        };
+        S[k] = std::max(bl(H), bl(S)) - drop;
+    }
+    out.S = std::move(S);
+    out.rect = {x0, z0, 1.f / SIZE, float(N)};
+    static int logged = 0;
+    if (logged++ < 3)
+        std::fprintf(stderr, "[sun] terrain shadow map %.0f ms (elevation %.1f deg, dir %.3f %.3f %.3f)\n",
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), std::atan(tanE) * 57.2958f, L.x, L.y, L.z);
+    return out;
+}
+}  // namespace
+
+void Renderer::updateSunTerrain() {
+    static const bool off = std::getenv("CORERAY_NOSUNTERRAIN") != nullptr;   // dev: compare without
+    if (!course_ || off) { sunRect_.z = 0; return; }
+    if (course_.get() != sunMapFor_) { sunRect_.z = 0; sunMapFor_ = course_.get(); sunMapAt_ = {1e9f, 1e9f}; }
+    if (sunJob_.valid() && sunJob_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        SunMap m = sunJob_.get();
+        if (m.course == course_.get()) {
+            constexpr int N = 512;
+            if (!sunTex_) {
+                sunTex_ = rlLoadTexture(m.S.data(), N, N, PIXELFORMAT_UNCOMPRESSED_R32, 1);
+                rlTextureParameters(sunTex_, RL_TEXTURE_MIN_FILTER, RL_TEXTURE_FILTER_BILINEAR);
+                rlTextureParameters(sunTex_, RL_TEXTURE_MAG_FILTER, RL_TEXTURE_FILTER_BILINEAR);
+                rlTextureParameters(sunTex_, RL_TEXTURE_WRAP_S, RL_TEXTURE_WRAP_CLAMP);
+                rlTextureParameters(sunTex_, RL_TEXTURE_WRAP_T, RL_TEXTURE_WRAP_CLAMP);
+            } else {
+                rlUpdateTexture(sunTex_, 0, 0, N, N, PIXELFORMAT_UNCOMPRESSED_R32, m.S.data());
+            }
+            sunRect_ = m.rect;
+            sunMapDir_ = m.dir;
+            sunMapAt_ = m.at;
+        }
+    }
+    if (sunJob_.valid()) return;   // one at a time
+    Vector3 L = Vector3Normalize(L_.lightDir);
+    float lh = std::hypot(L.x, L.z);
+    if (lh < 0.05f || L.y > 0.75f) { sunRect_.z = 0; return; }   // sun near overhead: no ridge shadows worth it
+    Vector2 cam{cam_.position.x, cam_.position.z};
+    bool moved = std::hypot(cam.x - sunMapAt_.x, cam.y - sunMapAt_.y) > 700.f;
+    bool turned = Vector3DotProduct(L, sunMapDir_) < 0.99996f;   // ~0.5 degrees
+    if (!moved && !turned) return;
+    sunJob_ = std::async(std::launch::async, buildSunMap, course_, L, cam);
 }

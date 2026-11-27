@@ -1,15 +1,21 @@
+#include <cstring>
+#include <chrono>
 // Frame orchestration: shaders, lighting (sun / moon / weather), camera, rider, shadows, post.
 // World streaming lives in World.cpp, weather particles + wildlife in Fx.cpp.
 #include "Renderer.h"
+#include "world/WorldMap.h"
 #include "Terrain.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <ctime>
 #include <string>
 
 #include "RenderUtil.h"
+#pragma GCC diagnostic ignored "-Wunused-variable"   // (the shader header defines every source)
 #include "Shaders.h"
+#include "Profiler.h"
 
 using namespace rutil;
 
@@ -29,23 +35,6 @@ const char* camModeName(CamMode m) {
 // ------------------------------------------------------------------ mesh helpers
 namespace {
 
-void addBlob(MeshBuilder& b, Vector3 c, Vector3 r, int rings, int slices, float lump, uint32_t seed) {
-    std::vector<std::vector<unsigned short>> grid(rings + 1);
-    for (int i = 0; i <= rings; ++i) {
-        float th = PI_F * i / rings;
-        for (int j = 0; j <= slices; ++j) {
-            float ph = 2 * PI_F * j / slices;
-            Vector3 d{std::sin(th) * std::cos(ph), std::cos(th), std::sin(th) * std::sin(ph)};
-            float k = 1.0f + lump * (vnoise(d.x * 2.3f + 5, d.z * 2.3f + d.y * 1.7f + 3, seed) - 0.5f) * 2.f;
-            grid[i].push_back(b.add({c.x + d.x * r.x * k, c.y + d.y * r.y * k, c.z + d.z * r.z * k}, d, {float(j) / slices, float(i) / rings}));
-        }
-    }
-    for (int i = 0; i < rings; ++i)
-        for (int j = 0; j < slices; ++j) {
-            b.tri(grid[i][j], grid[i][j + 1], grid[i + 1][j]);
-            b.tri(grid[i][j + 1], grid[i + 1][j + 1], grid[i + 1][j]);
-        }
-}
 
 Mesh genTorusX(float R, float r, int seg, int sides) {
     MeshBuilder b;
@@ -64,6 +53,74 @@ Mesh genTorusX(float R, float r, int seg, int sides) {
             b.tri(a, bb, a + 1);
             b.tri(a + 1, bb, bb + 1);
         }
+    return b.build();
+}
+
+// Surface of revolution about the X axis. `prof` is a closed (r, x) polygon traversed
+// counter-clockwise in the (r, x) plane (outward normal = (dx, -dr)); flat-shaded per edge.
+void latheX(MeshBuilder& b, const std::vector<Vector2>& prof, int seg) {
+    size_t np = prof.size();
+    for (size_t e = 0; e < np; ++e) {
+        Vector2 p0 = prof[e], p1 = prof[(e + 1) % np];
+        float dr = p1.x - p0.x, dx = p1.y - p0.y, len = std::sqrt(dr * dr + dx * dx);
+        if (len < 1e-7f) continue;
+        float nr = dx / len, nx = -dr / len;
+        unsigned short base = (unsigned short)(b.v.size() / 3);
+        for (int i = 0; i <= seg; ++i) {
+            float a = 2 * PI_F * i / seg, c = std::cos(a), sn = std::sin(a);
+            for (Vector2 q : {p0, p1}) b.add({q.y, q.x * c, q.x * sn}, {nx, nr * c, nr * sn}, {float(i) / seg, 0});
+        }
+        for (int i = 0; i < seg; ++i) {
+            unsigned short a0 = base + i * 2, b0 = base + (i + 1) * 2;
+            b.tri(a0, b0, a0 + 1);
+            b.tri(a0 + 1, b0, b0 + 1);
+        }
+    }
+}
+// closed annulus (flat ring) from r0 to r1 between x0 and x1
+void ringX(MeshBuilder& b, float r0, float r1, float x0, float x1, int seg) {
+    latheX(b, {{r0, x0}, {r1, x0}, {r1, x1}, {r0, x1}}, seg);
+}
+// open tube from a to b (no caps), `sides` facets
+void tube(MeshBuilder& b, Vector3 a, Vector3 c, float r, int sides = 6) {
+    Vector3 d = Vector3Subtract(c, a);
+    if (Vector3Length(d) < 1e-6f) return;
+    d = Vector3Normalize(d);
+    Vector3 ref = std::fabs(d.y) < 0.9f ? Vector3{0, 1, 0} : Vector3{1, 0, 0};
+    Vector3 u = Vector3Normalize(Vector3CrossProduct(ref, d)), v = Vector3CrossProduct(d, u);  // u x v = d
+    unsigned short base = (unsigned short)(b.v.size() / 3);
+    for (int i = 0; i <= sides; ++i) {
+        float t = 2 * PI_F * i / sides;
+        Vector3 n = Vector3Add(Vector3Scale(u, std::cos(t)), Vector3Scale(v, std::sin(t)));
+        b.add(Vector3Add(a, Vector3Scale(n, r)), n, {0, 0});
+        b.add(Vector3Add(c, Vector3Scale(n, r)), n, {1, 0});
+    }
+    for (int i = 0; i < sides; ++i) {
+        unsigned short a0 = base + i * 2, a1 = base + (i + 1) * 2;
+        b.tri(a0, a1, a0 + 1);
+        b.tri(a1, a1 + 1, a0 + 1);
+    }
+}
+
+// Hub + laced spokes in wheel-local space (axle along X). Front: 20 radial;
+// rear: 24 two-cross (12 per side, alternately leading / trailing).
+Mesh genSpokedHub(bool rear) {
+    MeshBuilder b;
+    // hub shell with flanges
+    float fl = rear ? 0.027f : 0.024f;
+    latheX(b, {{0.008f, -0.050f}, {0.012f, -0.050f}, {0.012f, -0.036f}, {0.024f, -0.034f}, {0.024f, -0.030f}, {0.016f, -0.028f},
+               {0.016f, 0.028f}, {0.024f, 0.030f}, {0.024f, 0.034f}, {0.012f, 0.036f}, {0.012f, 0.050f}, {0.008f, 0.050f}}, 16);
+    const float rimR = 0.268f;  // spoke nipples sit in the rim bed
+    int n = rear ? 24 : 20;
+    for (int k = 0; k < n; ++k) {
+        float side = (k % 2) ? 1.f : -1.f;
+        float aRim = 2 * PI_F * k / n;
+        float aHub = aRim;
+        if (rear) aHub += ((k / 2) % 2 ? 1.f : -1.f) * 2 * PI_F / 12 * 2 * 0.5f;  // 2-cross
+        Vector3 h{side * fl, 0.022f * std::cos(aHub), 0.022f * std::sin(aHub)};
+        Vector3 r{side * 0.003f, rimR * std::cos(aRim), rimR * std::sin(aRim)};
+        tube(b, h, r, 0.0011f, 4);
+    }
     return b.build();
 }
 
@@ -108,7 +165,9 @@ RenderTexture2D loadShadowRT(int res) {
 void unloadRT(RenderTexture2D& t) {
     if (t.id == 0) return;
     if (t.texture.id) rlUnloadTexture(t.texture.id);
-    if (t.depth.id) rlUnloadTexture(t.depth.id);
+    // rlUnloadFramebuffer frees the attached depth (texture or renderbuffer) itself; deleting it
+    // here too would free it twice, and a renderbuffer id passed to the texture delete frees
+    // some unrelated texture that happens to share the number
     rlUnloadFramebuffer(t.id);
     t = RenderTexture2D{};
 }
@@ -132,7 +191,7 @@ bool Renderer::init(int quality) {
         std::sscanf(dc, "%f,%f,%f,%f,%f,%f", &devCam_[0], &devCam_[1], &devCam_[2], &devCam_[3], &devCam_[4], &devCam_[5]);
     shadowRes_ = quality >= 2 ? 4096 : quality == 1 ? 2048 : 1024;
     std::string head = shaders::FS_HEADER, common = shaders::FS_COMMON;
-    terrainSh_ = loadShader(shaders::VS_STATIC, head + common + shaders::FS_TERRAIN, "terrain");
+    terrainSh_ = loadShader(shaders::VS_TERRAIN, head + common + shaders::FS_TERRAIN, "terrain");
     roadSh_ = loadShader(shaders::VS_STATIC, head + common + shaders::FS_ROAD, "road");
     objectSh_ = loadShader(shaders::VS_STATIC, head + common + shaders::FS_OBJECT, "object");
     waterSh_ = loadShader(shaders::VS_STATIC, head + common + shaders::FS_WATER, "water");
@@ -192,19 +251,64 @@ void Renderer::buildMeshes() {
     sphere_ = GenMeshSphere(1, 14, 18);
     cube_ = GenMeshCube(1, 1, 1);
     cone_ = GenMeshCone(1, 1, 12);
-    wheelTire_ = genTorusX(0.333f, 0.0135f, 48, 8);
-    wheelRim_ = genTorusX(0.30f, 0.02f, 48, 6);
+    // 700x25c tyre: 25 mm section on a 622 mm bead seat (outer radius WHEEL_FREE_R)
+    wheelTire_ = genTorusX(WHEEL_FREE_R - 0.0125f, 0.0125f, 72, 10);
+    {   // 45 mm deep carbon rim, 21 mm wide at the bead, tapering to the spoke bed
+        MeshBuilder b;
+        latheX(b, {{0.262f, -0.0060f}, {0.290f, -0.0108f}, {0.3105f, -0.0105f}, {0.3105f, 0.0105f}, {0.290f, 0.0108f}, {0.262f, 0.0060f}}, 72);
+        wheelRim_ = b.build();
+    }
+    spokesFront_ = genSpokedHub(false);
+    spokesRear_ = genSpokedHub(true);
+    {   // 160 mm disc rotor: braking ring + 6 arms to the centre-lock carrier
+        MeshBuilder b;
+        ringX(b, 0.064f, 0.080f, -0.0009f, 0.0009f, 48);
+        ringX(b, 0.018f, 0.030f, -0.0015f, 0.0015f, 16);
+        for (int k = 0; k < 6; ++k) {
+            float a0 = 2 * PI_F * k / 6, a1 = a0 + 0.45f;
+            tube(b, {0, 0.028f * std::cos(a0), 0.028f * std::sin(a0)}, {0, 0.066f * std::cos(a1), 0.066f * std::sin(a1)}, 0.0035f, 4);
+        }
+        rotor_ = b.build();
+    }
+    {   // 52/36 chainset: rings (pitch radius 12.7 mm x T / 2pi), teeth, 4-arm spider
+        MeshBuilder b;
+        auto ring = [&](int teeth, float x0, float x1) {
+            float pr = 0.0127f * teeth / (2 * PI_F);
+            ringX(b, pr - 0.014f, pr + 0.002f, x0, x1, teeth * 2);
+            for (int t = 0; t < teeth; ++t) {  // simple tooth tips
+                float a = 2 * PI_F * t / teeth, ca = std::cos(a), sa = std::sin(a);
+                tube(b, {(x0 + x1) * 0.5f, (pr + 0.001f) * ca, (pr + 0.001f) * sa}, {(x0 + x1) * 0.5f, (pr + 0.0045f) * ca, (pr + 0.0045f) * sa}, 0.0016f, 3);
+            }
+        };
+        ring(52, -0.0040f, -0.0020f);
+        ring(36, 0.0035f, 0.0055f);
+        for (int k = 0; k < 4; ++k) {
+            float a = 2 * PI_F * k / 4 + 0.4f;
+            tube(b, {-0.002f, 0.012f * std::cos(a), 0.012f * std::sin(a)}, {-0.002f, 0.092f * std::cos(a), 0.092f * std::sin(a)}, 0.0055f, 5);
+        }
+        ringX(b, 0.0f, 0.016f, -0.006f, 0.006f, 16);
+        chainring_ = b.build();
+    }
+    {   // 11-speed 11-30 cassette, 3.8 mm pitch (smallest cog outboard = -x)
+        MeshBuilder b;
+        const int cogs[11] = {30, 27, 24, 21, 19, 17, 15, 14, 13, 12, 11};
+        for (int i = 0; i < 11; ++i) {
+            float pr = 0.0127f * cogs[i] / (2 * PI_F), x = -0.0038f * i;
+            ringX(b, 0.017f, pr + 0.003f, x - 0.0009f, x + 0.0009f, std::max(24, cogs[i] * 2));
+        }
+        cassette_ = b.build();
+    }
     skyDome_ = GenMeshSphere(1, 24, 32);
     water_ = GenMeshPlane(30000, 30000, 8, 8);
+    // a new set of trees, bushes and rocks every launch (ez-tree port, fresh seeds)
+    trees::setSeed(std::getenv("CORERAY_TREESEED") ? uint32_t(std::atoi(std::getenv("CORERAY_TREESEED"))) : uint32_t(std::time(nullptr)));
     for (int t = 0; t < trees::TYPES; ++t) trees_[t] = trees::build(t, quality_);
+    for (int b = 0; b < trees::BUSHES; ++b) bushes_[b] = trees::buildBush(b);
+    for (int r = 0; r < trees::ROCKS; ++r) rocks_[r] = trees::buildRock(r);
     leafAtlas_ = trees::leafAtlas(quality_);
     foliageMat_.maps[MATERIAL_MAP_ALBEDO].texture = leafAtlas_;
     depthInstMat_.maps[MATERIAL_MAP_ALBEDO].texture = leafAtlas_;
-    {
-        MeshBuilder b;
-        addBlob(b, {0, 0.25f, 0}, {1.0f, 0.55f, 0.85f}, 6, 9, 0.45f, 9);
-        rockMesh_ = b.build();
-    }
+    if (!std::getenv("CORERAY_NOIMP")) bakeImpostors();
     // grass tufts, cartoon style: a rounded clump of wide, pointed, curving blades (unit
     // height), the middle ones tallest. Normals point out from a centre below the clump so it
     // shades as one soft volume. Vertex colour = per-blade tint; uv.y = 0 root .. 1 tip;
@@ -291,6 +395,13 @@ void Renderer::buildMeshes() {
     pyramid_ = GenMeshCone(1, 1, 4);
     rig_.build();
     ghostRig_.build();
+    if (!greyReady_ && !greyFuture_.valid()) {
+        greyFuture_ = std::async(std::launch::async, [] {
+            body::Params p;
+            p.cell = 0.009f;   // ~35k verts: plenty at riding distance
+            return body::build(p);
+        });
+    }
     buildAnimalMeshes();
 }
 
@@ -299,12 +410,16 @@ void Renderer::shutdown() {
     stopWorkers();
     destroyTargets();
     for (auto& r : shadow_) unloadRT(r);
-    for (auto& [k, c] : chunks_) { if (c.mesh.vaoId) UnloadMesh(c.mesh); if (c.water.vaoId) UnloadMesh(c.water); }
+    if (tunnelTex_) { rlUnloadTexture(tunnelTex_); tunnelTex_ = 0; }
+    if (sunJob_.valid()) sunJob_.wait();
+    if (sunTex_) { rlUnloadTexture(sunTex_); sunTex_ = 0; }
+    for (auto& [k, c] : chunks_) { if (c.mesh.vaoId) UnloadMesh(c.mesh); if (c.water.vaoId) UnloadMesh(c.water); if (c.roads.vaoId) UnloadMesh(c.roads); }
     chunks_.clear();
     for (auto& r : road_) if (r.mesh.vaoId) UnloadMesh(r.mesh);
     road_.clear();
+    clearStructures();
     camInit_ = false;
-    for (Mesh* m : {&water_, &skyDome_, &cyl_, &sphere_, &cube_, &cone_, &wheelTire_, &wheelRim_, &rockMesh_,
+    for (Mesh* m : {&water_, &skyDome_, &cyl_, &sphere_, &cube_, &cone_, &wheelTire_, &wheelRim_, &spokesFront_, &spokesRear_, &rotor_, &chainring_, &cassette_,
                     &tuft_, &flowerTuft_, &shaftCone_, &pyramid_})
         if (m->vaoId) { UnloadMesh(*m); *m = Mesh{}; }
     for (auto& am : animals_)
@@ -313,9 +428,14 @@ void Renderer::shutdown() {
     grass_.clear();
     rig_.unload();
     ghostRig_.unload();
+    if (greyFuture_.valid()) greyFuture_.wait();
+    if (greyReady_) { UnloadMesh(greyMesh_); greyMesh_ = Mesh{}; greyReady_ = false; }
     tex::unload(tex_);
     unloadVolumetrics();
-    for (auto& t : trees_) { if (t.hi.vaoId) UnloadMesh(t.hi); if (t.lo.vaoId) UnloadMesh(t.lo); t = trees::Built{}; }
+    unloadImpostors();
+    for (auto& t : trees_) { if (t.hi.vaoId) UnloadMesh(t.hi); if (t.lo.vaoId) UnloadMesh(t.lo); if (t.shadow.vaoId) UnloadMesh(t.shadow); t = trees::Built{}; }
+    for (auto& t : bushes_) { if (t.hi.vaoId) UnloadMesh(t.hi); if (t.lo.vaoId) UnloadMesh(t.lo); t = trees::Built{}; }
+    for (auto& r : rocks_) if (r.vaoId) { UnloadMesh(r); r = Mesh{}; }
     if (leafAtlas_.id) { UnloadTexture(leafAtlas_); leafAtlas_ = Texture2D{}; }
     for (Shader s : {terrainSh_, roadSh_, objectSh_, foliageSh_, waterSh_, skySh_, depthSh_, depthInstSh_, brightSh_, blurSh_, compositeSh_, fxaaSh_,
                      grassSh_, animalSh_, volumeSh_, particleSh_, kitSh_, refrCopySh_})
@@ -346,10 +466,11 @@ void Renderer::setCourse(std::shared_ptr<const Course> c) {
         inFlight_.clear();
         eroding_.clear();
     }
-    for (auto& [k, ch] : chunks_) { if (ch.mesh.vaoId) UnloadMesh(ch.mesh); if (ch.water.vaoId) UnloadMesh(ch.water); }
+    for (auto& [k, ch] : chunks_) { if (ch.mesh.vaoId) UnloadMesh(ch.mesh); if (ch.water.vaoId) UnloadMesh(ch.water); if (ch.roads.vaoId) UnloadMesh(ch.roads); }
     chunks_.clear();
     for (auto& r : road_) if (r.mesh.vaoId) UnloadMesh(r.mesh);
     road_.clear();
+    clearStructures();
     herds_.clear();
     birds_.clear();
     grass_.clear();
@@ -449,6 +570,7 @@ void Renderer::computeLighting(const SceneState& s) {
     L_.ambient *= 1.f + 0.7f * overcast;
     // the volumetric pass carries the near fog itself; the analytic fog keeps the distance
     L_.fog *= vol ? 1.f + w.fog * 3.f + w.rain * 0.9f + w.snow * 1.8f : 1.f + w.fog * 7.f + w.rain * 1.5f + w.snow * 2.5f;
+    L_.fog /= viewScale_;   // further views see further
     L_.fogGrey = std::clamp(w.fog * 0.6f + overcast * 0.4f, 0.f, 0.9f);
     L_.clouds = std::clamp(0.2f + w.cloud * 0.8f, 0.f, 1.f);
     L_.stars = L_.night * (1.f - smooth(0.4f, 0.85f, w.cloud)) * (1.f - w.fog);
@@ -468,8 +590,8 @@ void Renderer::computeLighting(const SceneState& s) {
 
 // ------------------------------------------------------------------ targets
 void Renderer::createTargets() {
-    rtW_ = std::max(16, GetRenderWidth());
-    rtH_ = std::max(16, GetRenderHeight());
+    rtW_ = targetW();
+    rtH_ = targetH();
     const int HDR = PIXELFORMAT_UNCOMPRESSED_R16G16B16A16;
     // the scene's depth is a texture so the water pass can read it (via the refraction copy)
     scene_ = loadRT(rtW_, rtH_, HDR, false);
@@ -485,11 +607,21 @@ void Renderer::createTargets() {
     qA_ = loadRT(rtW_ / 8, rtH_ / 8, HDR, false);
     qB_ = loadRT(rtW_ / 8, rtH_ / 8, HDR, false);
     ldr_ = loadRT(rtW_, rtH_, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, false);
+    SetTextureFilter(ldr_.texture, TEXTURE_FILTER_BILINEAR);   // upscaled to the window when the render scale is below 100 %
     // refraction copy: scene colour + linear depth (32-bit float so thin water stays precise)
     refr_ = loadRT(rtW_, rtH_, PIXELFORMAT_UNCOMPRESSED_R32G32B32A32, false);
     SetTextureFilter(refr_.texture, TEXTURE_FILTER_POINT);
     createVolTargets();
 }
+
+float Renderer::renderScale() const {
+    if (renderScale_ > 0) return std::clamp(renderScale_, 0.3f, 1.f);
+    if (const char* e = std::getenv("CORERAY_RENDERSCALE")) return std::clamp(float(std::atof(e)), 0.3f, 1.f);
+    // auto: Retina screens have pixels to spare; the sharpened upscale is hard to tell apart
+    return GetWindowScaleDPI().x > 1.25f ? 0.75f : 1.f;
+}
+int Renderer::targetW() const { return std::max(16, int(std::lround(GetRenderWidth() * renderScale()))); }
+int Renderer::targetH() const { return std::max(16, int(std::lround(GetRenderHeight() * renderScale()))); }
 
 void Renderer::destroyTargets() {
     destroyVolTargets();
@@ -499,6 +631,15 @@ void Renderer::destroyTargets() {
 
 // ------------------------------------------------------------------ camera
 void Renderer::updateCamera(const SceneState& s, float dt) {
+    if (s.freeCam) {   // explore mode: the camera is where it's told to be
+        cam_.position = s.camPos;
+        cam_.target = s.camTarget;
+        cam_.up = {0, 1, 0};
+        cam_.fovy = s.fov;
+        cam_.projection = CAMERA_PERSPECTIVE;
+        camInit_ = false;
+        return;
+    }
     // CoreKick's cameras (world.ts updateCamera): positions along the road relative to the
     // rider, smoothed *relative to the rider* so the camera never lags along the road.
     const Course& C = *course_;
@@ -556,7 +697,9 @@ void Renderer::updateCamera(const SceneState& s, float dt) {
         fovBase = 72.f;
         eyes = true;
     }
-    pos.y = std::max(pos.y, C.terrainHeight(pos.x, pos.z) + 1.3f);
+    // in a tunnel the land overhead isn't the floor
+    const bool inTunnel = C.world() && (C.kindAt(d) == 1 || C.kindAt(d - 12) == 1 || C.kindAt(d + 12) == 1);
+    if (!inTunnel) pos.y = std::max(pos.y, C.terrainHeight(pos.x, pos.z) + 1.3f);
     Vector3 off = Vector3Subtract(pos, anchor), lookOff = Vector3Subtract(tgt, anchor);
     if (!camInit_ || eyes) {
         camPosSmooth_ = off;
@@ -571,7 +714,7 @@ void Renderer::updateCamera(const SceneState& s, float dt) {
     cam_.fovy = cam_.fovy > 1 ? cam_.fovy + (fovT - cam_.fovy) * (1.f - std::exp(-dt * 1.5f)) : fovT;
     cam_.position = Vector3Add(anchor, camPosSmooth_);
     float g2 = C.terrainHeight(cam_.position.x, cam_.position.z) + 1.2f;
-    if (!eyes && cam_.position.y < g2) cam_.position.y = g2;
+    if (!eyes && !inTunnel && cam_.position.y < g2) cam_.position.y = g2;
     cam_.target = Vector3Add(anchor, camTargetSmooth_);
     cam_.up = {0, 1, 0};
     cam_.projection = CAMERA_PERSPECTIVE;
@@ -601,8 +744,15 @@ void Renderer::setCommonUniforms(Shader sh) {
     setV3(sh, "cascadeCenter1", Vector3Add(cam_.position, Vector3Scale(f, cascadeRange_[1] * 0.55f)));
     setI(sh, "shadowsOn", 1);
     setF(sh, "waterLevel", course_->waterLevel());
-    setF(sh, "snowLine", refMax_ + 120.f);
-    setF(sh, "landBase", refMin_);
+    if (const wmap::Map* W = course_->world()) {   // a generated world: its own climate
+        setF(sh, "snowLine", W->snowLine);
+        setF(sh, "landBase", W->snowLine - 1900.f);
+        setI(sh, "worldMode", 1);
+    } else {
+        setF(sh, "snowLine", refMax_ + 120.f);
+        setF(sh, "landBase", refMin_);
+        setI(sh, "worldMode", 0);
+    }
     setF(sh, "cloudCover", L_.clouds);
     setF(sh, "night", L_.night);
     setF(sh, "fogGrey", L_.fogGrey);
@@ -612,6 +762,17 @@ void Renderer::setCommonUniforms(Shader sh) {
     setV4(sh, "csmRect", csmRect_);
     setF(sh, "volClouds", volEnabled() ? 1.f : 0.f);
     setLightUniforms(sh);
+    // ridges between the sun and the land
+    setI(sh, "sunTerrain", 9);
+    setV4(sh, "sunTerrainRect", sunTex_ ? sunRect_ : Vector4{0, 0, 0, 0});
+    // tunnels: daylight only from the mouths, the ceiling lamps
+    setI(sh, "tunnelMap", 15);
+    setV4(sh, "tunnelRect", tunnelTex_ ? tunnelRect_ : Vector4{0, 0, 0, 0});
+    int nt = int(std::min<size_t>(24, tunnelLampsU_.size()));
+    setI(sh, "numTunnelLamps", tunnelRect_.z > 0 ? nt : 0);
+    setV3(sh, "tunnelLampCol", Vector3Scale({1.0f, 0.80f, 0.56f}, 8.f));   // warm white
+    int lt = GetShaderLocation(sh, "tunnelLamp");
+    if (nt > 0 && lt >= 0) SetShaderValueV(sh, lt, tunnelLampsU_.data(), SHADER_UNIFORM_VEC3, nt);
 }
 
 void Renderer::setLightUniforms(Shader sh) {
@@ -666,58 +827,122 @@ void Renderer::drawRider(const Matrix& base, const SceneState& s, bool ghost, bo
     const Color metal{170, 172, 178, 255};
     const float em = ghost ? 0.35f : 0.f;
 
-    Vector3 rearAxle{0, 0.335f, -0.405f}, frontAxle{0, 0.335f, 0.60f}, bb{0, 0.275f, 0};
-    Vector3 seatTop{0, 0.83f, -0.155f}, headTop{0, 0.87f, 0.475f}, headBot{0, 0.71f, 0.515f};
+    // Geometry of a 56 cm endurance road bike (metres, bike-local: +z forward, +x = rider's
+    // left, y up, ground at 0). Rider contact points (saddle, hoods, pedals at BB +-170 mm)
+    // are shared with RiderRig / the greybox body and must not move.
+    const float AY = WHEEL_ROLL_R;                       // axle height = loaded rolling radius
+    Vector3 rearAxle{0, AY, -0.408f}, frontAxle{0, AY, 0.598f}, bb{0, 0.275f, 0};
+    Vector3 seatTop{0, 0.80f, -0.148f}, headTop{0, 0.87f, 0.462f}, headBot{0, 0.715f, 0.510f};
     Vector3 saddle{0, 0.93f, -0.19f};
-    float tr = 0.016f;
-    drawLimb(bb, seatTop, tr * 1.2f, base, frame, sp, 0.35f, 0.6f);
-    drawLimb(seatTop, headTop, tr, base, frame, sp, 0.35f, 0.6f);
-    drawLimb(bb, headBot, tr * 1.4f, base, accent, sp, 0.35f, 0.6f);
-    drawLimb(headBot, headTop, tr * 1.3f, base, frame, sp, 0.35f, 0.6f);
-    for (float x : {-0.055f, 0.055f}) {
-        drawLimb({x, bb.y, bb.z}, {x, rearAxle.y, rearAxle.z}, tr * 0.75f, base, frame, sp, 0.35f, 0.6f);
-        drawLimb({x * 0.4f, 0.80f, -0.15f}, {x, rearAxle.y, rearAxle.z}, tr * 0.7f, base, frame, sp, 0.35f, 0.6f);
-        drawLimb({x * 0.6f, headBot.y, headBot.z}, {x, frontAxle.y, frontAxle.z}, tr * 0.8f, base, frame, sp, 0.35f, 0.6f);
+    Vector3 stemEnd{0, 0.905f, 0.572f};
+    const Color bar{22, 22, 26, 255};
+    const Color rubber{30, 30, 34, 255};
+    const Color chain{95, 95, 100, 255};
+
+    // ---- frame (tapered / ovalised tubes)
+    drawPart(cyl_, alignY(bb, headBot, 0.019f, 0.026f), base, accent, 0.35f, 0.6f, sp, 0, em);   // down tube (aero oval)
+    drawPart(cyl_, alignY(bb, seatTop, 0.017f, 0.019f), base, frame, 0.35f, 0.6f, sp, 0, em);    // seat tube
+    drawLimb(seatTop, headTop, 0.0145f, base, frame, sp, 0.35f, 0.6f);                         // top tube (slight slope)
+    drawPart(cyl_, alignY(headBot, headTop, 0.021f, 0.021f), base, frame, 0.35f, 0.6f, sp, 0, em);  // head tube
+    drawPart(sphere_, MatrixMultiply(MatrixScale(0.034f, 0.03f, 0.04f), MatrixTranslate(bb.x, bb.y, bb.z)), base, frame, 0.35f, 0.6f, sp);  // BB shell
+    for (float x : {-1.f, 1.f}) {
+        // chainstays and dropped seatstays to the rear dropout
+        drawLimb({x * 0.030f, bb.y + 0.005f, bb.z - 0.03f}, {x * 0.064f, rearAxle.y, rearAxle.z + 0.01f}, 0.0105f, base, frame, sp, 0.35f, 0.6f);
+        drawLimb({x * 0.016f, 0.735f, -0.128f}, {x * 0.064f, rearAxle.y + 0.012f, rearAxle.z + 0.004f}, 0.0085f, base, frame, sp, 0.35f, 0.6f);
+        // fork: straight-tapered blades with 45 mm rake to the front axle
+        Vector3 crown{x * 0.032f, headBot.y - 0.025f, headBot.z + 0.008f};
+        Vector3 mid{x * 0.052f, 0.48f, 0.565f};
+        drawPart(cyl_, alignY(crown, mid, 0.012f, 0.017f), base, frame, 0.35f, 0.6f, sp, 0, em);
+        drawPart(cyl_, alignY(mid, {x * 0.054f, frontAxle.y, frontAxle.z}, 0.0095f, 0.012f), base, frame, 0.35f, 0.6f, sp, 0, em);
     }
-    drawLimb(seatTop, {0, saddle.y - 0.02f, saddle.z + 0.01f}, 0.012f, base, frame, sp);
-    drawPart(cube_, MatrixMultiply(MatrixScale(0.13f, 0.035f, 0.27f), MatrixTranslate(saddle.x, saddle.y, saddle.z)), base, {15, 15, 15, 255}, 0.6f, 0.3f, sp);
-    Vector3 stemEnd{0, 0.91f, 0.57f};
-    drawLimb(headTop, stemEnd, 0.014f, base, frame, sp);
-    drawPart(cyl_, alignY({-0.21f, stemEnd.y, stemEnd.z}, {0.21f, stemEnd.y, stemEnd.z}, 0.012f, 0.012f), base, frame, 0.5f, 0.4f, sp);
-    for (float x : {-0.21f, 0.21f}) {
-        drawLimb({x, stemEnd.y, stemEnd.z}, {x, 0.93f, 0.66f}, 0.013f, base, frame, sp);
-        drawLimb({x, stemEnd.y, stemEnd.z}, {x, 0.80f, 0.62f}, 0.012f, base, frame, sp);
-        drawLimb({x, 0.80f, 0.62f}, {x, 0.78f, 0.53f}, 0.012f, base, frame, sp);
+    drawPart(cube_, MatrixMultiply(MatrixScale(0.075f, 0.03f, 0.045f), MatrixTranslate(0, headBot.y - 0.02f, headBot.z + 0.006f)), base, frame, 0.35f, 0.6f, sp);  // fork crown
+    // seatpost, saddle (rails + shell + nose)
+    drawLimb(seatTop, {0, saddle.y - 0.03f, saddle.z + 0.012f}, 0.0135f, base, bar, sp, 0.4f, 0.5f);
+    drawPart(sphere_, MatrixMultiply(MatrixScale(0.068f, 0.018f, 0.095f), MatrixTranslate(saddle.x, saddle.y - 0.008f, saddle.z - 0.035f)), base, {15, 15, 15, 255}, 0.6f, 0.3f, sp);
+    drawPart(sphere_, ellipsoid({0, saddle.y - 0.008f, saddle.z - 0.02f}, {0, saddle.y - 0.012f, saddle.z + 0.125f}, 0.022f, 0.016f), base, {15, 15, 15, 255}, 0.6f, 0.3f, sp);
+    // cockpit: spacers, stem, bar tops, ramps to the hoods, drops; hoods + levers
+    drawLimb(headTop, {0, headTop.y + 0.02f, headTop.z - 0.006f}, 0.017f, base, bar, sp);
+    drawPart(cyl_, alignY({0, headTop.y + 0.012f, headTop.z - 0.004f}, stemEnd, 0.016f, 0.019f), base, bar, 0.4f, 0.5f, sp);
+    drawPart(cyl_, alignY({-0.205f, stemEnd.y, stemEnd.z}, {0.205f, stemEnd.y, stemEnd.z}, 0.0125f, 0.0125f), base, bar, 0.7f, 0.2f, sp);
+    for (float x : {-0.205f, 0.205f}) {
+        float sx = x > 0 ? 1.f : -1.f;
+        Vector3 bend{x + sx * 0.008f, stemEnd.y + 0.004f, stemEnd.z + 0.045f};
+        Vector3 hood{x + sx * 0.008f, 0.925f, 0.625f};
+        drawLimb({x, stemEnd.y, stemEnd.z}, bend, 0.0125f, base, bar, sp, 0.7f, 0.2f);
+        drawLimb(bend, hood, 0.0125f, base, bar, sp, 0.7f, 0.2f);
+        drawLimb(hood, {x + sx * 0.012f, 0.86f, 0.655f}, 0.0125f, base, bar, sp, 0.7f, 0.2f);       // drop curve
+        drawLimb({x + sx * 0.012f, 0.86f, 0.655f}, {x + sx * 0.014f, 0.80f, 0.62f}, 0.0125f, base, bar, sp, 0.7f, 0.2f);
+        drawLimb({x + sx * 0.014f, 0.80f, 0.62f}, {x + sx * 0.014f, 0.785f, 0.535f}, 0.0125f, base, bar, sp, 0.7f, 0.2f);  // drops
+        drawPart(sphere_, ellipsoid({hood.x, hood.y - 0.005f, hood.z - 0.02f}, {hood.x, hood.y + 0.012f, hood.z + 0.04f}, 0.017f, 0.021f), base, rubber, 0.8f, 0.2f, sp);  // hood body
+        drawLimb({hood.x, hood.y - 0.005f, hood.z + 0.035f}, {hood.x, 0.83f, 0.672f}, 0.0065f, base, metal, sp, 0.3f, 0.8f);  // brake/shift lever
     }
     // lights: front white, rear red - they glow at night
     float glow = L_.night;
     drawPart(cube_, MatrixMultiply(MatrixScale(0.05f, 0.035f, 0.05f), MatrixTranslate(0, stemEnd.y - 0.04f, stemEnd.z + 0.05f)), base, {240, 240, 230, 255}, 0.3f, 0.5f, sp, 0, 2 + glow * 30);
-    drawPart(cube_, MatrixMultiply(MatrixScale(0.03f, 0.05f, 0.02f), MatrixTranslate(0, 0.78f, -0.26f)), base, {230, 20, 20, 255}, 0.3f, 0.5f, sp, 0, 1 + glow * 25);
-    for (Vector3 axle : {rearAxle, frontAxle}) {
-        Matrix spin = MatrixMultiply(MatrixRotateX(float(s.wheelAngle)), MatrixTranslate(axle.x, axle.y, axle.z));
-        drawPart(wheelTire_, spin, base, tire, 0.8f, 0.1f, sp);
-        drawPart(wheelRim_, spin, base, ghost ? accent : Color{40, 40, 46, 255}, 0.3f, 0.7f, sp, 0, em);
-        if (!sp) {
-            for (int k = 0; k < 10; ++k) {
-                float a = k * 2 * PI_F / 10;
-                Vector3 e{(k % 2 ? 0.02f : -0.02f), std::cos(a) * 0.29f, std::sin(a) * 0.29f};
-                drawPart(cyl_, MatrixMultiply(alignY({0, 0, 0}, e, 0.0022f, 0.0022f), spin), base, metal, 0.3f, 0.8f, false);
-            }
-        }
-        drawPart(cyl_, MatrixMultiply(alignY({-0.05f, 0, 0}, {0.05f, 0, 0}, 0.02f, 0.02f), MatrixTranslate(axle.x, axle.y, axle.z)), base, metal, 0.3f, 0.8f, sp);
+    drawPart(cube_, MatrixMultiply(MatrixScale(0.03f, 0.05f, 0.02f), MatrixTranslate(0, 0.76f, -0.245f)), base, {230, 20, 20, 255}, 0.3f, 0.5f, sp, 0, 1 + glow * 25);
+    // bottle cage + bottle on the down tube
+    {
+        Vector3 dd = Vector3Normalize(Vector3Subtract(headBot, bb));
+        Vector3 up{0, dd.z, -dd.y};
+        Vector3 b0 = Vector3Add(Vector3Add(bb, Vector3Scale(dd, 0.16f)), Vector3Scale(up, 0.05f));
+        Vector3 b1 = Vector3Add(b0, Vector3Scale(dd, 0.19f));
+        drawPart(cyl_, alignY(b0, b1, 0.034f, 0.034f), base, ghost ? accent : Color{230, 232, 236, 255}, 0.5f, 0.4f, sp, 0, em);
+        drawLimb(b1, Vector3Add(b1, Vector3Scale(dd, 0.025f)), 0.014f, base, {20, 20, 24, 255}, sp);
     }
-    Matrix ring = MatrixMultiply(MatrixMultiply(MatrixScale(1, 0.33f, 0.33f), MatrixRotateX(float(s.crankAngle))), MatrixTranslate(-0.065f, bb.y, bb.z));
-    drawPart(wheelRim_, ring, base, metal, 0.3f, 0.8f, sp);
-    if (!sp) drawLimb({-0.064f, bb.y, bb.z}, {-0.06f, rearAxle.y, rearAxle.z}, 0.004f, base, {60, 60, 60, 255}, false);
-    // cranks + pedals at the real crank angle (forward pedalling)
+
+    // ---- wheels: tyre, deep rim, hub + laced spokes, disc rotor (left side); all spin together.
+    // wheelAngle = distance / WHEEL_ROLL_R, so the contact patch is stationary on the road.
+    for (int w = 0; w < 2; ++w) {
+        Vector3 axle = w ? frontAxle : rearAxle;
+        Matrix spin = MatrixMultiply(MatrixRotateX(float(s.wheelAngle)), MatrixTranslate(axle.x, axle.y, axle.z));
+        drawPart(wheelTire_, spin, base, tire, 0.85f, 0.08f, sp);
+        drawPart(wheelRim_, spin, base, ghost ? accent : Color{30, 30, 34, 255}, 0.3f, 0.7f, sp, 0, em);
+        if (!sp) drawPart(w ? spokesFront_ : spokesRear_, spin, base, metal, 0.3f, 0.8f, false);
+        drawPart(rotor_, MatrixMultiply(MatrixMultiply(MatrixTranslate(0.058f, 0, 0), MatrixRotateX(float(s.wheelAngle))), MatrixTranslate(axle.x, axle.y, axle.z)),
+                 base, metal, 0.25f, 0.9f, sp);
+        // brake caliper on the left fork blade / chainstay, just above-behind the rotor
+        float cz = w ? -0.055f : 0.06f;
+        drawPart(cube_, MatrixMultiply(MatrixScale(0.022f, 0.05f, 0.06f), MatrixTranslate(0.058f, axle.y + 0.055f, axle.z + cz)), base, {40, 40, 44, 255}, 0.4f, 0.6f, sp);
+        drawPart(cyl_, MatrixMultiply(alignY({-0.068f, 0, 0}, {0.068f, 0, 0}, 0.006f, 0.006f), MatrixTranslate(axle.x, axle.y, axle.z)), base, metal, 0.3f, 0.8f, sp);  // thru-axle
+    }
+
+    // ---- drivetrain (right side, -x): cassette, chainset at the crank angle, chain, derailleurs
+    drawPart(cassette_, MatrixMultiply(MatrixMultiply(MatrixTranslate(-0.028f, 0, 0), MatrixRotateX(float(s.wheelAngle))), MatrixTranslate(rearAxle.x, rearAxle.y, rearAxle.z)),
+             base, metal, 0.3f, 0.85f, sp);
+    drawPart(chainring_, MatrixMultiply(MatrixMultiply(MatrixTranslate(-0.068f, 0, 0), MatrixRotateX(float(s.crankAngle))), MatrixTranslate(bb.x, bb.y, bb.z)),
+             base, {50, 50, 56, 255}, 0.3f, 0.8f, sp);
+    if (!sp) {
+        // chain on the big ring (pitch r 105 mm) and a mid cog (17T, r 34 mm)
+        const float rc = 0.0127f * 52 / (2 * PI_F), rk = 0.0127f * 17 / (2 * PI_F), cx = -0.07f;
+        Vector3 cTop{cx, bb.y + rc, bb.z}, kTop{cx + 0.022f, rearAxle.y + rk, rearAxle.z};
+        Vector3 pUp{cx + 0.014f, rearAxle.y - 0.05f, rearAxle.z + 0.004f}, pLo{cx + 0.006f, rearAxle.y - 0.118f, rearAxle.z + 0.03f};
+        Vector3 cBot{cx, bb.y - rc, bb.z};
+        drawLimb(cTop, kTop, 0.0042f, base, chain, false, 0.4f, 0.9f);
+        drawLimb(cBot, pLo, 0.0042f, base, chain, false, 0.4f, 0.9f);
+        drawLimb(pLo, pUp, 0.0042f, base, chain, false, 0.4f, 0.9f);
+        drawLimb(pUp, {cx + 0.022f, rearAxle.y - rk, rearAxle.z - 0.01f}, 0.0042f, base, chain, false, 0.4f, 0.9f);
+        // rear derailleur: body off the hanger + cage with two jockey wheels
+        drawPart(cube_, MatrixMultiply(MatrixScale(0.016f, 0.045f, 0.03f), MatrixTranslate(cx + 0.006f, rearAxle.y - 0.03f, rearAxle.z - 0.012f)), base, {35, 35, 40, 255}, 0.4f, 0.6f, false);
+        drawPart(cyl_, alignY(pUp, pLo, 0.006f, 0.016f), base, {35, 35, 40, 255}, 0.4f, 0.6f, false);
+        for (Vector3 pj : {pUp, pLo})
+            drawPart(sphere_, MatrixMultiply(MatrixScale(0.006f, 0.0125f, 0.0125f), MatrixTranslate(pj.x - 0.004f, pj.y, pj.z)), base, metal, 0.3f, 0.8f, false);
+        // front derailleur cage on the seat tube, just above the big ring
+        Vector3 st = Vector3Lerp(bb, seatTop, 0.24f);
+        drawPart(cube_, MatrixMultiply(MatrixScale(0.012f, 0.022f, 0.06f), MatrixTranslate(-0.072f, st.y + 0.008f, st.z + 0.03f)), base, {35, 35, 40, 255}, 0.4f, 0.6f, false);
+    }
+    // cranks (170 mm, flattened arms) + road pedals at the real crank angle (forward pedalling)
+    drawPart(cyl_, alignY({-0.072f, bb.y, bb.z}, {0.072f, bb.y, bb.z}, 0.012f, 0.012f), base, metal, 0.3f, 0.8f, sp);  // spindle
     for (int side = 0; side < 2; ++side) {
         Vector3 ped = RiderRig::pedal(s.crankAngle, side);
-        float x = ped.x;
-        drawLimb({x * 0.75f, bb.y, bb.z}, ped, 0.011f, base, metal, sp, 0.3f, 0.8f);
-        drawPart(cube_, MatrixMultiply(MatrixScale(0.07f, 0.012f, 0.09f), MatrixTranslate(ped.x + (side ? 0.03f : -0.03f), ped.y, ped.z)), base, {30, 30, 34, 255}, 0.5f, 0.4f, sp);
+        float x = ped.x, sx = side ? 1.f : -1.f;
+        Vector3 root{sx * 0.074f, bb.y, bb.z}, tip{x * 0.86f, ped.y, ped.z};
+        drawPart(cyl_, alignY(root, tip, 0.008f, 0.016f), base, {45, 45, 50, 255}, 0.3f, 0.8f, sp);
+        drawLimb(tip, ped, 0.006f, base, metal, sp, 0.3f, 0.8f);
+        drawPart(cube_, MatrixMultiply(MatrixScale(0.068f, 0.012f, 0.075f), MatrixTranslate(ped.x + sx * 0.03f, ped.y - 0.002f, ped.z)), base, {30, 30, 34, 255}, 0.5f, 0.4f, sp);
     }
     // ---- the rider: skinned human posed on the bike
     RiderRig& rig = ghost ? ghostRig_ : rig_;
+    if (!ghost && greyOn_ && greyReady_) { drawGrey(base, sp); return; }
     if (sp) DrawMesh(rig.mesh(), depthMat_, base);
     else {
         auto lin = [](Color c) { return Vector3{c.r / 255.f, c.g / 255.f, c.b / 255.f}; };
@@ -739,6 +964,64 @@ void Renderer::drawRider(const Matrix& base, const SceneState& s, bool ghost, bo
         Matrix glasses = MatrixMultiply(MatrixMultiply(MatrixScale(0.088f, 0.024f, 0.03f), MatrixTranslate(0, 1.66f, 0.088f)), headM);
         drawPart(sphere_, glasses, base, {10, 10, 14, 255}, 0.05f, 1.2f, false);
     }
+}
+
+// ------------------------------------------------------------------ greybox rider
+void Renderer::poseGrey(const SceneState& s) {
+    if (!greyReady_) {
+        if (!greyFuture_.valid() || greyFuture_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+        grey_ = greyFuture_.get();
+        const body::Mesh& M = grey_.mesh;
+        greyMesh_ = Mesh{};
+        greyMesh_.vertexCount = int(M.pos.size());
+        greyMesh_.triangleCount = int(M.idx.size() / 3);
+        greyMesh_.vertices = (float*)MemAlloc(greyMesh_.vertexCount * 3 * sizeof(float));
+        greyMesh_.normals = (float*)MemAlloc(greyMesh_.vertexCount * 3 * sizeof(float));
+        greyMesh_.texcoords = (float*)MemAlloc(greyMesh_.vertexCount * 2 * sizeof(float));
+        greyMesh_.indices = (unsigned short*)MemAlloc(M.idx.size() * sizeof(unsigned short));
+        std::memcpy(greyMesh_.vertices, M.pos.data(), M.pos.size() * sizeof(body::V3));
+        std::memcpy(greyMesh_.normals, M.nrm.data(), M.nrm.size() * sizeof(body::V3));
+        for (size_t i = 0; i < M.idx.size(); ++i) greyMesh_.indices[i] = (unsigned short)M.idx[i];
+        UploadMesh(&greyMesh_, true);
+        greyReady_ = true;
+    }
+    // the same bike geometry the kitted rider and drawRider use
+    body::anim::Bike bk;
+    bk.crank = float(s.crankAngle);
+    bk.seat = {0, 0.93f, -0.19f};
+    bk.hoodL = {0.21f, 0.94f, 0.625f};
+    bk.hoodR = {-0.21f, 0.94f, 0.625f};
+    Vector3 pr = RiderRig::pedal(s.crankAngle, 0), pl = RiderRig::pedal(s.crankAngle, 1);
+    bk.pedalR = {pr.x, pr.y, pr.z};
+    bk.pedalL = {pl.x, pl.y, pl.z};
+    bk.stand = s.stand;
+    bk.tuck = s.tuck;
+    bk.effort = s.effort;
+    body::Pose pose;
+    body::anim::cycle(grey_, pose, bk);
+    greyG_ = body::forward(grey_.skeleton, pose);
+    body::skin(grey_, greyG_, greyPos_, greyNrm_);
+    std::memcpy(greyMesh_.vertices, greyPos_.data(), greyPos_.size() * sizeof(body::V3));
+    std::memcpy(greyMesh_.normals, greyNrm_.data(), greyNrm_.size() * sizeof(body::V3));
+    UpdateMeshBuffer(greyMesh_, 0, greyMesh_.vertices, greyMesh_.vertexCount * 12, 0);
+    UpdateMeshBuffer(greyMesh_, 2, greyMesh_.normals, greyMesh_.vertexCount * 12, 0);
+}
+
+void Renderer::drawGrey(const Matrix& base, bool sp) {
+    drawPart(greyMesh_, MatrixIdentity(), base, {132, 133, 138, 255}, 0.75f, 0.15f, sp);
+    // the helmet stays: it rides on the head bone
+    const body::BoneRest& hr = grey_.skeleton.bones[body::Head];
+    body::Quat dq = body::qmul(greyG_.rot[body::Head], body::qconj(hr.rot));
+    body::V3 ax;
+    float ang = 2 * std::acos(std::clamp(dq.w, -1.f, 1.f));
+    float sn = std::sqrt(std::max(0.f, 1 - dq.w * dq.w));
+    ax = sn > 1e-5f ? body::V3{dq.x / sn, dq.y / sn, dq.z / sn} : body::V3{1, 0, 0};
+    Matrix headM = MatrixMultiply(MatrixMultiply(MatrixTranslate(-hr.head.x, -hr.head.y, -hr.head.z), MatrixRotate({ax.x, ax.y, ax.z}, ang)),
+                                  MatrixTranslate(greyG_.pos[body::Head].x, greyG_.pos[body::Head].y, greyG_.pos[body::Head].z));
+    float H = grey_.params.height, top = hr.head.y + hr.length;
+    Matrix helm = MatrixMultiply(MatrixMultiply(MatrixMultiply(MatrixScale(0.065f * H, 0.05f * H, 0.085f * H), MatrixRotateX(-0.12f)),
+                                                MatrixTranslate(0, top - 0.055f * H, -0.012f * H)), headM);
+    drawPart(sphere_, helm, base, {248, 248, 248, 255}, 0.3f, 0.6f, sp);
 }
 
 // ------------------------------------------------------------------ shadows
@@ -774,7 +1057,7 @@ void Renderer::renderShadowMaps(const SceneState& s) {
             drawLanterns(true, focus, range);
             if (s.wildlife) drawWildlife(true, focus, range);
         }
-        drawRider(riderBase(s), s, false, true);
+        if (!s.hideRider) drawRider(riderBase(s), s, false, true);
         EndMode3D();
         EndTextureMode();
     }
@@ -848,6 +1131,8 @@ void Renderer::postProcess(const SceneState& s) {
 
     BeginShaderMode(fxaaSh_);
     setV2(fxaaSh_, "texel", {1.f / rtW_, 1.f / rtH_});
+    // below full resolution the upscale gets a light contrast-adaptive sharpen
+    setF(fxaaSh_, "sharpen", std::clamp((1.f - float(rtW_) / std::max(1, GetRenderWidth())) * 1.0f, 0.f, 0.35f));   // gentle: more brings back texture grain
     DrawTexturePro(ldr_.texture, {0, 0, float(rtW_), -float(rtH_)}, {0, 0, float(GetScreenWidth()), float(GetScreenHeight())}, {0, 0}, 0, WHITE);
     EndShaderMode();
 }
@@ -867,7 +1152,7 @@ void Renderer::drawWater(const SceneState& s) {
     rlDisableColorBlend();  // alpha carries depth: write it as is
     BeginShaderMode(refrCopySh_);
     SetShaderValueTexture(refrCopySh_, GetShaderLocation(refrCopySh_, "sceneDepth"), Texture2D{scene_.depth.id, rtW_, rtH_, 1, 19});
-    setV2(refrCopySh_, "clipNF", {0.3f, 12000.f});
+    setV2(refrCopySh_, "clipNF", {0.3f, farClip()});
     blit(scene_, refr_);
     EndShaderMode();
     rlDrawRenderBatchActive();
@@ -880,7 +1165,7 @@ void Renderer::drawWater(const SceneState& s) {
     rlActiveTextureSlot(0);
     setI(waterSh_, "refrColor", 12);
     setV2(waterSh_, "screenSize", {float(rtW_), float(rtH_)});
-    setV2(waterSh_, "clipNF", {0.3f, 12000.f});
+    setV2(waterSh_, "clipNF", {0.3f, farClip()});
     setV2(waterSh_, "windVec", {std::sin(s.wx.windDir) * (0.2f + s.wx.wind), std::cos(s.wx.windDir) * (0.2f + s.wx.wind)});
     setF(waterSh_, "turbidity", std::clamp(0.06f + s.wx.rain * 0.45f + s.wx.wet * 0.15f, 0.f, 1.f));
     Vector3 camF = Vector3Normalize(Vector3Subtract(cam_.target, cam_.position));
@@ -963,7 +1248,7 @@ void Renderer::render(const SceneState& sIn, float dt) {
     } else {
         precipSound_ = {s.wx.rain, s.wx.hail, 0, 0};
     }
-    if (rtW_ != GetRenderWidth() || rtH_ != GetRenderHeight()) {
+    if (rtW_ != targetW() || rtH_ != targetH()) {
         destroyTargets();
         createTargets();
     }
@@ -972,6 +1257,8 @@ void Renderer::render(const SceneState& sIn, float dt) {
     computeLighting(s);
     updateCamera(s, dt);
     updateRoad(s.dist);
+    updateStructures();
+    updateSunTerrain();
     streamWorld(cam_.position, s.dist, 3);
     updateLanterns(s, dt);
     if (s.wildlife) updateWildlife(s, dt);
@@ -983,14 +1270,17 @@ void Renderer::render(const SceneState& sIn, float dt) {
     cascadeRange_[1] = quality_ >= 1 ? 380.f : 250.f;
 
     rig_.pose({s.crankAngle, s.stand, s.tuck, s.effort, 0.f});
+    if (greyOn_) poseGrey(s);
     if (s.pacerDist >= 0) ghostRig_.pose({s.time * 9.0, 0.f, 0.f, 0.5f, 0.f});
 
+    prof::mark(prof::Update);
     renderShadowMaps(s);
     renderCloudShadow();
+    prof::mark(prof::Shadows);
 
     BeginTextureMode(scene_);
     ClearBackground(BLACK);
-    rlSetClipPlanes(0.3, 12000.0);
+    rlSetClipPlanes(0.3, farClip());
     BeginMode3D(cam_);
     rlActiveTextureSlot(10);
     rlEnableTexture(shadow_[0].depth.id);
@@ -1000,15 +1290,18 @@ void Renderer::render(const SceneState& sIn, float dt) {
     rlEnableTexture(csm_.id ? csm_.texture.id : cloudMap_.id);
     rlActiveTextureSlot(14);
     rlEnableTexture(tex_.moor.id);   // terrain: moorland (material slots 0-11 are taken)
+    if (tunnelTex_) { rlActiveTextureSlot(15); rlEnableTexture(tunnelTex_); }   // tunnel light map
+    if (sunTex_) { rlActiveTextureSlot(9); rlEnableTexture(sunTex_); }         // terrain sun shadows
     rlActiveTextureSlot(0);
     setI(terrainSh_, "texMoor", 14);
 
-    for (Shader sh : {terrainSh_, roadSh_, objectSh_, foliageSh_, waterSh_, skySh_, grassSh_, animalSh_, volumeSh_, kitSh_}) {
+    for (Shader sh : {terrainSh_, roadSh_, objectSh_, foliageSh_, waterSh_, skySh_, grassSh_, animalSh_, volumeSh_, kitSh_, impSh_}) {
         setCommonUniforms(sh);
         setF(sh, "wetness", s.wx.wet);
         setF(sh, "snowCover", s.wx.snowCover);
         setF(sh, "flash", s.wx.flash);
     }
+    setI(terrainSh_, "tunnelSkip", 1);   // the land is never seen from inside a tube
     wind_ = 0.5f + s.wx.wind * 1.6f + s.wx.gust * 0.8f;
     static int tdebug = std::getenv("CORERAY_TDEBUG") ? std::atoi(std::getenv("CORERAY_TDEBUG")) : 0;
     setI(terrainSh_, "debugMode", tdebug);
@@ -1026,25 +1319,29 @@ void Renderer::render(const SceneState& sIn, float dt) {
     DrawMesh(skyDome_, skyMat_, MatrixMultiply(MatrixScale(6000, 6000, 6000), MatrixTranslate(cam_.position.x, cam_.position.y, cam_.position.z)));
     rlEnableDepthMask();
     rlEnableBackfaceCulling();
+    prof::mark(prof::Sky);
 
-    drawWorld(false, 0, cam_.position, 0);
+    drawWorld(false, 0, cam_.position, 0);   // marks Terrain, Road, Foliage, Props
     drawGrass(s);
+    prof::mark(prof::Grass);
     drawLanterns(false, cam_.position, 0);
     if (s.wildlife) drawWildlife(false, cam_.position, 0);
 
-    if (s.cam != CamMode::FirstPerson) drawRider(riderBase(s), s, false, false);
+    if (s.cam != CamMode::FirstPerson && !s.hideRider) drawRider(riderBase(s), s, false, false);
     if (s.pacerDist >= 0) {
         auto pp = course_->at(s.pacerDist);
         Vector3 ppos = Vector3Add(toV(pp.pos), Vector3Scale(rightOf(pp.heading), -0.2f));
         Matrix pb = MatrixMultiply(MatrixMultiply(MatrixRotateX(-std::atan(pp.grade)), MatrixRotateY(pp.heading)), MatrixTranslate(ppos.x, ppos.y, ppos.z));
         SceneState ps = s;
         ps.crankAngle = s.time * 9.0;
-        ps.wheelAngle = s.pacerDist / 0.335;
+        ps.wheelAngle = std::fmod(s.pacerDist / WHEEL_ROLL_R, 2 * PI);
         drawRider(pb, ps, true, false);
     }
     if (s.wildlife) drawBirds(s);
     drawBolt();
+    prof::mark(prof::Props);
     drawWater(s);
+    prof::mark(prof::Water);
 
     rlActiveTextureSlot(10);
     rlDisableTexture();
@@ -1054,6 +1351,10 @@ void Renderer::render(const SceneState& sIn, float dt) {
     rlDisableTexture();
     rlActiveTextureSlot(14);
     rlDisableTexture();
+    rlActiveTextureSlot(15);
+    rlDisableTexture();
+    rlActiveTextureSlot(9);
+    rlDisableTexture();
     rlActiveTextureSlot(0);
     if (volEnabled() && sceneFx_.id) {
         // fog, light cones, rain shafts and clouds over the opaque scene + water, then the
@@ -1061,13 +1362,16 @@ void Renderer::render(const SceneState& sIn, float dt) {
         EndMode3D();
         EndTextureMode();
         renderVolumetrics(s);
+        prof::mark(prof::Volumetrics);
         BeginTextureMode(sceneFx_);
         BeginMode3D(cam_);
     }
     drawLightShafts();
     drawParticles(s);
+    prof::mark(prof::Particles);
     EndMode3D();
     EndTextureMode();
 
     postProcess(s);
+    prof::mark(prof::Post);
 }

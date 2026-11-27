@@ -192,6 +192,8 @@ bool Renderer::init(int quality) {
     shadowRes_ = quality >= 2 ? 4096 : quality == 1 ? 2048 : 1024;
     std::string head = shaders::FS_HEADER, common = shaders::FS_COMMON;
     terrainSh_ = loadShader(shaders::VS_TERRAIN, head + common + shaders::FS_TERRAIN, "terrain");
+    terrainCutSh_ = loadShader(shaders::VS_TERRAIN, head + "#define PORTAL_CUT\n" + common + shaders::FS_TERRAIN, "terrain-portal");
+    terrainFarSh_ = loadShader(shaders::VS_TERRAIN, head + "#define FAR_TERRAIN\n" + common + shaders::FS_TERRAIN, "terrain-far");
     roadSh_ = loadShader(shaders::VS_STATIC, head + common + shaders::FS_ROAD, "road");
     objectSh_ = loadShader(shaders::VS_STATIC, head + common + shaders::FS_OBJECT, "object");
     waterSh_ = loadShader(shaders::VS_STATIC, head + common + shaders::FS_WATER, "water");
@@ -222,23 +224,26 @@ bool Renderer::init(int quality) {
     waterMat_ = makeMat(waterSh_); skyMat_ = makeMat(skySh_); foliageMat_ = makeMat(foliageSh_);
     depthMat_ = makeMat(depthSh_); depthInstMat_ = makeMat(depthInstSh_);
     grassMat_ = makeMat(grassSh_); animalMat_ = makeMat(animalSh_); volumeMat_ = makeMat(volumeSh_); kitMat_ = makeMat(kitSh_);
-    terrainMat_.maps[MATERIAL_MAP_ALBEDO].texture = tex_.grass;
     grassMat_.maps[MATERIAL_MAP_ALBEDO].texture = tex_.grass;
     roadMat_.maps[MATERIAL_MAP_ALBEDO].texture = tex_.asphalt;
     roadMat_.maps[MATERIAL_MAP_METALNESS].texture = tex_.gravel;
     roadMat_.maps[MATERIAL_MAP_NORMAL].texture = tex_.grass;
-    terrainMat_.maps[MATERIAL_MAP_METALNESS].texture = tex_.rock;
-    terrainMat_.maps[MATERIAL_MAP_NORMAL].texture = tex_.gravel;
-    terrainSh_.locs[SHADER_LOC_MAP_ROUGHNESS] = GetShaderLocation(terrainSh_, "texSand");
-    terrainSh_.locs[SHADER_LOC_MAP_OCCLUSION] = GetShaderLocation(terrainSh_, "texSoil");
-    terrainMat_.shader = terrainSh_;
-    terrainMat_.maps[MATERIAL_MAP_ROUGHNESS].texture = tex_.sand;
-    terrainMat_.maps[MATERIAL_MAP_OCCLUSION].texture = tex_.soil;
-    terrainSh_.locs[SHADER_LOC_MAP_EMISSION] = GetShaderLocation(terrainSh_, "texGranite");
-    terrainSh_.locs[SHADER_LOC_MAP_HEIGHT] = GetShaderLocation(terrainSh_, "texScree");
-    terrainMat_.shader = terrainSh_;
-    terrainMat_.maps[MATERIAL_MAP_EMISSION].texture = tex_.granite;
-    terrainMat_.maps[MATERIAL_MAP_HEIGHT].texture = tex_.scree;
+    // the terrain's eight textures ride on raylib's material slots (texMoor is bound by hand)
+    for (auto [sh, mat] : {std::pair<Shader*, Material*>{&terrainSh_, &terrainMat_}, {&terrainCutSh_, &terrainCutMat_}, {&terrainFarSh_, &terrainFarMat_}}) {
+        if (mat != &terrainMat_) *mat = makeMat(*sh);
+        mat->maps[MATERIAL_MAP_ALBEDO].texture = tex_.grass;
+        mat->maps[MATERIAL_MAP_METALNESS].texture = tex_.rock;
+        mat->maps[MATERIAL_MAP_NORMAL].texture = tex_.gravel;
+        sh->locs[SHADER_LOC_MAP_ROUGHNESS] = GetShaderLocation(*sh, "texSand");
+        sh->locs[SHADER_LOC_MAP_OCCLUSION] = GetShaderLocation(*sh, "texSoil");
+        sh->locs[SHADER_LOC_MAP_EMISSION] = GetShaderLocation(*sh, "texGranite");
+        sh->locs[SHADER_LOC_MAP_HEIGHT] = GetShaderLocation(*sh, "texScree");
+        mat->shader = *sh;
+        mat->maps[MATERIAL_MAP_ROUGHNESS].texture = tex_.sand;
+        mat->maps[MATERIAL_MAP_OCCLUSION].texture = tex_.soil;
+        mat->maps[MATERIAL_MAP_EMISSION].texture = tex_.granite;
+        mat->maps[MATERIAL_MAP_HEIGHT].texture = tex_.scree;
+    }
     buildMeshes();
     for (int i = 0; i < 2; ++i) shadow_[i] = loadShadowRT(shadowRes_);
     startWorkers();
@@ -437,7 +442,7 @@ void Renderer::shutdown() {
     for (auto& t : bushes_) { if (t.hi.vaoId) UnloadMesh(t.hi); if (t.lo.vaoId) UnloadMesh(t.lo); t = trees::Built{}; }
     for (auto& r : rocks_) if (r.vaoId) { UnloadMesh(r); r = Mesh{}; }
     if (leafAtlas_.id) { UnloadTexture(leafAtlas_); leafAtlas_ = Texture2D{}; }
-    for (Shader s : {terrainSh_, roadSh_, objectSh_, foliageSh_, waterSh_, skySh_, depthSh_, depthInstSh_, brightSh_, blurSh_, compositeSh_, fxaaSh_,
+    for (Shader s : {terrainSh_, terrainCutSh_, terrainFarSh_, roadSh_, objectSh_, foliageSh_, waterSh_, skySh_, depthSh_, depthInstSh_, brightSh_, blurSh_, compositeSh_, fxaaSh_,
                      grassSh_, animalSh_, volumeSh_, particleSh_, kitSh_, refrCopySh_})
         UnloadShader(s);
     ready_ = false;
@@ -1293,18 +1298,20 @@ void Renderer::render(const SceneState& sIn, float dt) {
     if (tunnelTex_) { rlActiveTextureSlot(15); rlEnableTexture(tunnelTex_); }   // tunnel light map
     if (sunTex_) { rlActiveTextureSlot(9); rlEnableTexture(sunTex_); }         // terrain sun shadows
     rlActiveTextureSlot(0);
-    setI(terrainSh_, "texMoor", 14);
+    for (Shader sh : {terrainSh_, terrainCutSh_, terrainFarSh_}) {
+        setI(sh, "texMoor", 14);
+        setI(sh, "tunnelSkip", 1);   // the land is never seen from inside a tube
+    }
 
-    for (Shader sh : {terrainSh_, roadSh_, objectSh_, foliageSh_, waterSh_, skySh_, grassSh_, animalSh_, volumeSh_, kitSh_, impSh_}) {
+    for (Shader sh : {terrainSh_, terrainCutSh_, terrainFarSh_, roadSh_, objectSh_, foliageSh_, waterSh_, skySh_, grassSh_, animalSh_, volumeSh_, kitSh_, impSh_}) {
         setCommonUniforms(sh);
         setF(sh, "wetness", s.wx.wet);
         setF(sh, "snowCover", s.wx.snowCover);
         setF(sh, "flash", s.wx.flash);
     }
-    setI(terrainSh_, "tunnelSkip", 1);   // the land is never seen from inside a tube
     wind_ = 0.5f + s.wx.wind * 1.6f + s.wx.gust * 0.8f;
     static int tdebug = std::getenv("CORERAY_TDEBUG") ? std::atoi(std::getenv("CORERAY_TDEBUG")) : 0;
-    setI(terrainSh_, "debugMode", tdebug);
+    for (Shader sh : {terrainSh_, terrainCutSh_, terrainFarSh_}) setI(sh, "debugMode", tdebug);
     setV3(skySh_, "realSunDir", L_.sunDir);
     setV3(skySh_, "moonDir", L_.moonDir);
     setF(skySh_, "moonIllum", L_.moonIllum);
@@ -1314,6 +1321,12 @@ void Renderer::render(const SceneState& sIn, float dt) {
     setF(skySh_, "cloudDark", s.wx.dark);
     setF(skySh_, "sunDisk", L_.sunVisible);
 
+    // Opaque geometry is drawn without alpha blending (every opaque shader writes alpha 1).
+    // raylib leaves blending on, and a blended draw can't be skipped by tile GPUs' hidden-surface
+    // removal (Apple), so every terrain pixel behind a hill or a tunnel wall was shaded.
+    static const bool blendOpaque = std::getenv("CORERAY_BLENDOPAQUE") != nullptr;   // dev: the old way, for A/B
+    rlDrawRenderBatchActive();
+    if (!blendOpaque) rlDisableColorBlend();
     rlDisableBackfaceCulling();
     rlDisableDepthMask();
     DrawMesh(skyDome_, skyMat_, MatrixMultiply(MatrixScale(6000, 6000, 6000), MatrixTranslate(cam_.position.x, cam_.position.y, cam_.position.z)));
@@ -1340,6 +1353,8 @@ void Renderer::render(const SceneState& sIn, float dt) {
     if (s.wildlife) drawBirds(s);
     drawBolt();
     prof::mark(prof::Props);
+    rlDrawRenderBatchActive();
+    rlEnableColorBlend();
     drawWater(s);
     prof::mark(prof::Water);
 

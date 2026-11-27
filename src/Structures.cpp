@@ -1,7 +1,9 @@
 // Generated worlds: the structures a road needs where the land won't carry it - tunnels (a
 // lined tube cut straight into the hillside, lamps along the roof) and bridges (stone arches on piers,
 // following the road's own curve and grade). Built from the map's road points near the camera.
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <map>
 
 #include "RenderUtil.h"
@@ -333,14 +335,37 @@ void Renderer::updateStructures() {
         }
         return d < 1500.f * viewScale_;
     };
+    camTunnel_ = InTunnel{};
+    static const bool noTunnelCull = std::getenv("CORERAY_NOTUNNELCULL") != nullptr;   // dev: A/B
     for (size_t t = 0; t < M->tunnels.size(); ++t) {
         const auto& T = M->tunnels[t];
         const auto& P = M->roads[T.road].pts;
         bool nearT = keep(1, int(t), P, T.i0, T.i1, [&] { return tunnelMesh(P, T.i0, T.i1); });
         if (!nearT) continue;
         // portals face out of the hill; the heading points into the tunnel
-        portals_.push_back({portalFace(P, T.i0, T.i1, true), headingAt(P, T.i0)});
-        portals_.push_back({portalFace(P, T.i0, T.i1, false), headingAt(P, T.i1) + PI_F});
+        Vector3 fa = portalFace(P, T.i0, T.i1, true), fb = portalFace(P, T.i0, T.i1, false);
+        portals_.push_back({fa, headingAt(P, T.i0)});
+        portals_.push_back({fb, headingAt(P, T.i1) + PI_F});
+        // is the camera in this tube (within the walls, under the crown, between the faces)?
+        if (!noTunnelCull && !camTunnel_.in) {
+            float best = 1e9f, roadY = 0, along = 0, total = 0;
+            for (int j = std::max(0, T.i0); j < std::min(int(P.size()) - 1, T.i1); ++j) {
+                float ax = P[j].x, az = P[j].z, bx = P[j + 1].x, bz = P[j + 1].z;
+                float dx = bx - ax, dz = bz - az, l2 = dx * dx + dz * dz, len = std::sqrt(l2);
+                float u = l2 > 1e-6f ? std::clamp(((c.x - ax) * dx + (c.z - az) * dz) / l2, 0.f, 1.f) : 0.f;
+                float d = std::hypot(c.x - (ax + u * dx), c.z - (az + u * dz));
+                if (d < best) { best = d; roadY = P[j].y + u * (P[j + 1].y - P[j].y); along = total + u * len; }
+                total += len;
+            }
+            // the faces sit a few metres in from the ends; keep clear of them (the mouth itself
+            // sees out widely anyway)
+            float da = Vector3Distance(c, fa), db = Vector3Distance(c, fb);
+            if (best < TW - 0.3f && c.y > roadY - 0.5f && c.y < roadY + TCROWN && along > 2.f && along < total - 2.f && da > 6.f && db > 6.f) {
+                camTunnel_.in = true;
+                camTunnel_.open[0] = Vector3Add(fa, {0, TCROWN * 0.5f, 0});
+                camTunnel_.open[1] = Vector3Add(fb, {0, TCROWN * 0.5f, 0});
+            }
+        }
         for (int j = T.i0 + 2; j < T.i1 - 1; j += 5) {   // a lamp every 25 m along the crown
             Vector3 p = V(P[j]);
             if (Vector3Distance(p, c) > 500.f) continue;
@@ -376,4 +401,25 @@ void Renderer::drawStructures(bool sp, const Vector3& focus, float radius) {
     if (!sp)
         for (const auto& l : tunnelLamps_)
             drawPart(cube_, MatrixMultiply(MatrixScale(0.35f, 0.1f, 1.4f), MatrixTranslate(l.x, l.y, l.z)), MatrixIdentity(), {255, 214, 150, 255}, 0.4f, 0.2f, false, 0, 6.f);
+}
+
+// From inside a tube the land only shows through the two openings: a sphere is kept if it
+// overlaps the cone from the camera through either opening (a disc ~8 m across the arch).
+// Conservative: a curved tunnel hides even more.
+bool Renderer::seenThroughTunnel(Vector3 c, float r) const {
+    if (!camTunnel_.in) return true;
+    const Vector3 cam = cam_.position;
+    Vector3 v = Vector3Subtract(c, cam);
+    float dv = Vector3Length(v);
+    if (dv <= r) return true;
+    for (const Vector3& o : camTunnel_.open) {
+        Vector3 w = Vector3Subtract(o, cam);
+        float dw = Vector3Length(w);
+        const float ro = 8.f;   // the arch's circumscribed radius, with a margin
+        if (dw <= ro) return true;
+        float aOpen = std::asin(std::min(1.f, ro / dw)), aSphere = std::asin(std::min(1.f, r / dv));
+        float ang = std::acos(std::clamp(Vector3DotProduct(v, w) / (dv * dw), -1.f, 1.f));
+        if (ang <= aOpen + aSphere) return true;
+    }
+    return false;
 }

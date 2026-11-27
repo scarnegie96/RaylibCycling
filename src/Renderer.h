@@ -236,6 +236,10 @@ private:
 
     // shaders
     Shader terrainSh_{}, roadSh_{}, objectSh_{}, foliageSh_{}, waterSh_{}, skySh_{};
+    // terrain variants: the hillside cut open at tunnel portals (the only one that discards, so
+    // only chunks near a portal use it), and a cheaper one for far chunks (LOD 2+)
+    Shader terrainCutSh_{}, terrainFarSh_{};
+    Material terrainCutMat_{}, terrainFarMat_{};
     Shader depthSh_{}, depthInstSh_{};
     Shader grassSh_{}, animalSh_{}, volumeSh_{}, particleSh_{}, kitSh_{};
     Material kitMat_{};
@@ -269,6 +273,10 @@ private:
     std::map<std::pair<int, int>, Structure> structs_;   // (0 bridge / 1 tunnel, index)
     struct Portal { Vector3 p; float heading; };          // heading: into the tunnel
     std::vector<Portal> portals_;
+    // the camera inside a tunnel tube: the land can only be seen through its two openings
+    struct InTunnel { bool in = false; Vector3 open[2]{}; };
+    InTunnel camTunnel_;
+    bool seenThroughTunnel(Vector3 c, float r) const;   // a sphere outside that might show through a mouth
     std::vector<Vector3> tunnelLamps_;
     // tunnel light map round the camera (see Structures.cpp updateTunnelMap): metres in from
     // the nearest mouth + road height per 2 m texel; the shaders darken what's under a vault

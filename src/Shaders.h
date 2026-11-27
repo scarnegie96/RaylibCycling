@@ -545,6 +545,12 @@ uniform int debugMode;
 // uv: x = scoured ground, y = shore (0.5+ = under water)
 
 vec4 triplanar(sampler2D t, vec3 p, vec3 n, float sc) {
+#ifdef FAR_TERRAIN
+    // beyond ~1.7 km: the dominant projection only (one lookup instead of up to three)
+    vec3 an = abs(n);
+    if (an.y >= an.x && an.y >= an.z) return texture(t, vec2(p.x, p.z) * sc + 0.37);
+    return an.x > an.z ? texture(t, vec2(p.z, p.y) * sc) : texture(t, vec2(p.x, p.y) * sc + 0.71);
+#endif
     vec3 w = pow(abs(n), vec3(4.0));
     w /= (w.x + w.y + w.z);
     // strata run horizontally on the cliff faces
@@ -573,6 +579,9 @@ vec4 hblend(vec4 h, vec4 w) {
 }
 
 void main() {
+#ifdef PORTAL_CUT
+    // Only chunks near a tunnel mouth use this variant: a shader that can discard keeps the
+    // GPU from skipping hidden pixels (Apple's hidden-surface removal), so the rest go without.
     for (int i = 0; i < 12; i++) {
         if (i >= numPortals) break;
         vec3 d = fragPos - portalPos[i].xyz;
@@ -585,6 +594,7 @@ void main() {
         float top = wall + (crown - wall) * sqrt(1.0 - e * e);
         if (along > -2.5 && along < 18.0 && lat < hw && d.y > -1.0 && d.y < top) discard;
     }
+#endif
     vec3 n0 = normalize(fragNormal);
     vec3 n = n0;
     vec2 xz = fragPos.xz;
@@ -605,7 +615,11 @@ void main() {
     float tone = worldMode == 1 ? patchA : fragField.w;
     float sandCover = worldMode == 1 ? clamp(fragSand, 0.0, 1.0) : 0.0;
     bool far = camD > 250.0;
+#ifdef FAR_TERRAIN
+    float n1 = vnoise(xz * 0.06), n2 = vnoise(xz * 0.45), n3 = 0.5;
+#else
     float n1 = vnoise(xz * 0.06), n2 = vnoise(xz * 0.45), n3 = vnoise(xz * 1.1);
+#endif
     float dn = n1 * 0.6 + n2 * 0.3 + n3 * 0.1;
     float alt = clamp((h - landBase) / max(snowLine - landBase, 400.0), 0.0, 1.2);   // valley floor 0 .. snow line 1
     float facing = dot(n0.xz, vec2(0.35, -0.94)) * 2.5;      // slopes turned to the midday sun dry out
@@ -672,6 +686,7 @@ void main() {
     // broad tonal variation so wide views don't flatten out
     albedo *= 0.9 + 0.2 * tone;
 
+#ifndef FAR_TERRAIN
     // relief from the blended height (surface-gradient bump mapping), fading with distance
     float bumpAmt = (1.0 - smoothstep(20.0, 100.0, camD)) * 0.6;   // softer: fine relief read as noise
     if (bumpAmt > 0.0) {
@@ -685,6 +700,7 @@ void main() {
     float e = 0.35;
     float hx = vnoise((xz + vec2(e, 0)) * 0.45) - n2, hz = vnoise((xz + vec2(0, e)) * 0.45) - n2;
     n = normalize(n + vec3(-hx, 0.0, -hz) * 0.18 * (1.0 - W.y));   // gentle (it read as noise)
+#endif
 
     vec3 snow = vec3(0.90, 0.93, 0.98);
     // snow lies in hollows first and is blown off the crests
@@ -701,6 +717,9 @@ void main() {
     albedo = mix(albedo, albedo * vec3(0.75, 0.85, 0.8), under);   // algae / silt film on the bed
     // small streams: a sheet of water over the bed, catching the sky
     float film = smoothstep(0.62, 0.95, stream) * (1.0 - under) * (1.0 - snowAmt);
+#ifdef FAR_TERRAIN
+    film = 0.0;
+#endif
     if (film > 0.0) {
         vec2 flowN = vec2(vnoise(xz * 1.3 + vec2(0.0, time * 0.9)), vnoise(xz * 1.3 + vec2(time * 0.7, 3.0))) - 0.5;
         n = normalize(mix(n, normalize(vec3(flowN.x * 0.25, 1.0, flowN.y * 0.25)), film));
