@@ -410,6 +410,9 @@ void Renderer::shutdown() {
     stopWorkers();
     destroyTargets();
     for (auto& r : shadow_) unloadRT(r);
+    if (tunnelTex_) { rlUnloadTexture(tunnelTex_); tunnelTex_ = 0; }
+    if (sunJob_.valid()) sunJob_.wait();
+    if (sunTex_) { rlUnloadTexture(sunTex_); sunTex_ = 0; }
     for (auto& [k, c] : chunks_) { if (c.mesh.vaoId) UnloadMesh(c.mesh); if (c.water.vaoId) UnloadMesh(c.water); if (c.roads.vaoId) UnloadMesh(c.roads); }
     chunks_.clear();
     for (auto& r : road_) if (r.mesh.vaoId) UnloadMesh(r.mesh);
@@ -759,6 +762,17 @@ void Renderer::setCommonUniforms(Shader sh) {
     setV4(sh, "csmRect", csmRect_);
     setF(sh, "volClouds", volEnabled() ? 1.f : 0.f);
     setLightUniforms(sh);
+    // ridges between the sun and the land
+    setI(sh, "sunTerrain", 9);
+    setV4(sh, "sunTerrainRect", sunTex_ ? sunRect_ : Vector4{0, 0, 0, 0});
+    // tunnels: daylight only from the mouths, the ceiling lamps
+    setI(sh, "tunnelMap", 15);
+    setV4(sh, "tunnelRect", tunnelTex_ ? tunnelRect_ : Vector4{0, 0, 0, 0});
+    int nt = int(std::min<size_t>(24, tunnelLampsU_.size()));
+    setI(sh, "numTunnelLamps", tunnelRect_.z > 0 ? nt : 0);
+    setV3(sh, "tunnelLampCol", Vector3Scale({1.0f, 0.80f, 0.56f}, 8.f));   // warm white
+    int lt = GetShaderLocation(sh, "tunnelLamp");
+    if (nt > 0 && lt >= 0) SetShaderValueV(sh, lt, tunnelLampsU_.data(), SHADER_UNIFORM_VEC3, nt);
 }
 
 void Renderer::setLightUniforms(Shader sh) {
@@ -1244,6 +1258,7 @@ void Renderer::render(const SceneState& sIn, float dt) {
     updateCamera(s, dt);
     updateRoad(s.dist);
     updateStructures();
+    updateSunTerrain();
     streamWorld(cam_.position, s.dist, 3);
     updateLanterns(s, dt);
     if (s.wildlife) updateWildlife(s, dt);
@@ -1275,6 +1290,8 @@ void Renderer::render(const SceneState& sIn, float dt) {
     rlEnableTexture(csm_.id ? csm_.texture.id : cloudMap_.id);
     rlActiveTextureSlot(14);
     rlEnableTexture(tex_.moor.id);   // terrain: moorland (material slots 0-11 are taken)
+    if (tunnelTex_) { rlActiveTextureSlot(15); rlEnableTexture(tunnelTex_); }   // tunnel light map
+    if (sunTex_) { rlActiveTextureSlot(9); rlEnableTexture(sunTex_); }         // terrain sun shadows
     rlActiveTextureSlot(0);
     setI(terrainSh_, "texMoor", 14);
 
@@ -1284,6 +1301,7 @@ void Renderer::render(const SceneState& sIn, float dt) {
         setF(sh, "snowCover", s.wx.snowCover);
         setF(sh, "flash", s.wx.flash);
     }
+    setI(terrainSh_, "tunnelSkip", 1);   // the land is never seen from inside a tube
     wind_ = 0.5f + s.wx.wind * 1.6f + s.wx.gust * 0.8f;
     static int tdebug = std::getenv("CORERAY_TDEBUG") ? std::atoi(std::getenv("CORERAY_TDEBUG")) : 0;
     setI(terrainSh_, "debugMode", tdebug);
@@ -1332,6 +1350,10 @@ void Renderer::render(const SceneState& sIn, float dt) {
     rlActiveTextureSlot(13);
     rlDisableTexture();
     rlActiveTextureSlot(14);
+    rlDisableTexture();
+    rlActiveTextureSlot(15);
+    rlDisableTexture();
+    rlActiveTextureSlot(9);
     rlDisableTexture();
     rlActiveTextureSlot(0);
     if (volEnabled() && sceneFx_.id) {

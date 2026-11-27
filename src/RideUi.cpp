@@ -206,6 +206,10 @@ void App::drawRideHud() {
     const float W = ui::screenW(), H = ui::screenH();
     const float pad = 22;
     const bool metric = prof_.metric;
+    // each card is laid out where it belongs by default, then beginWidget() moves / scales it to
+    // where the rider put it (Modify UI); the layout below always works in default positions
+    if (!hudLayoutLoaded_) { hudLayout_.load(prefs_.hudLayout); hudLayoutLoaded_ = true; }
+    for (auto& w : wid_) w.on = false;
 
     // ---- top-left: effort
     float effortRight = pad, effortBottom = pad;
@@ -233,6 +237,7 @@ void App::drawRideHud() {
         Rectangle r{pad, pad, cw, step.empty() ? 104.f : 126.f};
         effortRight = r.x + r.width;
         effortBottom = r.y + r.height;
+        beginWidget(hud::Effort, r);
         glass(r);
         text(pw, r.x + 16, r.y + 10, F::Big, HUD_INK, 54);
         text("W", r.x + 16 + pwW + 6, r.y + 36, F::Small, HUD_MUTED, 16);
@@ -250,12 +255,14 @@ void App::drawRideHud() {
         x += 13;
         for (auto& [v, u] : row) x += valUnit(v, u, x, y, 17) + 16;
         if (!step.empty()) text(step, r.x + 16, r.y + 100, F::Small, HUD_MUTED, 12);
+        endWidget();
     }
 
     // ---- virtual gear (under the effort card): gear number, a tick per gear, shift buttons
-    if (e.virtualShifting()) {
+    if (e.virtualShifting() || layoutEdit_) {   // while modifying the UI it shows even when off, so it can be placed
         const bool live = e.shiftingActive();
         Rectangle r{pad, effortBottom + 12, 236, 74};
+        beginWidget(hud::Gear, r);
         glass(r);
         text("GEAR", r.x + 16, r.y + 10, F::Small, HUD_MUTED, 10);
         std::string g = std::to_string(e.gear());
@@ -275,6 +282,7 @@ void App::drawRideHud() {
         if (sl.state == LinkState::Connected) DrawCircle(int(r.x + 76 + measure(sub, F::Small, 11).x + 10), int(r.y + 18), 3, ui::ACCENT);
         if (hudButton({r.x + r.width - 72, r.y + 32, 28, 28}, "-")) eng_->shift(-1);
         if (hudButton({r.x + r.width - 40, r.y + 32, 28, 28}, "+")) eng_->shift(1);
+        endWidget();
     }
 
     // ---- top-right: the ride. Live speed and grade beside the time, then the ride's totals
@@ -312,6 +320,7 @@ void App::drawRideHud() {
         float topW = measure(tm, F::Big, 34).x + 24 + rowWidth(live, 18);
         float cw = std::max({totW, topW, measure(sub, F::Small, 12).x}) + 32;
         Rectangle r{W - pad - cw, pad, cw, 128};
+        beginWidget(hud::Ride, r);
         glass(r);
         // time (left) and live speed / grade (right)
         text(tm, r.x + 16, r.y + 8, F::Big, HUD_INK, 34);
@@ -328,16 +337,19 @@ void App::drawRideHud() {
         text(sub, r.x + 16, r.y + 104, F::Small, HUD_MUTED, 12);
         rideBottom = r.y + r.height;
         rideLeft = r.x;
+        endWidget();
     }
 
     // ---- climb (under the ride card)
     {
         int ci = e.currentClimb(), ni = e.nextClimb();
-        if (ci >= 0 || (ni >= 0 && !endlessRide_)) {
+        const bool real = ci >= 0 || (ni >= 0 && !endlessRide_);
+        if (real || layoutEdit_) {
+            std::string cat = "Cat 3", main = "in 1.2 km", rest = "  \xC2\xB7  2.4 km at 5.8%";   // a sample to place
+            if (real) {
             const Climb& c = e.profileData().climbs[ci >= 0 ? ci : ni];
             double ld = e.lapDistance();
-            std::string cat = c.category == "Uncategorised" ? "Climb" : c.category;
-            std::string main, rest;
+            cat = c.category == "Uncategorised" ? "Climb" : c.category;
             if (ci >= 0) {
                 main = fmtDist(c.endD - ld, metric);
                 rest = fmt(" to the top  \xC2\xB7  %.0f m", std::max(0.0, c.topEle - e.ele())) + fmt("  \xC2\xB7  avg %.1f%%", c.avgGradePct);
@@ -347,8 +359,10 @@ void App::drawRideHud() {
                 main = "in " + fmtDist(to, metric);
                 rest = fmt("  \xC2\xB7  %.1f km", c.lengthM / 1000) + fmt(" at %.1f%%", c.avgGradePct);
             }
+            }
             float cw = measure(cat, F::Small, 11).x + 16 + 12 + measure(main, F::Title, 16).x + measure(rest, F::Small, 12).x + 28;
             Rectangle r{W - pad - cw, rideBottom + 12, cw, 40};
+            beginWidget(hud::Climb, r);
             glass(r);
             Rectangle badge{r.x + 12, r.y + 9, measure(cat, F::Small, 11).x + 16, 22};
             DrawRectangleRounded(badge, 0.4f, 6, Color{240, 122, 26, 255});
@@ -356,16 +370,20 @@ void App::drawRideHud() {
             float x = badge.x + badge.width + 10;
             text(main, x, r.y + 10, F::Title, HUD_INK, 16);
             text(rest, x + measure(main, F::Title, 16).x, r.y + 13, F::Small, HUD_MUTED, 12);
-            rideBottom = r.y + r.height;
+            endWidget();
+            if (real) rideBottom = r.y + r.height;
         }
     }
 
+    float rightBottom = rideBottom;   // the foot of the right-hand stack (the minimap goes under it)
     // ---- weather: its own card, left of the ride card (or under the right-hand stack if there's no room)
     {
         const float ww = 292, wh = weatherCardH();
         Rectangle wr{rideLeft - 14 - ww, pad, ww, wh};
-        if (wr.x < effortRight + 16) wr = {W - pad - ww, rideBottom + 12, ww, wh};
+        if (wr.x < effortRight + 16) { wr = {W - pad - ww, rideBottom + 12, ww, wh}; rightBottom = wr.y + wr.height; }
+        beginWidget(hud::Weather, wr);
         drawWeatherCard(wr);
+        endWidget();
     }
 
     // ---- top centre: workout step, road-change banner
@@ -373,7 +391,9 @@ void App::drawRideHud() {
         float bw = std::min(560.f, W - 2 * 330);
         float cy = pad;
         if (e.structured() && bw > 300) {
+            beginWidget(hud::Step, {(W - bw) / 2, cy, bw, 92});
             drawStepPanel({(W - bw) / 2, cy, bw, 92});
+            endWidget();
             cy += 100;
         }
         if (bw > 300) drawSectorBanner((W - bw) / 2, cy, bw);
@@ -411,6 +431,12 @@ void App::drawRideHud() {
     }
     float ctrlTop = by - rows.size() * bh - (rows.size() - 1) * gap;
     float ctrlLeft = W - pad;
+    for (size_t ri = 0; ri < rows.size(); ++ri) {   // the block's left edge, for its widget rect
+        float total = 0;
+        for (int i : rows[ri]) total += bw(btns[i]) + gap;
+        ctrlLeft = std::min(ctrlLeft, W - pad - (total - gap));
+    }
+    beginWidget(hud::Controls, {ctrlLeft, ctrlTop, W - pad - ctrlLeft, by - ctrlTop});
     for (size_t ri = 0; ri < rows.size(); ++ri) {
         float total = 0;
         for (int i : rows[ri]) total += bw(btns[i]) + gap;
@@ -452,10 +478,27 @@ void App::drawRideHud() {
             x += w + gap;
         }
     }
+    endWidget();
+    // ---- the minimap (generated worlds): right-hand side, between the stack and the controls
+    if (prefs_.miniMap && map_ && course_ && course_->world() == map_.get()) {
+        miniMap_.setMap(map_);   // bakes once per world, off-thread
+        float top = rightBottom + 16, bottom = ctrlTop - 16;
+        const float full = std::clamp(H * 0.15f, 92.f, 132.f);
+        // squeezed in between the stack and the controls, unless the rider has placed it
+        float rad = hudLayout_.place[hud::MiniMap].set ? full : std::min(full, (bottom - top) / 2 - 6);
+        if (rad >= 64) {
+            Vector2 c{W - pad - rad - 6, bottom - rad - 6};
+            auto p = course_->at(e.distance());
+            beginWidget(hud::MiniMap, {c.x - rad - 8, c.y - rad - 8, 2 * rad + 16, 2 * rad + 18});
+            drawMiniMap(c, rad, p.pos.x, p.pos.z, p.heading, e.distance());
+            endWidget();
+        }
+    }
     // flow (left)
     float flowRight;
     {
         Rectangle r{pad, by - 72, 168, 72};
+        beginWidget(hud::Flow, r);
         glass(r);
         Vector2 c{r.x + 36, r.y + 36};
         DrawRing(c, 14.5f, 19.5f, 0, 360, 48, hudInk(22));
@@ -466,10 +509,12 @@ void App::drawRideHud() {
         text(flowStreak_ >= 5 ? fmtTime(flowStreak_) : "\xE2\x80\x94", r.x + 66, r.y + 27, F::Title, HUD_INK, 22);
         text("best " + fmtTime(flowBest_), r.x + 66, r.y + 52, F::Small, HUD_MUTED, 11);
         flowRight = r.x + r.width;
+        endWidget();
     }
     // the road ahead: hilliness for the kilometres not yet built (endless rides)
     if (endlessRide_) {
         Rectangle r{pad, by - 72 - 12 - 112, 330, 112};
+        beginWidget(hud::RoadAhead, r);
         glass(r);
         text("ROAD AHEAD", r.x + 16, r.y + 12, F::Small, hudPick(Color{15, 128, 72, 255}, Color{100, 225, 160, 255}), 11);
         textRight("from km " + std::to_string(endless_.nextKm + 1), r.x + r.width - 16, r.y + 12, F::Small, HUD_MUTED, 11);
@@ -487,12 +532,14 @@ void App::drawRideHud() {
         float tx = r.x + (r.width - tw) / 2;
         text(nv, tx, y + 3, F::Title, netNext_ > 0 ? hudPick(Color{194, 94, 11, 255}, Color{255, 160, 80, 255}) : netNext_ < 0 ? hudPick(Color{47, 127, 216, 255}, Color{120, 180, 255, 255}) : HUD_INK, 18);
         text(nu, tx + measure(nv, F::Title, 18).x, y + 8, F::Small, HUD_MUTED, 12);
+        endWidget();
     }
     // the road (centre strip): the ridden part warm, you a dark line, climbs underlined
     {
         float sx = flowRight + 14, sw = std::min(640.f, ctrlLeft - 14 - sx);
         if (sw > 160) {
             Rectangle r{sx + std::max(0.f, (ctrlLeft - 14 - sx - sw) / 2), by - 72, sw, 72};
+            beginWidget(hud::Profile, r);
             glass(r);
             Rectangle in{r.x + 12, r.y + 9, r.width - 24, r.height - 18};
             const RouteProfile& rp = e.profileData();
@@ -551,10 +598,11 @@ void App::drawRideHud() {
                     text("built to km " + std::to_string(int(rp.length / 1000)), in.x + in.width - measure("built to km 00", F::Small, 10).x, in.y - 2, F::Small, HUD_MUTED, 10);
                 }
             }
+            endWidget();
         }
     }
 
-    if (!e.started()) {
+    if (!e.started() && !layoutEdit_) {
         bool ok = ble_.trainer().state == LinkState::Connected || simActive();
         std::string msg = ok ? "Start pedalling to begin" : "No trainer  \xC2\xB7  Esc for the menu";
         Vector2 m = measure(msg, F::Title, 22);
@@ -562,7 +610,7 @@ void App::drawRideHud() {
         glass(r);
         textCentered(msg, r, F::Title, HUD_INK, 22);
     }
-    if (e.paused() && !pauseMenu_) {
+    if (e.paused() && !pauseMenu_ && !layoutEdit_) {
         DrawRectangle(0, 0, int(W), int(H), Color{31, 36, 48, 30});
         Vector2 m = measure("Paused", F::Big, 42);
         text("Paused", (W - m.x) / 2 + 1, (H - m.y) / 2 + 3, F::Big, Color{31, 36, 48, 90}, 42);
@@ -790,7 +838,7 @@ void App::drawPauseMenu() {
     DrawRectangle(0, 0, int(W), int(H), Color{8, 12, 20, 70});
     // on a generated map the world can be kept: seed, size, climate (everything that makes it) and where this ride began
     const bool genWorld = map_ && eng_->route().id.rfind("map-", 0) == 0;
-    const float extra = genWorld ? 62.f : 0.f;
+    const float extra = (genWorld ? 62.f : 0.f) + 62.f;   // + Modify UI
     Rectangle r{W / 2 - 220, H / 2 - 190 - extra / 2, 440, 380 + extra};
     panel(r, PANEL);
     textCentered("Paused", {r.x, r.y + 12, r.width, 50}, F::Title, TEXT);
@@ -799,6 +847,17 @@ void App::drawPauseMenu() {
     if (button({r.x + 40, y, r.width - 80, 50}, "Resume", true)) { pauseMenu_ = false; eng_->resume(); }
     y += 62;
     if (button({r.x + 40, y, r.width - 80, 50}, view3d_ ? "Switch to 2D dashboard" : "Switch to 3D world")) view3d_ = !view3d_;
+    y += 62;
+    // move and resize the HUD's cards; the ride stays paused
+    if (button({r.x + 40, y, r.width - 80, 50}, "Modify UI")) {
+        pauseMenu_ = false;
+        layoutEdit_ = true;
+        view3d_ = true;
+        hudHidden_ = false;
+        drawerOpen_ = testPanel_ = helpOpen_ = false;
+        edSel_ = -1;
+        edDrag_ = 0;
+    }
     y += 62;
     if (genWorld) {
         const int km = int(std::lround(map_->params.size / 1024.f));
@@ -815,7 +874,7 @@ void App::drawPauseMenu() {
 
 void App::drawHelp() {
     const float W = ui::screenW(), H = ui::screenH();
-    Rectangle r{W / 2 - 340, H / 2 - 304, 680, 608};
+    Rectangle r{W / 2 - 340, H / 2 - 318, 680, 636};
     panel(r, PANEL);
     text("Keys", r.x + 24, r.y + 16, F::Title, TEXT);
     const char* rows[][2] = {{"Space", "Pause / resume"}, {"L", "Record a lap"}, {"E", "Edit drawer (intervals, goal, laps, insert sets)"},
@@ -824,13 +883,45 @@ void App::drawHelp() {
                              {"R", "Change the road ahead: add a climb, descent, sprint..."}, {"Backspace", "Undo the last road change"},
                              {"C", "Camera: chase, cinematic, side, rider, drone, close, eyes"}, {"T / W / M", "Time of day / weather / sound"}, {"D", "Simulator test data"},
                              {"Shift+Up/Down", "Simulator power +-10 W"}, {"Alt+Up/Down", "Simulator heart rate +-2 bpm"}, {"Tab", "Hide the HUD"},
-                             {"F / P", "FPS counter / frame-time breakdown"}, {"Esc", "Menu"}};
+                             {"F / P", "FPS counter / frame-time breakdown"}, {"N / Shift+N", "Minimap zoom / heading-up or north-up"}, {"Esc", "Menu"}};
     float y = r.y + 70;
     for (auto& rw : rows) {
         text(rw[0], r.x + 30, y, F::Body, ACCENT, 17);
         text(rw[1], r.x + 220, y, F::Body, TEXT, 17);
         y += 27;
     }
+}
+
+// ------------------------------------------------------------------ minimap (generated worlds)
+void App::drawMiniMap(Vector2 centre, float radius, float x, float z, float heading, double dist) {
+    static const float RANGES[4] = {600, 1200, 2500, 5000};
+    const int zi = std::clamp(prefs_.miniMapZoom, 0, 3);
+    MiniMap::View v;
+    v.centre = centre;
+    v.radius = radius;
+    v.rangeM = RANGES[zi];
+    v.x = x; v.z = z;
+    v.heading = heading;
+    v.northUp = prefs_.miniMapNorthUp;
+    // the road ahead, as far as the rim (only what is laid out: a roam grows as you choose)
+    if (course_ && dist >= 0) {
+        const double step = std::max(10.0, v.rangeM / 90.0);
+        const double until = course_->loop() ? dist + v.rangeM * 2.5 : std::min(dist + v.rangeM * 2.5, double(course_->length()));
+        for (double d = dist; d <= until; d += step) {
+            auto q = course_->at(d);
+            v.ahead.push_back({q.pos.x, q.pos.z});
+        }
+    }
+    v.canZoomIn = zi > 0;
+    v.canZoomOut = zi < 3;
+    int nz = zi;
+    switch (miniMap_.draw(v, GetFrameTime())) {
+        case MiniMap::Hit::ZoomIn: nz = zi - 1; break;
+        case MiniMap::Hit::ZoomOut: nz = zi + 1; break;
+        case MiniMap::Hit::Map: nz = (zi + 1) % 4; break;   // a click on the map itself still cycles
+        default: break;
+    }
+    if (nz != zi) { prefs_.miniMapZoom = std::clamp(nz, 0, 3); store::save(prof_, prefs_); }
 }
 
 // ------------------------------------------------------------------ performance (F / P)

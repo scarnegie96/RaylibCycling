@@ -476,7 +476,15 @@ void Renderer::renderVolumetrics(const SceneState& s) {
         setF(sh, "precipArea", cloud_.precipArea);
         setV3(sh, "boltPos", bolt_.cloud);
         setF(sh, "boltI", boltLight());
-    }, {1, 2, 3, 4, 5, 6, 7});
+        // tunnels: no daylight in the air under the vault
+        if (tunnelTex_) bindTex(8, tunnelTex_);
+        if (sunTex_) bindTex(9, sunTex_);
+        setI(sh, "sunTerrain", 9);
+        setV4(sh, "sunTerrainRect", sunTex_ ? sunRect_ : Vector4{0, 0, 0, 0});
+        setI(sh, "tunnelMap", 8);
+        setV4(sh, "tunnelRect", tunnelTex_ ? tunnelRect_ : Vector4{0, 0, 0, 0});
+        setV3(sh, "tunnelLampCol", Vector3Scale({1.0f, 0.80f, 0.56f}, 8.f));
+    }, {1, 2, 3, 4, 5, 6, 7, 8, 9});
 
     // ---- temporal resolve
     RenderTexture2D& hist = volHist_[volHistIdx_];

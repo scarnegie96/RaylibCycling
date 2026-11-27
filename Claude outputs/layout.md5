@@ -1,0 +1,12 @@
+419050e08debc57773e9d94117504d47  CMakeLists.txt
+10cf5fef7c4faadbc36c1cede9beae79  src/App.cpp
+46e72623981c502cf8304e4ecf69b661  src/App.h
+659ec50906153ff720f9a0caac2f3890  src/RideUi.cpp
+d0c8885e0ebe2bb12e01035222e1c692  src/Store.cpp
+0d4bca37f75db3bea3ac2109013bb63d  src/Store.h
+87b06afa8eb711c1fc7e99f98bfb91e4  src/Ui.cpp
+80ae9b4959fac55ebf4d76a5ce624560  src/Ui.h
+4164eb2c04111bb7387e1f07aa020c53  src/MiniMap.cpp
+1ceb5959e25170496aead0043578e7de  src/HudLayout.h
+f6c784c4e2e9bc666a47a24e4896fb8d  src/HudLayout.cpp
+aecba73bcff6987cc1f5d6ed675e78aa  src/LayoutUi.cpp

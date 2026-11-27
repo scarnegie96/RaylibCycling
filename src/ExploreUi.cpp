@@ -145,7 +145,8 @@ void App::exploreFrame(float dt) {
     // the minimap: click to go there
     const float MW = 300.f;
     Rectangle mini{ui::screenW() - MW - 16, 16, MW, MW};
-    const bool overMini = (exMini_ && CheckCollisionPointRec(ui::mouseLogical(), mini)) || CheckCollisionPointRec(ui::mouseLogical(), exPanelRect());
+    const bool overMini = (exMini_ && CheckCollisionPointRec(ui::mouseLogical(), mini)) || CheckCollisionPointRec(ui::mouseLogical(), exPanelRect()) ||
+                          (prefs_.miniMap && CheckCollisionPointCircle(ui::mouseLogical(), {ui::screenW() - 142, ui::screenH() - 142}, 120 + MiniMap::reach(120)));
     if (overMini && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && map_) {
         Vector2 m = ui::mouseLogical();
         float x = map_->x0 + (m.x - mini.x) / MW * map_->params.size, z = map_->z0 + (m.y - mini.y) / MW * map_->params.size;
@@ -238,6 +239,11 @@ void App::drawExplore() {
         Vector2 tip{cx + std::sin(exYaw_) * 12, cy + std::cos(exYaw_) * 12};
         DrawLineEx({cx, cy}, tip, 3, {255, 60, 200, 255});
         DrawCircle(int(cx), int(cy), 5, {255, 60, 200, 255});
+    }
+    // the ride HUD's circular topographic minimap (click it to zoom)
+    if (prefs_.miniMap) {
+        miniMap_.setMap(map_);
+        drawMiniMap({W - 16 - 126, H - 16 - 126}, 120, exPos_.x, exPos_.z, exYaw_, -1);
     }
 }
 

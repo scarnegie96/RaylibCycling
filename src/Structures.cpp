@@ -1,11 +1,12 @@
 // Generated worlds: the structures a road needs where the land won't carry it - tunnels (a
-// lined tube, concrete portals, lamps along the roof) and bridges (stone arches on piers,
+// lined tube cut straight into the hillside, lamps along the roof) and bridges (stone arches on piers,
 // following the road's own curve and grade). Built from the map's road points near the camera.
 #include <cmath>
 #include <map>
 
 #include "RenderUtil.h"
 #include "Renderer.h"
+#include "rlgl.h"
 #include "world/WorldMap.h"
 
 using namespace rutil;
@@ -16,6 +17,13 @@ constexpr float TW = HW + 1.6f;            // tunnel half width (walls)
 constexpr float TWALL = 4.2f, TCROWN = 6.6f;   // wall height, crown height
 
 Vector3 V(const wmap::RoadPt& p) { return {p.x, p.y, p.z}; }
+// where the hillside face stands at a tunnel end: the cutting's formation stops 0.6 of the way
+// from the last open point to the first tunnel point (Map::sample), so the tube ends there
+Vector3 portalFace(const std::vector<wmap::RoadPt>& P, int i0, int i1, bool start) {
+    int n = int(P.size());
+    if (start) return i0 > 0 ? Vector3Lerp(V(P[i0 - 1]), V(P[i0]), 0.6f) : V(P[i0]);
+    return i1 + 1 < n ? Vector3Lerp(V(P[i1]), V(P[i1 + 1]), 0.4f) : V(P[i1]);
+}
 float headingAt(const std::vector<wmap::RoadPt>& P, int j) {
     int a = std::max(0, j - 1), b = std::min(int(P.size()) - 1, j + 1);
     return std::atan2(P[b].x - P[a].x, P[b].z - P[a].z);
@@ -59,19 +67,31 @@ Mesh tunnelMesh(const std::vector<wmap::RoadPt>& P, int i0, int i1) {
     }
     px[K - 2] = TW; py[K - 2] = TWALL; nx[K - 2] = -1; ny[K - 2] = 0;
     px[K - 1] = TW; py[K - 1] = -0.4f; nx[K - 1] = -1; ny[K - 1] = 0;
-    int a = std::max(0, i0 - 1), z = std::min(int(P.size()) - 1, i1 + 1);
-    float along = 0;
-    for (int j = a; j <= z; ++j) {
-        if (j > a) along += std::hypot(P[j].x - P[j - 1].x, P[j].z - P[j - 1].z);
+    // rows: the hillside face (pushed 0.4 m out so the cut edge laps onto the lining), the
+    // tunnel's own points, the far face
+    struct Row { Vector3 p; float h; };
+    std::vector<Row> R;
+    auto face = [&](bool start) {
+        int j = start ? i0 : i1;
         float h = headingAt(P, j);
-        Vector3 r = rightOf(h);
+        Vector3 f = portalFace(P, i0, i1, start);
+        Vector3 out = Vector3Scale(Vector3{std::sin(h), 0, std::cos(h)}, start ? -0.4f : 0.4f);
+        return Row{Vector3Add(f, out), h};
+    };
+    R.push_back(face(true));
+    for (int j = i0; j <= i1; ++j) R.push_back({V(P[j]), headingAt(P, j)});
+    R.push_back(face(false));
+    float along = 0;
+    for (size_t j = 0; j < R.size(); ++j) {
+        if (j) along += std::hypot(R[j].p.x - R[j - 1].p.x, R[j].p.z - R[j - 1].p.z);
+        Vector3 r = rightOf(R[j].h);
         for (int q = 0; q < K; ++q) {
-            Vector3 p = Vector3Add(V(P[j]), Vector3Add(Vector3Scale(r, px[q]), {0, py[q], 0}));
+            Vector3 p = Vector3Add(R[j].p, Vector3Add(Vector3Scale(r, px[q]), {0, py[q], 0}));
             Vector3 n = Vector3Add(Vector3Scale(r, nx[q]), {0, ny[q], 0});
             b.add(p, n, {float(q) / (K - 1), along / 4.f});
         }
     }
-    int rows = z - a + 1;
+    int rows = int(R.size());
     for (int j = 0; j + 1 < rows; ++j)
         for (int q = 0; q + 1 < K; ++q) {
             unsigned short a0 = j * K + q, a1 = a0 + 1, b0 = a0 + K, b1 = b0 + 1;
@@ -201,7 +221,79 @@ void Renderer::clearStructures() {
     structs_.clear();
     portals_.clear();
     tunnelLamps_.clear();
+    tunnelLampsU_.clear();
     structMap_ = nullptr;
+    tunnelRect_.z = 0;
+    tunnelFor_ = nullptr;
+    tunnelCentre_ = {1e9f, 1e9f};
+}
+
+// The tunnel light map: a 1 km square round the camera at 2 m, rebuilt when the camera has
+// moved 200 m from its centre. Per texel within the tube (+ a margin past the walls): metres
+// in from the nearer mouth (the hillside face), 1, the road's height. The shaders compare a
+// fragment's height with the road's, so roads and land above a tunnel stay in daylight.
+void Renderer::updateTunnelMap(const wmap::Map* M) {
+    constexpr int N = 512;
+    constexpr float CELL = 2.f, SIZE = N * CELL, MARGIN = TW + 2.5f;
+    if (!M || M->tunnels.empty()) { tunnelRect_.z = 0; return; }
+    Vector2 c{cam_.position.x, cam_.position.z};
+    if (M == tunnelFor_ && std::hypot(c.x - tunnelCentre_.x, c.y - tunnelCentre_.y) < 200.f) return;
+    tunnelFor_ = M;
+    c = {std::round(c.x / 64.f) * 64.f, std::round(c.y / 64.f) * 64.f};
+    tunnelCentre_ = c;
+    const float x0 = c.x - SIZE * 0.5f, z0 = c.y - SIZE * 0.5f;
+    std::vector<float> data(size_t(N) * N * 4, 0.f), best(size_t(N) * N, 1e9f);
+    bool any = false;
+    for (const auto& T : M->tunnels) {
+        const auto& P = M->roads[T.road].pts;
+        // the tube's centre line, face to face (as tunnelMesh builds it)
+        std::vector<Vector3> R;
+        R.push_back(portalFace(P, T.i0, T.i1, true));
+        for (int j = T.i0; j <= T.i1; ++j) R.push_back(V(P[j]));
+        R.push_back(portalFace(P, T.i0, T.i1, false));
+        std::vector<float> s(R.size(), 0.f);
+        float lo[2] = {1e9f, 1e9f}, hi[2] = {-1e9f, -1e9f};
+        for (size_t j = 0; j < R.size(); ++j) {
+            if (j) s[j] = s[j - 1] + std::hypot(R[j].x - R[j - 1].x, R[j].z - R[j - 1].z);
+            lo[0] = std::min(lo[0], R[j].x); hi[0] = std::max(hi[0], R[j].x);
+            lo[1] = std::min(lo[1], R[j].z); hi[1] = std::max(hi[1], R[j].z);
+        }
+        if (hi[0] + MARGIN < x0 || lo[0] - MARGIN > x0 + SIZE || hi[1] + MARGIN < z0 || lo[1] - MARGIN > z0 + SIZE) continue;
+        const float L = s.back();
+        for (size_t j = 0; j + 1 < R.size(); ++j) {
+            const Vector3 a = R[j], b = R[j + 1];
+            int ix0 = std::max(0, int((std::min(a.x, b.x) - MARGIN - x0) / CELL));
+            int ix1 = std::min(N - 1, int((std::max(a.x, b.x) + MARGIN - x0) / CELL));
+            int iz0 = std::max(0, int((std::min(a.z, b.z) - MARGIN - z0) / CELL));
+            int iz1 = std::min(N - 1, int((std::max(a.z, b.z) + MARGIN - z0) / CELL));
+            float ex = b.x - a.x, ez = b.z - a.z, el2 = std::max(1e-6f, ex * ex + ez * ez);
+            for (int iz = iz0; iz <= iz1; ++iz)
+                for (int ix = ix0; ix <= ix1; ++ix) {
+                    float px = x0 + (ix + 0.5f) * CELL, pz = z0 + (iz + 0.5f) * CELL;
+                    float t = std::clamp(((px - a.x) * ex + (pz - a.z) * ez) / el2, 0.f, 1.f);
+                    float d = std::hypot(px - (a.x + ex * t), pz - (a.z + ez * t));
+                    size_t k = size_t(iz) * N + ix;
+                    if (d > MARGIN || d >= best[k]) continue;
+                    best[k] = d;
+                    float sa = s[j] + (s[j + 1] - s[j]) * t;
+                    data[k * 4 + 0] = std::min(sa, L - sa);       // metres in from the nearer mouth
+                    data[k * 4 + 1] = 1.f;
+                    data[k * 4 + 2] = a.y + (b.y - a.y) * t;      // the road under the vault
+                    any = true;
+                }
+        }
+    }
+    if (!any) { tunnelRect_.z = 0; return; }
+    if (!tunnelTex_) {
+        tunnelTex_ = rlLoadTexture(data.data(), N, N, PIXELFORMAT_UNCOMPRESSED_R32G32B32A32, 1);
+        rlTextureParameters(tunnelTex_, RL_TEXTURE_MIN_FILTER, RL_TEXTURE_FILTER_NEAREST);
+        rlTextureParameters(tunnelTex_, RL_TEXTURE_MAG_FILTER, RL_TEXTURE_FILTER_NEAREST);
+        rlTextureParameters(tunnelTex_, RL_TEXTURE_WRAP_S, RL_TEXTURE_WRAP_CLAMP);
+        rlTextureParameters(tunnelTex_, RL_TEXTURE_WRAP_T, RL_TEXTURE_WRAP_CLAMP);
+    } else {
+        rlUpdateTexture(tunnelTex_, 0, 0, N, N, PIXELFORMAT_UNCOMPRESSED_R32G32B32A32, data.data());
+    }
+    tunnelRect_ = {x0, z0, 1.f / SIZE, float(N)};
 }
 
 void Renderer::updateStructures() {
@@ -209,6 +301,8 @@ void Renderer::updateStructures() {
     if (M != structMap_) { clearStructures(); structMap_ = M; }
     portals_.clear();
     tunnelLamps_.clear();
+    tunnelLampsU_.clear();
+    updateTunnelMap(M);
     if (!M) return;
     const Vector3 c = cam_.position;
     auto bounds = [&](const std::vector<wmap::RoadPt>& P, int i0, int i1, Vector3& ctr, float& rad) {
@@ -245,9 +339,8 @@ void Renderer::updateStructures() {
         bool nearT = keep(1, int(t), P, T.i0, T.i1, [&] { return tunnelMesh(P, T.i0, T.i1); });
         if (!nearT) continue;
         // portals face out of the hill; the heading points into the tunnel
-        portals_.push_back({V(P[T.i0]), headingAt(P, T.i0)});
-        float hb = headingAt(P, T.i1);
-        portals_.push_back({V(P[T.i1]), hb + PI_F});
+        portals_.push_back({portalFace(P, T.i0, T.i1, true), headingAt(P, T.i0)});
+        portals_.push_back({portalFace(P, T.i0, T.i1, false), headingAt(P, T.i1) + PI_F});
         for (int j = T.i0 + 2; j < T.i1 - 1; j += 5) {   // a lamp every 25 m along the crown
             Vector3 p = V(P[j]);
             if (Vector3Distance(p, c) > 500.f) continue;
@@ -255,6 +348,11 @@ void Renderer::updateStructures() {
             tunnelLamps_.push_back(p);
         }
     }
+    // the nearest 24 light the scene (just under the fittings)
+    std::vector<std::pair<float, Vector3>> lamps;
+    for (const auto& l : tunnelLamps_) lamps.push_back({Vector3Distance(l, c), Vector3Add(l, {0, -0.15f, 0})});
+    std::sort(lamps.begin(), lamps.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    for (size_t i = 0; i < lamps.size() && i < 24; ++i) tunnelLampsU_.push_back(lamps[i].second);
     for (size_t i = 0; i < M->bridges.size(); ++i) {
         const auto& B = M->bridges[i];
         if (B.road < 0) continue;
@@ -264,28 +362,17 @@ void Renderer::updateStructures() {
 
 void Renderer::drawStructures(bool sp, const Vector3& focus, float radius) {
     if (!structMap_) return;
-    const Color stone{152, 144, 130, 255}, concrete{150, 149, 144, 255};
+    const Color stone{152, 144, 130, 255};
     for (auto& [k, st] : structs_) {
         if (!st.mesh.vaoId) continue;
         bool near = sp ? (std::fabs(st.center.x - focus.x) < radius + st.radius && std::fabs(st.center.z - focus.z) < radius + st.radius)
                        : Vector3Distance(st.center, cam_.position) - st.radius < 2400.f;
         if (!near) continue;
-        // the lining is lit by its lamps more than by the day outside: dark, with a glow
-        if (k.first == 1) drawPart(st.mesh, MatrixIdentity(), MatrixIdentity(), {96, 94, 90, 255}, 0.8f, 0.12f, sp, 0, sp ? 0.f : 0.55f);
+        // concrete lining: the shaders' tunnel map keeps the daylight out, its lamps light it
+        if (k.first == 1) drawPart(st.mesh, MatrixIdentity(), MatrixIdentity(), {150, 149, 144, 255}, 0.8f, 0.12f, sp);
         else drawPart(st.mesh, MatrixIdentity(), MatrixIdentity(), stone, 0.9f, 0.08f, sp, 3);
     }
-    // portals: a concrete frame round the opening, wing walls holding back the cutting
-    for (const auto& p : portals_) {
-        Matrix base = MatrixMultiply(MatrixRotateY(p.heading), MatrixTranslate(p.p.x, p.p.y, p.p.z));
-        const float th = 1.2f;
-        for (float sx : {-1.f, 1.f}) {
-            drawPart(cube_, MatrixMultiply(MatrixScale(1.8f, TCROWN + 2.4f, th), MatrixTranslate(sx * (TW + 0.9f), (TCROWN + 2.4f) * 0.5f - 0.5f, -th * 0.5f)), base, concrete, 0.85f, 0.1f, sp);
-            // wing walls splaying back into the cutting
-            Matrix wing = MatrixMultiply(MatrixMultiply(MatrixScale(0.8f, TWALL + 1.f, 9.f), MatrixTranslate(0, (TWALL + 1.f) * 0.5f - 0.5f, -4.5f)), MatrixRotateY(sx * 0.35f));
-            drawPart(cube_, MatrixMultiply(wing, MatrixTranslate(sx * (TW + 1.6f), 0, -th)), base, concrete, 0.85f, 0.1f, sp);
-        }
-        drawPart(cube_, MatrixMultiply(MatrixScale(2 * TW + 3.6f, 2.4f, th), MatrixTranslate(0, TCROWN + 1.2f - 0.2f, -th * 0.5f)), base, concrete, 0.85f, 0.1f, sp);
-    }
+    // no portal geometry: the terrain shader cuts the hillside to the tube's arch (World.cpp)
     if (!sp)
         for (const auto& l : tunnelLamps_)
             drawPart(cube_, MatrixMultiply(MatrixScale(0.35f, 0.1f, 1.4f), MatrixTranslate(l.x, l.y, l.z)), MatrixIdentity(), {255, 214, 150, 255}, 0.4f, 0.2f, false, 0, 6.f);

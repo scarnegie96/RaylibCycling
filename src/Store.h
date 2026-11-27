@@ -21,6 +21,7 @@ struct Prefs {
     int mapClimate = 0;     // 0 the seed decides, 1 temperate, 2 desert, 3 cold
     int freeWorld = 0;      // free rides: 0 the endless road, 1 the generated map (start where you pick)
     std::string selRoute;
+    std::string hudLayout;  // moved / resized ride HUD widgets (hud::Layout::save)
     // world
     int todMode = 1;           // 0 real time at your location, 1 fixed time, 2 day/night cycle
     double todHour = 13.0;     // fixed time / cycle start (local hours)
@@ -37,6 +38,9 @@ struct Prefs {
     int uiSize = 110;     // % on top of the screen-size auto scale (menus)
     int hudSize = 130;    // % for the ride HUD
     bool showFps = false, showPerf = false;   // in-ride FPS counter (F) and frame-time panel (P)
+    bool miniMap = true;    // generated worlds: the circular minimap in rides (N; click it to zoom)
+    int miniMapZoom = 1;    // 0..3: 600 m, 1.2 km, 2.5 km, 5 km from the centre to the rim
+    bool miniMapNorthUp = false;   // false: heading-up (Shift+N)
     std::string trainerId, trainerName, hrId, hrName, shifterId, shifterName;
     bool simEnabled = false;
     sim::Settings sim;

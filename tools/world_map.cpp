@@ -1,5 +1,5 @@
 // world_map: generate a world and write maps of it (PNG).
-//   world_map [--seed N] [--size M] [--res M] [--aridity A] [--erosion E] [--loop KM] [--out PREFIX] [--cache FILE]
+//   world_map [--minimap FILE.png [--minimap-res N]] [--seed N] [--size M] [--res M] [--aridity A] [--erosion E] [--loop KM] [--out PREFIX] [--cache FILE]
 // Writes PREFIX_terrain.png (biomes, relief, water, roads, towns), PREFIX_biome.png,
 // PREFIX_hydro.png (discharge, lakes, salt flats, washes) and PREFIX_climate.png.
 #include <atomic>
@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "raylib.h"
+#include "MiniMap.h"
 #include "world/WorldMap.h"
 
 using namespace wmap;
@@ -54,7 +55,8 @@ struct Img {
 int main(int argc, char** argv) {
     Params P;
     float res = 10.f, loopKm = 0, cx = 0, cz = 0, view = 0;
-    std::string out = "world", cache;
+    std::string out = "world", cache, minimap;
+    int minimapRes = 4096;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&] { return i + 1 < argc ? std::string(argv[++i]) : std::string(); };
@@ -70,6 +72,8 @@ int main(int argc, char** argv) {
         else if (a == "--center") { cx = std::stof(next()); cz = std::stof(next()); }
         else if (a == "--view") view = std::stof(next());
         else if (a == "--cache") cache = next();
+        else if (a == "--minimap") minimap = next();
+        else if (a == "--minimap-res") minimapRes = std::stoi(next());
     }
     SetTraceLogLevel(LOG_WARNING);
     auto t0 = std::chrono::steady_clock::now();
@@ -99,6 +103,14 @@ int main(int argc, char** argv) {
     std::printf("  height %.0f .. %.0f m\n", hmin, hmax);
     for (const Town& t : M->towns) std::printf("  %s %-18s (%6.0f, %6.0f) %4.0f m\n", t.rank == 2 ? "town   " : "village", t.name.c_str(), t.x, t.z, t.y);
 
+    // the in-ride minimap's topographic image (MiniMapBake.cpp), then stop
+    if (!minimap.empty()) {
+        auto tb = std::chrono::steady_clock::now();
+        bool ok = MiniMap::bakeToPng(*M, minimap, minimapRes);
+        std::printf("minimap %s: %s, %.2f s\n", minimap.c_str(), ok ? "ok" : "FAILED",
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - tb).count());
+        return ok ? 0 : 1;
+    }
     // sample the whole map at the requested resolution
     if (view <= 0) { view = P.size; cx = 0; cz = 0; }
     const float vx0 = cx - view / 2, vz0 = cz - view / 2;

@@ -214,7 +214,8 @@ Sample Map::sample(float x, float z) const {
     // the road network: the land is formed to the nearest road
     // nearest road, and the nearest one at a clearly different level (the next leg of a
     // switchback, a road passing above): between the two the slope runs from one to the other
-    float rd = 1e4f, ry = 0, rd2 = 1e4f, ry2 = 0, rdF = 1e4f, ryF = 0, rdT = 1e4f;   // F: the nearest stretch on the land (formation), T: in a tunnel
+    bool overTunnel = false;
+    float rd = 1e4f, ry = 0, rd2 = 1e4f, ry2 = 0, rdF = 1e4f, ryF = 0, rdT = 1e4f, ryT = 0;   // F: the nearest stretch on the land (formation), T: in a tunnel
     int cls = -1;
     {
         struct C { float d, y; int cls, road, seg; bool form; };
@@ -232,7 +233,7 @@ Sample Map::sample(float x, float z) const {
                     float t;
                     float d = segDist(x, z, a.x, a.z, b.x, b.z, t);
                     if (d > 110.f) continue;
-                    if (a.kind == 1 && b.kind == 1) { rdT = std::min(rdT, d); continue; }   // in a tunnel: the land above is untouched
+                    if (a.kind == 1 && b.kind == 1) { if (d < rdT) { rdT = d; ryT = lerpf(a.y, b.y, t); } continue; }   // in a tunnel: the land above is untouched
                     bool form = a.kind != 2 && b.kind != 2;      // bridges leave the land alone
                     // past a tunnel portal (beyond the open end of the cutting) nothing is formed
                     if (form && (a.kind == 1 || b.kind == 1)) {
@@ -254,7 +255,8 @@ Sample Map::sample(float x, float z) const {
             if (cand[q].d < rd) { rd = cand[q].d; ry = cand[q].y; cls = cand[q].cls; }
             if (cand[q].form && cand[q].d < rdF) { rdF = cand[q].d; ryF = cand[q].y; best = q; }
         }
-        if (rdT < rdF) { rdF = 1e4f; best = -1; }   // over a tunnel (past its portal): the hill stays whole
+        overTunnel = rdT < rdF;
+        if (overTunnel) { rdF = 1e4f; best = -1; }   // over a tunnel (past its portal): the hill stays whole
         if (best >= 0)
             for (int q = 0; q < nc; ++q) {
                 if (!cand[q].form || std::fabs(cand[q].y - ryF) <= 2.5f || cand[q].d >= rd2) continue;
@@ -286,6 +288,14 @@ Sample Map::sample(float x, float z) const {
         }
     }
     s.h = lerpf(land, forced, bestF * protect);
+    if (overTunnel && rdT < 30.f) {
+        // cover over the tube: the classification only asks for depth over the centre line, so
+        // on a spur or under a dip the land can sit below the vault. Backfill it like a
+        // cut-and-cover portal: 1.4 m over the crown out past the walls, then a 1:1 batter.
+        float cover = ryT + 8.0f - std::max(0.f, rdT - 6.4f);
+        float k = 1.2f, d = cover - s.h;   // soft max, no crease where the batter meets the land
+        if (d > -k) s.h += d > k ? d : (d + k) * (d + k) / (4.f * k);
+    }
     if (rdF < HW + 3.f && s.waterW >= 1e3f) { s.water = -1e9f; s.waterW = 0; }   // the road's formation holds the lake back
     if (protect > 0.5f && water > -1e8f && water > s.water) { s.water = water; s.flowX = fvx; s.flowZ = fvz; s.waterW = wW; }
     s.bank = std::max(s.bank, bank * protect);

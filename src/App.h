@@ -14,6 +14,8 @@
 #include <future>
 #include "Db.h"
 #include "MapPreview.h"
+#include "MiniMap.h"
+#include "HudLayout.h"
 #include "Renderer.h"
 #include "Store.h"
 #include "Ui.h"
@@ -110,6 +112,22 @@ private:
     void drawEditDrawer();
     void drawRoadAhead(float x, float& y, float w);
     void drawPauseMenu();
+    // ---- movable / resizable HUD widgets (pause menu > Modify UI)
+    hud::Layout hudLayout_;
+    bool hudLayoutLoaded_ = false;
+    bool layoutEdit_ = false;                 // the editor is open (the ride stays paused)
+    struct WidgetFrame { bool on = false; Rectangle def{}, at{}; float scale = 1; };
+    WidgetFrame wid_[hud::COUNT];             // this frame: built-in rect and where it landed
+    int edSel_ = -1, edHover_ = -1, edDrag_ = 0;   // drag: 1 move, 2 resize
+    Vector2 edGrab_{};
+    Rectangle edAt0_{};
+    float edS0_ = 1;
+    float edGuideX_ = -1, edGuideY_ = -1;     // snap guides being shown
+    Vector2 edBar_{};                         // the editor toolbar's offset from the centre (drag 3)
+    void beginWidget(int id, Rectangle def);
+    void endWidget();
+    void drawLayoutEditor();
+    void closeLayoutEditor();
     void drawHelp();
     void drawPerf();   // FPS counter / frame-time breakdown (mid-right)
 
@@ -164,6 +182,8 @@ private:
     bool roamStart(Route& out);
     // ---- free ride on a generated world (FreeWorldUi.cpp): a 3D miniature to pick the start on
     MapPreview mapPreview_;
+    MiniMap miniMap_;               // in-ride topographic minimap of a generated world
+    void drawMiniMap(Vector2 centre, float radius, float x, float z, float heading, double dist);
     MapPreview::Spawn spawn_;
     std::string spawnKey_;                     // the map (mapFor_) the spawn belongs to
     double mapReqAt_ = 0;                      // when the current map was requested (for the progress text)

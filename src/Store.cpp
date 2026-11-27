@@ -65,13 +65,14 @@ void load(Profile& p, Prefs& pr) {
     flag("hrAlertHigh", p.hrAlertHigh); flag("hrAlertLow", p.hrAlertLow); num("hrAlertGraceS", p.hrAlertGraceS); num("hrAlertRepeatS", p.hrAlertRepeatS);
     inum("quality", pr.quality); inum("renderScale", pr.renderScale); inum("timeOfDay", pr.timeOfDay); inum("camera", pr.camera); flag("startIn3d", pr.startIn3d);
     inum("courseSeed", pr.courseSeed); inum("scenery", pr.scenery); inum("mapSeed", pr.mapSeed); inum("mapSizeKm", pr.mapSizeKm); inum("mapClimate", pr.mapClimate); inum("freeWorld", pr.freeWorld);
-    str("selRoute", pr.selRoute);
+    str("selRoute", pr.selRoute); str("hudLayout", pr.hudLayout);
     inum("todMode", pr.todMode); num("todHour", pr.todHour); num("cycleMinutes", pr.cycleMinutes);
     inum("weatherMode", pr.weatherMode); str("weatherKind", pr.weatherKind);
     num("lat", pr.lat); num("lon", pr.lon); str("place", pr.place);
     inum("theme", pr.theme); inum("accent", pr.accent); inum("hudStyle", pr.hudStyle); inum("uiSize", pr.uiSize); inum("hudSize", pr.hudSize);
     flag("wildlife", pr.wildlife); flag("lanterns", pr.lanterns); flag("sound", pr.sound);
     flag("showFps", pr.showFps); flag("showPerf", pr.showPerf);
+    flag("miniMap", pr.miniMap); flag("miniMapNorthUp", pr.miniMapNorthUp); inum("miniMapZoom", pr.miniMapZoom);
     num("weeklyGoalHours", p.weeklyGoalHours);
     int fa = int(p.ftpAuto); inum("ftpAuto", fa); p.ftpAuto = FtpAutoMode(std::clamp(fa, 0, 2));
     str("trainerId", pr.trainerId); str("shifterId", pr.shifterId); str("shifterName", pr.shifterName); str("trainerName", pr.trainerName); str("hrId", pr.hrId); str("hrName", pr.hrName);
@@ -101,11 +102,12 @@ void save(const Profile& p, const Prefs& pr) {
       << "\nhrName=" << pr.hrName << "\nsimEnabled=" << pr.simEnabled << "\nsimEffortW=" << pr.sim.effortW << "\nsimPowerW=" << pr.sim.powerW
       << "\nsimHrBpm=" << pr.sim.hrBpm << "\nsimCadence=" << pr.sim.cadenceRpm << "\nsimVariability=" << pr.sim.variability
       << "\nsimPowerSource=" << int(pr.sim.powerSource) << "\nsimPattern=" << int(pr.sim.pattern) << "\nsimHrSource=" << int(pr.sim.hrSource)
-      << "\nsimCadenceSource=" << int(pr.sim.cadenceSource) << "\nselRoute=" << pr.selRoute << "\ntodMode=" << pr.todMode
+      << "\nsimCadenceSource=" << int(pr.sim.cadenceSource) << "\nselRoute=" << pr.selRoute << "\nhudLayout=" << pr.hudLayout << "\ntodMode=" << pr.todMode
       << "\ntodHour=" << pr.todHour << "\ncycleMinutes=" << pr.cycleMinutes << "\nweatherMode=" << pr.weatherMode
       << "\nweatherKind=" << pr.weatherKind << "\nlat=" << pr.lat << "\nlon=" << pr.lon << "\nplace=" << pr.place
       << "\nwildlife=" << pr.wildlife << "\nlanterns=" << pr.lanterns << "\nsound=" << pr.sound
       << "\nshowFps=" << pr.showFps << "\nshowPerf=" << pr.showPerf
+      << "\nminiMap=" << pr.miniMap << "\nminiMapNorthUp=" << pr.miniMapNorthUp << "\nminiMapZoom=" << pr.miniMapZoom
       << "\nweeklyGoalHours=" << p.weeklyGoalHours << "\nftpAuto=" << int(p.ftpAuto) << "\n";
 }
 

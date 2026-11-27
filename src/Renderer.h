@@ -100,6 +100,8 @@ public:
     struct PrecipSound { float rain = 0, hail = 0, farL = 0, farR = 0; };
     PrecipSound precipSound() const { return precipSound_; }
 
+    // terrain sun shadow map built off-thread (World.cpp)
+    struct SunMap { std::vector<float> S; Vector4 rect{}; Vector3 dir{}; Vector2 at{}; const Course* course = nullptr; };
 private:
     // ---- world streaming (World.cpp)
     struct ChunkData;  // CPU side, built by workers
@@ -268,6 +270,24 @@ private:
     struct Portal { Vector3 p; float heading; };          // heading: into the tunnel
     std::vector<Portal> portals_;
     std::vector<Vector3> tunnelLamps_;
+    // tunnel light map round the camera (see Structures.cpp updateTunnelMap): metres in from
+    // the nearest mouth + road height per 2 m texel; the shaders darken what's under a vault
+    unsigned tunnelTex_ = 0;
+    Vector4 tunnelRect_{0, 0, 0, 0};          // x0, z0, 1/size, texels (z = 0: none near)
+    Vector2 tunnelCentre_{1e9f, 1e9f};
+    const wmap::Map* tunnelFor_ = nullptr;
+    std::vector<Vector3> tunnelLampsU_;      // the nearest 24 lamps, sent to the shaders
+    void updateTunnelMap(const wmap::Map* M);
+    // terrain sun shadows (World.cpp updateSunTerrain): per 20 m texel of a 10 km square laid
+    // mostly up-sun of the camera, the height a point must reach to see the sun past every
+    // ridge. Built on a worker from the terrain field when the camera moves or the sun turns.
+    unsigned sunTex_ = 0;
+    Vector4 sunRect_{0, 0, 0, 0};            // x0, z0, 1/size (z = 0: none)
+    Vector3 sunMapDir_{0, 0, 0};
+    Vector2 sunMapAt_{1e9f, 1e9f};
+    const Course* sunMapFor_ = nullptr;
+    std::future<SunMap> sunJob_;
+    void updateSunTerrain();
     const wmap::Map* structMap_ = nullptr;
     void updateStructures();
     void drawStructures(bool shadowPass, const Vector3& focus, float radius);

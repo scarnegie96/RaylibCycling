@@ -1,0 +1,9 @@
+ba21008964357f2773cf74921c9ba276  CMakeLists.txt
+7f580b5331d2e4d5ec4c3264859458cd  src/App.cpp
+4918b672ed0af26977c1473377d75104  src/App.h
+557520ea7888ba11f61851c2600d5fcd  src/RideUi.cpp
+d19e81f6e87ea25acdd6084142f5b138  src/Store.cpp
+4787665bf03ff45969bf84635bc727d1  src/Store.h
+bcbca228be01123e42c724fa15658993  src/Ui.cpp
+603afde691728d5bd45537098f7b584b  src/Ui.h
+1db44dd7bd6f3e85ffc163edaaf5ed10  src/MiniMap.cpp

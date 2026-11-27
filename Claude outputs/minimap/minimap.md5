@@ -1,0 +1,11 @@
+ba21008964357f2773cf74921c9ba276  CMakeLists.txt
+7f580b5331d2e4d5ec4c3264859458cd  src/App.cpp
+4918b672ed0af26977c1473377d75104  src/App.h
+752038708eee699b3b6fd6e21a82940b  src/ExploreUi.cpp
+84eeaf654c5c891ac810757aab5181d3  src/RideUi.cpp
+d19e81f6e87ea25acdd6084142f5b138  src/Store.cpp
+4787665bf03ff45969bf84635bc727d1  src/Store.h
+1910efd066f625e8aa12cca5a3cc001c  tools/world_map.cpp
+662621fe45f76c0d4d25b1139e5c0c1b  src/MiniMap.h
+561fb8b17d4c9f98fd6663924c249fb3  src/MiniMap.cpp
+3a02f191a207b3a0d0eeba3c3d59e314  src/MiniMapBake.cpp

@@ -417,8 +417,9 @@ int App::run(int argc, char** argv) {
         else if (screen_ == Screen::Explore) { drawExplore(); if (prefs_.showFps || prefs_.showPerf) drawPerf(); }
         else if (screen_ == Screen::Ride) {
             // a window on top: the HUD beneath must not take its clicks
-            if (devicesModal_ || pauseMenu_) ui::setInputBlocked(true);
+            if (devicesModal_ || pauseMenu_ || layoutEdit_) ui::setInputBlocked(true);
             if (!view3d_) drawDashboard2d();
+            else if (layoutEdit_) drawRideHud();   // Modify UI: the cards, without their inputs
             else if (!hudHidden_) { drawRideHud(); drawRoamChoices(); }
             if (drawerOpen_) drawEditDrawer();
             if (testPanel_ && simActive()) {
@@ -428,8 +429,9 @@ int App::run(int argc, char** argv) {
                 drawSimPanel({r.x + 16, r.y + 12, r.width - 32, r.height - 24}, true);
                 if (CheckCollisionPointRec(ui::mouseLogical(), r)) ui::setInputBlocked(false);
             }
-            if (devicesModal_ || pauseMenu_) ui::setInputBlocked(false);
-            if (pauseMenu_) drawPauseMenu();
+            if (devicesModal_ || pauseMenu_ || layoutEdit_) ui::setInputBlocked(false);
+            if (layoutEdit_) drawLayoutEditor();
+            else if (pauseMenu_) drawPauseMenu();
             else if (devicesModal_) drawDevicesModal();
             if (helpOpen_) drawHelp();
             if (draw3d && (prefs_.showFps || prefs_.showPerf)) drawPerf();
@@ -453,6 +455,7 @@ int App::run(int argc, char** argv) {
     store::save(prof_, prefs_);
     for (int i = 0; i < 50 && g_async.load() > 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
     mapPreview_.release();
+    miniMap_.release();
     if (cogTex_.id) UnloadTexture(cogTex_);
     renderer_.shutdown();
     sfx::shutdown();
@@ -1024,7 +1027,7 @@ void App::frameUpdate(float dt) {
         updateWorld(dt, exDist_);
         return;
     }
-    if (!anyTextActive() && screen_ != Screen::Summary) {
+    if (!anyTextActive() && screen_ != Screen::Summary && !layoutEdit_) {
         if (IsKeyPressed(KEY_W)) cycleWeather();
         if (IsKeyPressed(KEY_T)) cycleTime();
         if (IsKeyPressed(KEY_M)) {
@@ -1156,6 +1159,17 @@ void App::hrAlerts() {
 void App::handleRideKeys(float dt) {
     (void)dt;
     if (anyTextActive()) return;
+    // dev: CORERAY_MODIFYUI=N opens Modify UI at once (N > 0 selects widget N-1)
+    if (static bool devOnce = false; !devOnce && std::getenv("CORERAY_MODIFYUI")) {
+        devOnce = true;
+        eng_->pause();
+        layoutEdit_ = true;
+        edSel_ = std::atoi(std::getenv("CORERAY_MODIFYUI")) - 1;
+    }
+    if (layoutEdit_) {   // Modify UI owns the keys (arrows nudge); Esc goes back to the pause menu
+        if (IsKeyPressed(KEY_ESCAPE)) { SetMouseCursor(MOUSE_CURSOR_DEFAULT); closeLayoutEditor(); }
+        return;
+    }
     bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
     bool alt = IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT);
     if (IsKeyPressed(KEY_ESCAPE)) {
@@ -1178,6 +1192,15 @@ void App::handleRideKeys(float dt) {
     if (IsKeyPressed(KEY_V)) view3d_ = !view3d_;
     if (IsKeyPressed(KEY_B)) { renderer_.setGreyboxRider(!renderer_.greyboxRider()); toast(renderer_.greyboxRider() ? "Rider: greybox body" : "Rider: kitted"); }
     if (IsKeyPressed(KEY_TAB)) hudHidden_ = !hudHidden_;
+    if (IsKeyPressed(KEY_N) && map_ && course_ && course_->world() == map_.get()) {   // the minimap: zoom, or heading-up / north-up
+        const bool sh = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+        static const char* Z[4] = {"600 m", "1.2 km", "2.5 km", "5 km"};
+        if (sh) { prefs_.miniMapNorthUp = !prefs_.miniMapNorthUp; toast(prefs_.miniMapNorthUp ? "Minimap: north up" : "Minimap: heading up"); }
+        else if (!prefs_.miniMap) { prefs_.miniMap = true; toast("Minimap on"); }
+        else if (prefs_.miniMapZoom >= 3) { prefs_.miniMap = false; prefs_.miniMapZoom = 1; toast("Minimap off (N to show it)"); }
+        else { prefs_.miniMapZoom++; toast(std::string("Minimap: ") + Z[prefs_.miniMapZoom] + " to the edge"); }
+        store::save(prof_, prefs_);
+    }
     if (IsKeyPressed(KEY_F)) { prefs_.showFps = !prefs_.showFps; store::save(prof_, prefs_); }
     if (IsKeyPressed(KEY_P)) { prefs_.showPerf = !prefs_.showPerf; store::save(prof_, prefs_); }
     if (IsKeyPressed(KEY_SLASH) || IsKeyPressed(KEY_F1)) helpOpen_ = !helpOpen_;

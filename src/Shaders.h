@@ -223,6 +223,64 @@ uniform float snowCover;
 uniform float flash;
 uniform float night;
 uniform float fogGrey;
+// tunnels (generated worlds): a top-down map round the camera, 2 m texels, nearest texel per
+// fetch: r = metres in from the nearest mouth, g = 1 inside a tunnel, b = road height there
+uniform sampler2D tunnelMap;
+uniform vec4 tunnelRect;      // x0, z0, 1/size (m), texels across (z = 0: no tunnels near)
+uniform int tunnelSkip;       // the terrain: it is never seen from inside a tube
+uniform int numTunnelLamps;
+uniform vec3 tunnelLamp[24];  // the lamps' faces under the crown, nearest the camera first
+uniform vec3 tunnelLampCol;
+float gTun = 1.0;             // set by shade(): sky light reaching this fragment (fog reads it)
+
+// x: sky visibility (1 in the open, falling off past the mouths), y: how far inside (0..1)
+vec2 tunnelAt(vec3 wp) {
+    if (tunnelRect.z <= 0.0 || tunnelSkip == 1) return vec2(1.0, 0.0);
+    vec2 uv = (wp.xz - tunnelRect.xy) * tunnelRect.z;
+    if (uv.x < 0.0 || uv.y < 0.0 || uv.x >= 1.0 || uv.y >= 1.0) return vec2(1.0, 0.0);
+    float N = tunnelRect.w;
+    if (texelFetch(tunnelMap, ivec2(uv * N), 0).g < 0.5) return vec2(1.0, 0.0);   // most fragments stop here
+    vec2 tc = uv * N - 0.5;
+    ivec2 i0 = ivec2(floor(tc));
+    vec2 f = fract(tc);
+    float acc = 0.0, wsum = 0.0;
+    for (int k = 0; k < 4; k++) {
+        ivec2 o = ivec2(k & 1, k >> 1);
+        ivec2 q = clamp(i0 + o, ivec2(0), ivec2(int(N) - 1));
+        vec4 t = texelFetch(tunnelMap, q, 0);
+        // only under the vault: a road or the land well above the tube is in the open
+        if (t.g < 0.5 || wp.y < t.b - 1.5 || wp.y > t.b + 6.75) continue;
+        float w = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
+        acc += t.r * w;
+        wsum += w;
+    }
+    if (wsum < 1e-3) return vec2(1.0, 0.0);
+    float dm = acc / wsum;
+    // daylight reaches a few metres in: half by ~4 m, a few percent by 20 m
+    return vec2(exp(-max(dm, 0.0) / 6.0), clamp(wsum * 4.0, 0.0, 1.0));
+}
+
+// the tunnel's ceiling lamps: wide spots aimed down at the road, plus a little bounce off
+// the lining so the far tube isn't black
+vec3 tunnelLight(vec3 albedo, vec3 n, vec3 wp, vec3 V, float shin, float spec, float inside) {
+    vec3 col = albedo * tunnelLampCol * 0.012 * inside;
+    for (int i = 0; i < 24; i++) {
+        if (i >= numTunnelLamps) break;
+        vec3 l = tunnelLamp[i] - wp;
+        float d2 = dot(l, l);
+        if (d2 > 1024.0) continue;
+        float d = sqrt(d2);
+        vec3 ld = l / max(d, 1e-3);
+        float win = clamp(1.0 - pow(d / 32.0, 4.0), 0.0, 1.0);
+        float att = win * win / (1.0 + d2 * 0.22);
+        float spot = smoothstep(-0.35, 0.45, -ld.y);                       // aimed down, spills on the walls
+        float fade = 1.0 - smoothstep(210.0, 290.0, length(tunnelLamp[i] - camPos));   // the set is the nearest 24
+        float nl = max(dot(n, ld) * 0.9 + 0.1, 0.0);
+        vec3 hl = normalize(V + ld);
+        col += tunnelLampCol * att * spot * fade * (albedo * nl + pow(max(dot(n, hl), 0.0), shin) * spec * nl * 0.8);
+    }
+    return col * inside;
+}
 
 float hash12(vec2 p) {
     vec3 p3 = fract(vec3(p.xyx) * 0.1031);
@@ -261,7 +319,23 @@ float shadowSample(sampler2D sm, mat4 vp, vec3 wp, float bias, float radius, int
     return lit / float(taps);
 }
 
+// terrain sun shadows (World.cpp updateSunTerrain): the height a point must be above to see
+// the sun past the ridges up-sun; 4 m of slack for the 20 m grid, a soft 4 m edge
+uniform sampler2D sunTerrain;
+uniform vec4 sunTerrainRect;  // x0, z0, 1/size (z = 0: none)
+float terrainSun(vec3 wp) {
+    if (sunTerrainRect.z <= 0.0) return 1.0;
+    vec2 uv = (wp.xz - sunTerrainRect.xy) * sunTerrainRect.z;
+    if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) return 1.0;
+    float S = textureLod(sunTerrain, uv, 0.0).r;
+    return smoothstep(-2.0, 2.0, wp.y + 4.0 - S);
+}
+float shadowFactorMaps(vec3 wp, vec3 n);
 float shadowFactor(vec3 wp, vec3 n) {
+    float t = terrainSun(wp);
+    return t <= 0.0 ? 0.0 : t * shadowFactorMaps(wp, n);
+}
+float shadowFactorMaps(vec3 wp, vec3 n) {
     if (shadowsOn == 0) return 1.0;
     float ndl = clamp(dot(n, sunDir), 0.0, 1.0);
     vec3 d = abs(wp - cascadeCenter0);
@@ -342,6 +416,7 @@ vec3 applyFog(vec3 col, vec3 wp) {
     fc = mix(fc, fc + sunColor * 0.25, sunAmt);
     float g = dot(fc, vec3(0.333));
     fc = mix(fc, vec3(g) * vec3(0.96, 0.98, 1.02), fogGrey) + vec3(0.6, 0.65, 0.8) * flash * 0.25;
+    fc *= gTun;   // the haze deep in a tunnel isn't lit by the sky
     return mix(col, fc, clamp(f, 0.0, 1.0));
 }
 
@@ -429,14 +504,17 @@ vec3 shade(vec3 albedo, vec3 n, vec3 wp, float rough, float spec, float shadow, 
     float nh = max(dot(n, H), 0.0);
     float fres = 0.04 + 0.96 * pow(1.0 - max(dot(n, V), 0.0), 5.0);
     float s = pow(nh, shin) * (shin + 8.0) / 25.13 * spec * mix(0.25, 1.0, fres);
+    vec2 tun = tunnelAt(wp);   // in a tunnel the sky (and sun) only reach in from the mouths
+    gTun = tun.x;
     vec3 hemi = mix(groundColor, skyZenith, n.y * 0.5 + 0.5);
-    vec3 direct = sunColor * ndl * shadow * cloudShadow(wp);
-    vec3 col = albedo * (direct + hemi * ambient * ao);
+    vec3 direct = sunColor * ndl * shadow * cloudShadow(wp) * tun.x;
+    vec3 col = albedo * (direct + hemi * ambient * ao * tun.x);
     col += direct * s;
-    col += skyColor(reflect(-V, n)) * fres * spec * 0.35 * ao;
+    col += skyColor(reflect(-V, n)) * fres * spec * 0.35 * ao * tun.x;
     // lightning lights everything from above for an instant
-    col += albedo * vec3(0.75, 0.8, 1.0) * flash * (0.6 + 0.4 * max(n.y, 0.0)) * 1.6;
+    col += albedo * vec3(0.75, 0.8, 1.0) * flash * (0.6 + 0.4 * max(n.y, 0.0)) * 1.6 * tun.x;
     col += localLight(albedo, n, wp, V, shin, spec);
+    if (tun.y > 0.0) col += tunnelLight(albedo, n, wp, V, shin, spec, tun.y);
     return col;
 }
 )";
@@ -448,8 +526,8 @@ in float fragBand;   // per-vertex: strata band offset
 in float fragSand;   // generated worlds: loose sand at the surface
 uniform int worldMode;        // 1: a generated world (fragField.w = desert tint, fragSand)
 uniform int numPortals;       // tunnel portals: the hillside is open in front of them
-uniform vec4 portalPos[12];   // xyz: the road at the portal, w: half width
-uniform vec4 portalDir[12];   // xyz: into the tunnel (horizontal), w: height
+uniform vec4 portalPos[12];   // xyz: the road at the hillside face, w: arch half width
+uniform vec4 portalDir[12];   // xyz: into the tunnel (horizontal), w: arch crown height
 uniform float waterLevel;
 uniform float snowLine;
 uniform float landBase;       // the route's lowest ground
@@ -501,7 +579,11 @@ void main() {
         vec3 f = portalDir[i].xyz;
         float along = dot(d, f);
         float lat = abs(d.x * f.z - d.z * f.x);
-        if (along > -6.5 && along < 18.0 && lat < portalPos[i].w && d.y > -1.0 && d.y < portalDir[i].w) discard;
+        // cut to the tube's arch: vertical walls, then an elliptical vault 2.4 m tall
+        float hw = portalPos[i].w, crown = portalDir[i].w, wall = crown - 2.4;
+        float e = clamp(lat / hw, 0.0, 1.0);
+        float top = wall + (crown - wall) * sqrt(1.0 - e * e);
+        if (along > -2.5 && along < 18.0 && lat < hw && d.y > -1.0 && d.y < top) discard;
     }
     vec3 n0 = normalize(fragNormal);
     vec3 n = n0;
@@ -665,6 +747,9 @@ void main() {
     float gravelW = 0.75 + (vnoise(vec2(v * 0.35, 1.0)) - 0.5) * 0.5;
     float grassMix = smoothstep(gravelW - 0.35, gravelW + 0.45, out1 + (vnoise(fragPos.xz * 2.3) - 0.5) * 0.5);
     grassMix = max(grassMix, smoothstep(2.2, 2.8, out1));      // always pure grass where the strip meets the terrain
+    vec2 tunR = tunnelAt(fragPos);
+    float dryR = clamp(tunR.x * 3.0, 0.0, 1.0);                // rain and snow reach a few metres in
+    grassMix *= 1.0 - tunR.y;                                  // in a tunnel: gravel shoulders to the walls
 
     // ---- asphalt
     vec2 rp = vec2(across, v);
@@ -715,7 +800,7 @@ void main() {
     vec3 grass = grassAlbedo(texture2, fragPos.xz, gh);
     // stray grass growing through the gravel
     float tuft = smoothstep(0.6, 0.85, vnoise(fragPos.xz * 1.6)) * smoothstep(0.15, 0.9, out1);
-    vec3 verge = mix(grav, grass, max(grassMix, tuft * 0.5));
+    vec3 verge = mix(grav, grass, max(grassMix, tuft * 0.5 * (1.0 - tunR.y)));
     float vh = mix(gv.a, gh, grassMix);
 
     vec3 albedo = mix(verge, asph, onTar);
@@ -732,12 +817,12 @@ void main() {
     }
 
     // ---- snow settles everywhere except where tyres run
-    float sn = snowCover * mix(mix(0.95, 0.3, clamp(track, 0.0, 1.0)), 1.0, 1.0 - onTar) * (0.75 + 0.25 * hgt);
+    float sn = snowCover * dryR * mix(mix(0.95, 0.3, clamp(track, 0.0, 1.0)), 1.0, 1.0 - onTar) * (0.75 + 0.25 * hgt);
     albedo = mix(albedo, vec3(0.82, 0.85, 0.90), sn);
     albedo *= albedo * 1.6;
 
     // ---- wet: darker, glossy, puddles in the low spots with rain rings
-    float wet = wetness * (1.0 - sn);
+    float wet = wetness * dryR * (1.0 - sn);
     float low = 1.0 - hgt;
     float puddle = smoothstep(0.62, 0.78, vnoise(fragPos.xz * 0.28) * 0.65 + low * 0.35 + vnoise(fragPos.xz * 1.9) * 0.15)
                    * wet * (1.0 - clamp(track, 0.0, 1.0) * 0.6) * mix(1.0, 0.6, 1.0 - onTar);
@@ -751,7 +836,7 @@ void main() {
     float vergeAO = mix(0.72, 1.0, vnoise(fragPos.xz * 0.06)) * mix(0.8, 1.0, gh);
     float aoR = mix(1.0, vergeAO, (1.0 - onTar) * grassMix);
     if (wetness > 0.02 && camD < 60.0) {
-        vec2 rip = ripples(fragPos.xz, time) * wetness * (0.35 + puddle);
+        vec2 rip = ripples(fragPos.xz, time) * wetness * dryR * (0.35 + puddle);
         n = normalize(n + vec3(rip.x, 0.0, rip.y));
     }
     float sh = shadowFactor(fragPos, normalize(fragNormal));

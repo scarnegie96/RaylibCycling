@@ -49,6 +49,11 @@ void reapplyScale();  // after EndTextureMode / EndMode3D, which reset the model
 float screenW();
 float screenH();
 void beginScissor(Rectangle r);  // logical rect
+// A movable / resizable widget: draw it in its own (default-layout) coordinates and it lands at
+// offset + scale * p. The mouse (mouseLogical, hovered, clicked) and scissor rects follow, so
+// buttons inside keep working. Not nestable beyond a few levels; always pair with popWidget().
+void pushWidget(Vector2 offset, float scale);
+void popWidget();
 // suggested scale for a window: 1 at 1440x900 points, up to 2.2 on big screens
 float autoScale(float minLogicalW, float minLogicalH, float user);
 

@@ -3,6 +3,9 @@
 // km posts, start / finish arches and the night-time lanterns.
 #include <algorithm>
 #include <cmath>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
 
 #include "RenderUtil.h"
@@ -818,8 +821,9 @@ void Renderer::updateLanterns(const SceneState& s, float dt) {
         std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first < b.first; });
         for (size_t i = 0; i < cand.size() && lights_.size() < 15; ++i) lights_.push_back(cand[i].second);
     }
-    // the bike's headlight: a real spot down the road after dusk
-    if (L_.night > 0.25f) {
+    // the bike's headlight: a real spot down the road after dusk, and in tunnels
+    const bool tunnel = C.world() && (C.kindAt(s.dist) == 1 || C.kindAt(s.dist + 25) == 1);
+    if (L_.night > 0.25f || tunnel) {
         auto p = C.at(s.dist);
         auto ahead = C.at(s.dist + 12);
         Vector3 lp = Vector3Add(Vector3Add(toV(p.pos), Vector3Scale(rightOf(p.heading), 1.4f)), Vector3Add(Vector3Scale(fwdOf(p.heading), 0.7f), {0, 1.0f, 0}));
@@ -827,7 +831,7 @@ void Renderer::updateLanterns(const SceneState& s, float dt) {
         Light L;
         L.pos = lp;
         L.dir = Vector3Normalize(Vector3Subtract(aim, lp));
-        L.col = Vector3Scale({0.92f, 0.95f, 1.0f}, 55.f * L_.night);
+        L.col = Vector3Scale({0.92f, 0.95f, 1.0f}, 55.f * std::max(L_.night, tunnel ? 0.8f : 0.f));
         L.cosIn = 0.975f;
         L.cosOut = 0.90f;
         L.vol = 0.06f;   // a bike light barely shows in the air from behind
@@ -1116,8 +1120,10 @@ void Renderer::drawWorld(bool sp, int cascade, const Vector3& focus, float radiu
         for (auto [d, i] : order) {
             if (np >= 12) break;
             const auto& P = portals_[i];
-            pp[np * 4] = P.p.x; pp[np * 4 + 1] = P.p.y; pp[np * 4 + 2] = P.p.z; pp[np * 4 + 3] = 5.4f;
-            pd[np * 4] = std::sin(P.heading); pd[np * 4 + 1] = 0; pd[np * 4 + 2] = std::cos(P.heading); pd[np * 4 + 3] = 6.8f;
+            // the tube's arch (Structures.cpp: half width 5.2, walls 4.2, crown 6.6), a few cm
+            // inside it so the hillside's cut edge sits on the lining with no slit
+            pp[np * 4] = P.p.x; pp[np * 4 + 1] = P.p.y; pp[np * 4 + 2] = P.p.z; pp[np * 4 + 3] = 5.15f;
+            pd[np * 4] = std::sin(P.heading); pd[np * 4 + 1] = 0; pd[np * 4 + 2] = std::cos(P.heading); pd[np * 4 + 3] = 6.55f;
             ++np;
         }
         setI(terrainSh_, "numPortals", np);
@@ -1257,4 +1263,90 @@ void Renderer::drawWorld(bool sp, int cascade, const Vector3& focus, float radiu
 
     arch(archBase_, {232, 64, 48, 255});
     if (hasFinish_) arch(finishBase_, {74, 222, 128, 255});
+}
+
+// ------------------------------------------------------------------ terrain sun shadows
+// The cascaded shadow maps reach a kilometre or two; a low sun behind a ridge further off
+// used to light the valley (and the fog) straight through the mountain. This is the classic
+// height-field horizon map: S(p) = the height a point at p must be above to see the sun, from
+// S(p) = max(H(q), S(q)) - step * tan(elevation) with q one step up-sun - one sweep over the
+// texels in up-sun-first order, so every q is already done. 512 x 20 m = 10 km, the camera
+// 2.5 km from the down-sun edge (7.7 km of ridges up-sun).
+namespace {
+Renderer::SunMap buildSunMap(std::shared_ptr<const Course> course, Vector3 L, Vector2 cam) {
+    auto t0 = std::chrono::steady_clock::now();
+    constexpr int N = 512;
+    constexpr float CELL = 20.f, SIZE = N * CELL;
+    Renderer::SunMap out;
+    out.dir = L;
+    out.at = cam;
+    out.course = course.get();
+    float lh = std::hypot(L.x, L.z);
+    Vector2 u{L.x / lh, L.z / lh};
+    float tanE = std::max(L.y, 0.01f) / lh;
+    float cx = cam.x + u.x * (SIZE * 0.5f - 2500.f), cz = cam.y + u.y * (SIZE * 0.5f - 2500.f);
+    float x0 = std::round((cx - SIZE * 0.5f) / CELL) * CELL, z0 = std::round((cz - SIZE * 0.5f) / CELL) * CELL;
+    const terrain::Field& F = course->field();
+    std::vector<float> H(size_t(N) * N);
+    for (int iz = 0; iz < N; ++iz)
+        for (int ix = 0; ix < N; ++ix) H[size_t(iz) * N + ix] = F.height(x0 + (ix + 0.5f) * CELL, z0 + (iz + 0.5f) * CELL);
+    std::vector<int> order(size_t(N) * N);
+    std::vector<float> proj(order.size());
+    for (int k = 0; k < N * N; ++k) { order[k] = k; proj[k] = (k % N) * u.x + (k / N) * u.y; }
+    std::sort(order.begin(), order.end(), [&](int a, int b) { return proj[a] > proj[b]; });
+    const float STEP = 1.5f;   // texels: q's four neighbours all lie further up-sun than p
+    const float drop = STEP * CELL * tanE;
+    std::vector<float> S(size_t(N) * N, -1e6f);
+    for (int k : order) {
+        float qx = (k % N) + u.x * STEP, qz = (k / N) + u.y * STEP;
+        if (qx < 0 || qz < 0 || qx > N - 1 || qz > N - 1) continue;   // the edge: nothing further up-sun
+        int ix = std::min(int(qx), N - 2), iz = std::min(int(qz), N - 2);
+        float fx = qx - ix, fz = qz - iz;
+        auto bl = [&](const std::vector<float>& g) {
+            size_t a = size_t(iz) * N + ix;
+            return (g[a] * (1 - fx) + g[a + 1] * fx) * (1 - fz) + (g[a + N] * (1 - fx) + g[a + N + 1] * fx) * fz;
+        };
+        S[k] = std::max(bl(H), bl(S)) - drop;
+    }
+    out.S = std::move(S);
+    out.rect = {x0, z0, 1.f / SIZE, float(N)};
+    static int logged = 0;
+    if (logged++ < 3)
+        std::fprintf(stderr, "[sun] terrain shadow map %.0f ms (elevation %.1f deg, dir %.3f %.3f %.3f)\n",
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), std::atan(tanE) * 57.2958f, L.x, L.y, L.z);
+    return out;
+}
+}  // namespace
+
+void Renderer::updateSunTerrain() {
+    static const bool off = std::getenv("CORERAY_NOSUNTERRAIN") != nullptr;   // dev: compare without
+    if (!course_ || off) { sunRect_.z = 0; return; }
+    if (course_.get() != sunMapFor_) { sunRect_.z = 0; sunMapFor_ = course_.get(); sunMapAt_ = {1e9f, 1e9f}; }
+    if (sunJob_.valid() && sunJob_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        SunMap m = sunJob_.get();
+        if (m.course == course_.get()) {
+            constexpr int N = 512;
+            if (!sunTex_) {
+                sunTex_ = rlLoadTexture(m.S.data(), N, N, PIXELFORMAT_UNCOMPRESSED_R32, 1);
+                rlTextureParameters(sunTex_, RL_TEXTURE_MIN_FILTER, RL_TEXTURE_FILTER_BILINEAR);
+                rlTextureParameters(sunTex_, RL_TEXTURE_MAG_FILTER, RL_TEXTURE_FILTER_BILINEAR);
+                rlTextureParameters(sunTex_, RL_TEXTURE_WRAP_S, RL_TEXTURE_WRAP_CLAMP);
+                rlTextureParameters(sunTex_, RL_TEXTURE_WRAP_T, RL_TEXTURE_WRAP_CLAMP);
+            } else {
+                rlUpdateTexture(sunTex_, 0, 0, N, N, PIXELFORMAT_UNCOMPRESSED_R32, m.S.data());
+            }
+            sunRect_ = m.rect;
+            sunMapDir_ = m.dir;
+            sunMapAt_ = m.at;
+        }
+    }
+    if (sunJob_.valid()) return;   // one at a time
+    Vector3 L = Vector3Normalize(L_.lightDir);
+    float lh = std::hypot(L.x, L.z);
+    if (lh < 0.05f || L.y > 0.75f) { sunRect_.z = 0; return; }   // sun near overhead: no ridge shadows worth it
+    Vector2 cam{cam_.position.x, cam_.position.z};
+    bool moved = std::hypot(cam.x - sunMapAt_.x, cam.y - sunMapAt_.y) > 700.f;
+    bool turned = Vector3DotProduct(L, sunMapDir_) < 0.99996f;   // ~0.5 degrees
+    if (!moved && !turned) return;
+    sunJob_ = std::async(std::launch::async, buildSunMap, course_, L, cam);
 }

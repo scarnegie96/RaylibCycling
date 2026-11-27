@@ -96,6 +96,20 @@ uniform vec2 lightCone[16];
 uniform vec4 lightShape[16];   // xyz = beam's long axis (along the road), w = elongation
 uniform float lightVol[16];    // how strongly each light shows in the air (headlight: faint)
 
+// tunnels: the same map the scene shaders use (Shaders.h tunnelAt); the air under a vault
+// isn't lit by the sky, only by the lamps
+uniform sampler2D tunnelMap;
+uniform vec4 tunnelRect;
+uniform vec3 tunnelLampCol;
+vec2 tunnelAirAt(vec3 p) {
+    if (tunnelRect.z <= 0.0) return vec2(1.0, 0.0);
+    vec2 uv = (p.xz - tunnelRect.xy) * tunnelRect.z;
+    if (uv.x < 0.0 || uv.y < 0.0 || uv.x >= 1.0 || uv.y >= 1.0) return vec2(1.0, 0.0);
+    vec4 t = texelFetch(tunnelMap, ivec2(uv * tunnelRect.w), 0);
+    if (t.g < 0.5 || p.y < t.b - 1.5 || p.y > t.b + 6.75) return vec2(1.0, 0.0);
+    return vec2(exp(-max(t.r, 0.0) / 6.0), 1.0);
+}
+
 const float PI = 3.14159265;
 
 float ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
@@ -259,7 +273,23 @@ vec4 marchClouds(vec3 ro, vec3 rd, float tScene, float jitter, out float avgT) {
 }
 
 // ------------------------------------------------------------ fog, lights, rain
+// terrain sun shadows (World.cpp updateSunTerrain): the height a point must be above to see
+// the sun past the ridges up-sun; 4 m of slack for the 20 m grid, a soft 4 m edge
+uniform sampler2D sunTerrain;
+uniform vec4 sunTerrainRect;  // x0, z0, 1/size (z = 0: none)
+float terrainSun(vec3 wp) {
+    if (sunTerrainRect.z <= 0.0) return 1.0;
+    vec2 uv = (wp.xz - sunTerrainRect.xy) * sunTerrainRect.z;
+    if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) return 1.0;
+    float S = textureLod(sunTerrain, uv, 0.0).r;
+    return smoothstep(-2.0, 2.0, wp.y + 4.0 - S);
+}
+float sunVisMaps(vec3 p);
 float sunVis(vec3 p) {
+    float t = terrainSun(p);
+    return t <= 0.0 ? 0.0 : t * sunVisMaps(p);
+}
+float sunVisMaps(vec3 p) {
     vec3 d0 = abs(p - cascadeCenter0);
     vec4 lp;
     if (max(d0.x, d0.z) < cascadeRange.x * 0.9) {
@@ -349,7 +379,8 @@ vec4 marchFog(vec3 ro, vec3 rd, float tScene, float jitter) {
         vec3 p = ro + rd * t;
         float sig = fogDensity(p);
         if (sig < 1e-6) continue;
-        vec3 Li = lightColF * ph * sunVis(p) * cloudShadowAt(p) + amb;
+        vec2 tun = tunnelAirAt(p);
+        vec3 Li = (lightColF * ph * sunVis(p) * cloudShadowAt(p) + amb) * tun.x + tunnelLampCol * 0.02 * tun.y;
         Li += lampScatter(p, rd);
         if (boltI > 0.001) { float bd = length(p - boltPos); Li += vec3(0.78, 0.82, 1.0) * boltI * 1.2 * exp(-bd / 900.0); }
         vec3 S = Li * sig;

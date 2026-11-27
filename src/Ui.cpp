@@ -95,9 +95,15 @@ namespace {
 float g_scale = 1.f, g_last = 1.f;
 int g_depth = 0;
 }
+// The zoom lives in the modelview matrix itself (no rlPushMatrix: rlgl's push switches to a
+// separate "transform" matrix that BeginMode3D / texture modes don't reset, and it compounded
+// frame after frame). Saved and restored exactly, so raylib's own screen scaling stays intact.
+static Matrix g_savedMv;
 void pushScale(float s) {
+    if (g_depth > 0) return;
     rlDrawRenderBatchActive();
-    rlPushMatrix();
+    rlMatrixMode(RL_MODELVIEW);
+    g_savedMv = rlGetMatrixModelview();
     rlScalef(s, s, 1.f);
     g_scale = s;
     g_last = s;
@@ -107,22 +113,60 @@ void pushScale(float s) {
 void popScale() {
     if (g_depth <= 0) return;
     rlDrawRenderBatchActive();
-    rlPopMatrix();
+    rlSetMatrixModelview(g_savedMv);
     --g_depth;
     g_scale = 1.f;
     SetMouseScale(1.f, 1.f);
 }
 float scale() { return g_scale; }
 float lastScale() { return g_last; }
-Vector2 mouseLogical() { Vector2 m = GetMousePosition(); float k = g_depth > 0 ? 1.f : g_last; return {m.x / k, m.y / k}; }
-void reapplyScale() { if (g_depth > 0 && g_scale != 1.f) { rlDrawRenderBatchActive(); rlLoadIdentity(); rlScalef(g_scale, g_scale, 1.f); } }
+// widget transforms (pushWidget): p_screen_logical = o + s * p
+namespace {
+struct WT { Vector2 o; float s; Matrix saved; };
+WT g_wt[4];
+int g_wn = 0;
+}
+static Vector2 widgetIn(Vector2 m) {   // logical -> widget-local, innermost last
+    for (int i = 0; i < g_wn; ++i) m = {(m.x - g_wt[i].o.x) / g_wt[i].s, (m.y - g_wt[i].o.y) / g_wt[i].s};
+    return m;
+}
+static Rectangle widgetOut(Rectangle r) {   // widget-local -> logical
+    for (int i = g_wn - 1; i >= 0; --i) r = {g_wt[i].o.x + r.x * g_wt[i].s, g_wt[i].o.y + r.y * g_wt[i].s, r.width * g_wt[i].s, r.height * g_wt[i].s};
+    return r;
+}
+void pushWidget(Vector2 o, float s) {
+    if (g_wn >= 4) return;
+    rlDrawRenderBatchActive();
+    rlMatrixMode(RL_MODELVIEW);
+    g_wt[g_wn] = {o, std::max(0.05f, s), rlGetMatrixModelview()};
+    rlTranslatef(o.x, o.y, 0.f);
+    rlScalef(g_wt[g_wn].s, g_wt[g_wn].s, 1.f);
+    ++g_wn;
+}
+void popWidget() {
+    if (g_wn <= 0) return;
+    rlDrawRenderBatchActive();
+    --g_wn;
+    rlSetMatrixModelview(g_wt[g_wn].saved);
+}
+Vector2 mouseLogical() { Vector2 m = GetMousePosition(); float k = g_depth > 0 ? 1.f : g_last; return widgetIn({m.x / k, m.y / k}); }
+// EndTextureMode / EndMode3D reload the modelview with raylib's screen scale: put the zoom back on top
+void reapplyScale() {
+    if (g_depth > 0) {
+        rlDrawRenderBatchActive(); rlMatrixMode(RL_MODELVIEW); rlScalef(g_scale, g_scale, 1.f);
+        for (int i = 0; i < g_wn; ++i) { g_wt[i].saved = rlGetMatrixModelview(); rlTranslatef(g_wt[i].o.x, g_wt[i].o.y, 0.f); rlScalef(g_wt[i].s, g_wt[i].s, 1.f); }
+    }
+}
 float screenW() { return GetScreenWidth() / (g_depth > 0 ? g_scale : g_last); }
 float screenH() { return GetScreenHeight() / (g_depth > 0 ? g_scale : g_last); }
 void beginScissor(Rectangle r) {
+    r = widgetOut(r);
     BeginScissorMode(int(std::floor(r.x * g_scale)), int(std::floor(r.y * g_scale)), int(std::ceil(r.width * g_scale)), int(std::ceil(r.height * g_scale)));
 }
 float autoScale(float minW, float minH, float user) {
-    float W = ui::screenW(), H = ui::screenH();
+    // the real window size in points - never the zoomed (logical) size, or each frame's zoom
+    // feeds the next one and big windows flip between two sizes
+    float W = float(GetScreenWidth()), H = float(GetScreenHeight());
     float a = std::clamp(std::min(W / 1440.f, H / 900.f), 1.f, 2.2f);
     float s = a * user;
     // never so big that the layout runs out of room
